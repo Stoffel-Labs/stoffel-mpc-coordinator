@@ -1,0 +1,15 @@
+[package]
+name = "stoffel-mpc-coordinator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "deploy-coordinator"
+path = "src/deploy-coordinator/bin/main.rs"
+
+[dependencies]
+stoffel-solidity-bindings = { version = "0.1.0", git = "ssh://git@github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord" }
+alloy = { version = "1.5.2", features = ["full", "node-bindings"] }
+alloy-primitives = "1.5.4"
+clap = { version = "4.5.56", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
