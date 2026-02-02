@@ -27,7 +27,7 @@ pub use wrap_mint::WrapMintHandler;
 use async_trait::async_trait;
 
 use crate::jobs::Job;
-use crate::vm::{VmExecutor, Value};
+use crate::vm::{VmExecutor, Value, value_to_bytes};
 use crate::types::JobType;
 
 /// Result type for handler operations
@@ -94,8 +94,8 @@ pub trait JobHandler: Send + Sync {
 
     /// Format the VM result into output bytes
     fn format_output(&self, value: &Value) -> HandlerResult<Vec<u8>> {
-        // Default: convert to bytes
-        Ok(value.to_bytes())
+        // Default: convert to bytes using the vm module's conversion function
+        Ok(value_to_bytes(value))
     }
 }
 

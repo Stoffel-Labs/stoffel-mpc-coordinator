@@ -11,7 +11,7 @@ use tracing::{info, warn, error, debug};
 
 use crate::jobs::{JobQueue, Job};
 use crate::types::{JobStatus, JobType};
-use crate::vm::{VmExecutor, VmError};
+use crate::vm::{VmExecutor, VmError, value_to_bytes};
 
 /// Configuration for the job executor
 #[derive(Debug, Clone)]
@@ -155,7 +155,7 @@ impl JobExecutor {
         self.job_queue.update_status(job.id, JobStatus::Signing).await;
 
         // Convert result to bytes
-        let output_bytes = result.to_bytes();
+        let output_bytes = value_to_bytes(&result);
 
         Ok(output_bytes)
     }

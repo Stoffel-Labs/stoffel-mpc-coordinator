@@ -6,10 +6,15 @@
 
 use async_trait::async_trait;
 
-use super::{JobHandler, HandlerResult, HandlerError};
+use super::{JobHandler, HandlerResult, HandlerError, value_to_bytes};
 use crate::jobs::Job;
 use crate::types::JobType;
 use crate::vm::Value;
+
+// Use inline hex encoding to avoid external dependency
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
 /// Handler for wrapping SPL mints as confidential mints
 pub struct WrapMintHandler;
@@ -110,7 +115,8 @@ impl JobHandler for WrapMintHandler {
                 format!("Failed to decode input {}: {}", input.index, e)
             ))?;
 
-            values.push(Value::Bytes(data));
+            // Wrap mint inputs are public (addresses)
+            values.push(Value::String(hex_encode(&data)));
         }
 
         Ok(values)
@@ -118,7 +124,7 @@ impl JobHandler for WrapMintHandler {
 
     fn format_output(&self, value: &Value) -> HandlerResult<Vec<u8>> {
         // The output should be a 32-byte confidential mint address
-        let bytes = value.to_bytes();
+        let bytes = value_to_bytes(value);
 
         if bytes.len() != 32 {
             tracing::warn!(
@@ -376,8 +382,11 @@ mod tests {
 
         for input in &inputs {
             match input {
-                Value::Bytes(bytes) => assert_eq!(bytes.len(), 32),
-                _ => panic!("Expected Bytes value"),
+                Value::String(hex_str) => {
+                    // Hex-encoded 32 bytes = 64 characters
+                    assert_eq!(hex_str.len(), 64);
+                }
+                _ => panic!("Expected String value"),
             }
         }
     }
@@ -400,7 +409,8 @@ mod tests {
 
         // Register the wrap_mint mock function
         vm.register_function("wrap_mint", |_args| {
-            Ok(Value::Bytes(vec![0xFF; 32])) // Mock 32-byte confidential mint address
+            // Return hex-encoded 32 bytes (64 characters)
+            Ok(Value::String("ff".repeat(32)))
         });
 
         let result = handler.execute(&job, &mut vm).await;

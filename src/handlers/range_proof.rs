@@ -6,10 +6,16 @@
 
 use async_trait::async_trait;
 
-use super::{JobHandler, HandlerResult, HandlerError};
+use super::{JobHandler, HandlerResult, HandlerError, value_to_bytes};
 use crate::jobs::Job;
 use crate::types::JobType;
 use crate::vm::Value;
+use stoffel_vm_types::core_types::ShareType;
+
+// Use inline hex encoding to avoid external dependency
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
 /// Handler for generating range proofs
 pub struct GenerateRangeProofHandler;
@@ -132,7 +138,12 @@ impl JobHandler for GenerateRangeProofHandler {
                 format!("Failed to decode input {}: {}", input.index, e)
             ))?;
 
-            values.push(Value::Bytes(data));
+            // Use Share for secret data (value, blinding), String (hex) for public (bit_range)
+            if input.is_secret {
+                values.push(Value::Share(ShareType::default_secret_int(), data));
+            } else {
+                values.push(Value::String(hex_encode(&data)));
+            }
         }
 
         Ok(values)
@@ -141,7 +152,7 @@ impl JobHandler for GenerateRangeProofHandler {
     fn format_output(&self, value: &Value) -> HandlerResult<Vec<u8>> {
         // The output should be ~700 bytes (Bulletproofs range proof)
         // Actual size varies based on the proof type and parameters
-        let bytes = value.to_bytes();
+        let bytes = value_to_bytes(value);
 
         // Bulletproofs range proofs are typically 672-768 bytes
         // depending on the number of bits being proven
@@ -532,22 +543,25 @@ mod tests {
         let inputs = handler.prepare_inputs(&job).unwrap();
         assert_eq!(inputs.len(), 3);
 
-        // Check value (8 bytes)
+        // Check value (8 bytes) - is_secret: true, so Share
         match &inputs[0] {
-            Value::Bytes(bytes) => assert_eq!(bytes.len(), 8),
-            _ => panic!("Expected Bytes value"),
+            Value::Share(_, bytes) => assert_eq!(bytes.len(), 8),
+            _ => panic!("Expected Share value for secret value input"),
         }
 
-        // Check blinding (32 bytes)
+        // Check blinding (32 bytes) - is_secret: true, so Share
         match &inputs[1] {
-            Value::Bytes(bytes) => assert_eq!(bytes.len(), 32),
-            _ => panic!("Expected Bytes value"),
+            Value::Share(_, bytes) => assert_eq!(bytes.len(), 32),
+            _ => panic!("Expected Share value for secret blinding input"),
         }
 
-        // Check bit_range (1 byte)
+        // Check bit_range (1 byte) - is_secret: false, so String
         match &inputs[2] {
-            Value::Bytes(bytes) => assert_eq!(bytes.len(), 1),
-            _ => panic!("Expected Bytes value"),
+            Value::String(hex_str) => {
+                // Hex-encoded 1 byte = 2 characters
+                assert_eq!(hex_str.len(), 2);
+            }
+            _ => panic!("Expected String value for public bit_range input"),
         }
     }
 
@@ -560,8 +574,8 @@ mod tests {
 
         // Register the generate_range_proof mock function
         vm.register_function("generate_range_proof", |_args| {
-            // Mock ~700-byte Bulletproofs range proof
-            Ok(Value::Bytes(vec![0x22; 672]))
+            // Mock ~700-byte Bulletproofs range proof (hex-encoded = 1344 chars)
+            Ok(Value::String("22".repeat(672)))
         });
 
         let result = handler.execute(&job, &mut vm).await;

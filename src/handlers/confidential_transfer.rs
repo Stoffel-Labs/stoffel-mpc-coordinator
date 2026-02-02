@@ -7,10 +7,16 @@
 
 use async_trait::async_trait;
 
-use super::{JobHandler, HandlerResult, HandlerError};
+use super::{JobHandler, HandlerResult, HandlerError, value_to_bytes};
 use crate::jobs::Job;
 use crate::types::JobType;
 use crate::vm::Value;
+use stoffel_vm_types::core_types::ShareType;
+
+// Use inline hex encoding to avoid external dependency
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
 /// Handler for executing confidential transfers
 pub struct ConfidentialTransferHandler;
@@ -71,7 +77,12 @@ impl JobHandler for ConfidentialTransferHandler {
                 format!("Failed to decode input {}: {}", input.index, e)
             ))?;
 
-            values.push(Value::Bytes(data));
+            // Use Share for secret data, String (hex) for public data
+            if input.is_secret {
+                values.push(Value::Share(ShareType::default_secret_int(), data));
+            } else {
+                values.push(Value::String(hex_encode(&data)));
+            }
         }
 
         Ok(values)
@@ -80,7 +91,7 @@ impl JobHandler for ConfidentialTransferHandler {
     fn format_output(&self, value: &Value) -> HandlerResult<Vec<u8>> {
         // The output should be the updated account states and proofs
         // Typically this is 64 bytes (32 bytes each for source and dest)
-        let bytes = value.to_bytes();
+        let bytes = value_to_bytes(value);
 
         if bytes.len() < 64 {
             tracing::warn!(

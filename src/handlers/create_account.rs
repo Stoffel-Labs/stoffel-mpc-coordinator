@@ -6,10 +6,15 @@
 
 use async_trait::async_trait;
 
-use super::{JobHandler, HandlerResult, HandlerError};
+use super::{JobHandler, HandlerResult, HandlerError, value_to_bytes};
 use crate::jobs::Job;
 use crate::types::JobType;
 use crate::vm::Value;
+
+// Use inline hex encoding to avoid external dependency
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
 /// Handler for creating confidential accounts
 pub struct CreateConfidentialAccountHandler;
@@ -110,7 +115,8 @@ impl JobHandler for CreateConfidentialAccountHandler {
                 format!("Failed to decode input {}: {}", input.index, e)
             ))?;
 
-            values.push(Value::Bytes(data));
+            // Account creation inputs are public (addresses)
+            values.push(Value::String(hex_encode(&data)));
         }
 
         Ok(values)
@@ -118,7 +124,7 @@ impl JobHandler for CreateConfidentialAccountHandler {
 
     fn format_output(&self, value: &Value) -> HandlerResult<Vec<u8>> {
         // The output should be a 32-byte account PDA address
-        let bytes = value.to_bytes();
+        let bytes = value_to_bytes(value);
 
         if bytes.len() != 32 {
             tracing::warn!(
@@ -375,8 +381,11 @@ mod tests {
         assert_eq!(inputs.len(), 2);
 
         match &inputs[0] {
-            Value::Bytes(bytes) => assert_eq!(bytes.len(), 32),
-            _ => panic!("Expected Bytes value"),
+            Value::String(hex_str) => {
+                // Hex-encoded 32 bytes = 64 characters
+                assert_eq!(hex_str.len(), 64);
+            }
+            _ => panic!("Expected String value"),
         }
     }
 
@@ -395,11 +404,6 @@ mod tests {
         let job = make_create_account_job();
         let mut vm = VmExecutor::new();
         vm.load_bytecode(b"STFL_mock").unwrap();
-
-        // Register the create_account mock function
-        vm.register_function("create_account", |_args| {
-            Ok(Value::Bytes(vec![0xDD; 32])) // Mock 32-byte PDA address
-        });
 
         let result = handler.execute(&job, &mut vm).await;
         assert!(result.is_ok());
