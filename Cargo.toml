@@ -9,6 +9,9 @@ path = "src/deploy-coordinator/bin/main.rs"
 
 [dependencies]
 stoffel-solidity-bindings = { version = "0.1.0", git = "ssh://git@github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord" }
+stoffel-vm = { git = "https://github.com/Stoffel-Labs/StoffelVM.git", branch = "feature/cspl-vm-builtins" }
+stoffel-vm-types = { git = "https://github.com/Stoffel-Labs/StoffelVM.git", branch = "feature/cspl-vm-builtins" }
+stoffellang = { git = "https://github.com/Stoffel-Labs/Stoffel-Lang.git" }
 alloy = { version = "1.5.2", features = ["full", "node-bindings"] }
 alloy-primitives = "1.5.4"
 clap = { version = "4.5.56", features = ["derive"] }
