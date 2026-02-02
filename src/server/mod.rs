@@ -30,6 +30,8 @@ pub struct AppState {
     pub start_time: Instant,
     /// MPC configuration
     pub config: MpcConfig,
+    /// Input mask storage
+    pub mask_store: masks::MaskStore,
 }
 
 /// MPC configuration
@@ -63,6 +65,7 @@ impl AppState {
             parties: Arc::new(RwLock::new(Vec::new())),
             start_time: Instant::now(),
             config,
+            mask_store: masks::MaskStore::new(),
         }
     }
 }
@@ -85,6 +88,8 @@ pub fn create_router(state: AppState) -> Router {
         // Party management
         .route("/mpc/parties", get(list_parties))
         .route("/mpc/parties/register", post(register_party))
+        // Input mask retrieval
+        .route("/mpc/masks/:coordinator_pda/:index", get(masks::get_mask))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

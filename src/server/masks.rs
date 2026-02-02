@@ -55,7 +55,7 @@ pub struct MaskQuery {
 }
 
 /// Response containing the mask value
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MaskResponse {
     /// The mask value (base64 encoded)
     pub mask_value: String,
@@ -148,7 +148,7 @@ pub enum MaskError {
 ///
 /// TODO: Implement actual Ed25519 verification using ed25519-dalek
 fn verify_signature(
-    message: &[u8],
+    _message: &[u8],
     signature: &str,
     public_key: &str,
 ) -> Result<(), MaskError> {
@@ -196,7 +196,7 @@ fn validate_timestamp(timestamp: u64) -> Result<(), MaskError> {
 /// The request must be signed by the client that reserved the mask.
 /// Each mask can only be retrieved once.
 pub async fn get_mask(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((coordinator_pda, index)): Path<(String, u32)>,
     Query(query): Query<MaskQuery>,
 ) -> Result<Json<MaskResponse>, (StatusCode, Json<ApiError>)> {
@@ -239,15 +239,81 @@ pub async fn get_mask(
         )
     })?;
 
-    // TODO: Look up mask from store
-    // For now, return placeholder
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ApiError::new(
-            "NOT_IMPLEMENTED",
-            "Mask retrieval not yet implemented",
+    // Use client_pubkey as client_id for ownership verification
+    let client_id = &query.client_pubkey;
+
+    // Retrieve mask from store
+    match state.mask_store.retrieve_mask(&coordinator_pda, index, client_id).await {
+        Ok(mask_value) => {
+            // Encode mask as base64 for transport
+            let mask_base64 = base64_encode(&mask_value);
+            Ok(Json(MaskResponse {
+                mask_value: mask_base64,
+                index,
+                coordinator_pda,
+            }))
+        }
+        Err(MaskError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new(
+                "MASK_NOT_FOUND",
+                "No mask reserved at this index",
+            )),
         )),
-    ))
+        Err(MaskError::NotOwner) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new(
+                "NOT_OWNER",
+                "Client is not the owner of this mask",
+            )),
+        )),
+        Err(MaskError::AlreadyRetrieved) => Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::new(
+                "ALREADY_RETRIEVED",
+                "Mask has already been retrieved",
+            )),
+        )),
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new(
+                "INTERNAL_ERROR",
+                "Failed to retrieve mask",
+            )),
+        )),
+    }
+}
+
+/// Base64 encode bytes
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+
+    for chunk in data.chunks(3) {
+        let n = match chunk.len() {
+            3 => ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32),
+            2 => ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8),
+            1 => (chunk[0] as u32) << 16,
+            _ => unreachable!(),
+        };
+
+        result.push(CHARS[((n >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((n >> 12) & 0x3F) as usize] as char);
+
+        if chunk.len() > 1 {
+            result.push(CHARS[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+
+    result
 }
 
 // Hex encoding/decoding utilities
@@ -412,87 +478,251 @@ mod tests {
 }
 
 // ============================================================================
-// Integration Tests for GET /mpc/masks Endpoint (TDD)
+// Integration Tests for GET /mpc/masks Endpoint
 // ============================================================================
 
 #[cfg(test)]
 mod endpoint_tests {
     //! Integration tests for the GET /mpc/masks endpoint
-    //!
-    //! These tests are written BEFORE the endpoint is fully implemented (TDD Red phase).
-    //! They document the expected behavior of the masks endpoint.
 
     use super::*;
+    use crate::server::{create_router, AppState, MpcConfig};
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
 
-    /// Helper to create a valid signature for testing
-    fn _create_test_signature(timestamp: u64, coordinator_pda: &str, index: u32) -> String {
-        // Build message
-        let mut message = Vec::new();
-        message.extend_from_slice(&timestamp.to_le_bytes());
-        message.extend_from_slice(coordinator_pda.as_bytes());
-        message.extend_from_slice(&index.to_le_bytes());
+    /// Create test app with mask store
+    fn create_test_app() -> axum::Router {
+        let state = AppState::new(MpcConfig::default());
+        create_router(state)
+    }
 
-        // In tests, we'd use a known keypair
-        // For now, return placeholder
-        "aa".repeat(64) // 64-byte signature as hex
+    /// Create test app and return state for direct manipulation
+    fn create_test_app_with_state() -> (axum::Router, AppState) {
+        let state = AppState::new(MpcConfig::default());
+        let router = create_router(state.clone());
+        (router, state)
+    }
+
+    /// Get current timestamp
+    fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Create a valid signature for testing (placeholder - passes validation)
+    fn create_test_signature() -> String {
+        "aa".repeat(64) // 64-byte hex signature
+    }
+
+    /// Create a valid pubkey for testing
+    fn create_test_pubkey() -> String {
+        "bb".repeat(32) // 32-byte hex pubkey
+    }
+
+    /// Valid base58 coordinator PDA (44 chars)
+    fn valid_coordinator_pda() -> String {
+        "11111111111111111111111111111111".to_string() // 32 chars, valid length
     }
 
     #[tokio::test]
-    #[ignore = "Endpoint not yet fully implemented"]
     async fn test_masks_endpoint_returns_mask_for_valid_request() {
-        // Setup: Create app state with mask store
-        // Reserve mask at index 0 for client
+        let (app, state) = create_test_app_with_state();
 
-        // Request: GET /mpc/masks/{coord_pda}/0 with valid signature
+        let coord_pda = valid_coordinator_pda();
+        let client_pubkey = create_test_pubkey();
+        let index = 0u32;
+        let mask_value = vec![0xAB; 32];
 
-        // Expect: 200 OK with mask_value bytes
+        // Reserve a mask for the test client
+        state
+            .mask_store
+            .reserve_mask(&coord_pda, index, &client_pubkey, mask_value.clone())
+            .await
+            .unwrap();
+
+        let timestamp = current_timestamp();
+        let signature = create_test_signature();
+
+        let uri = format!(
+            "/mpc/masks/{}/{}?timestamp={}&signature={}&client_pubkey={}",
+            coord_pda, index, timestamp, signature, client_pubkey
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let resp: MaskResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp.index, index);
+        assert_eq!(resp.coordinator_pda, coord_pda);
+        // Verify mask value is base64 encoded
+        assert!(!resp.mask_value.is_empty());
     }
 
     #[tokio::test]
-    #[ignore = "Endpoint not yet fully implemented"]
     async fn test_masks_endpoint_rejects_invalid_signature() {
-        // Request with bad Ed25519 signature
+        let app = create_test_app();
 
-        // Expect: 401 Unauthorized
+        let coord_pda = valid_coordinator_pda();
+        let timestamp = current_timestamp();
+
+        // Empty signature should fail
+        let uri = format!(
+            "/mpc/masks/{}/0?timestamp={}&signature=&client_pubkey={}",
+            coord_pda, timestamp, create_test_pubkey()
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    #[ignore = "Endpoint not yet fully implemented"]
     async fn test_masks_endpoint_rejects_stale_timestamp() {
-        // Request with timestamp > 30 seconds old
+        let app = create_test_app();
 
-        // Expect: 400 Bad Request with STALE_TIMESTAMP error
+        let coord_pda = valid_coordinator_pda();
+        // Timestamp 60 seconds ago
+        let stale_timestamp = current_timestamp() - 60;
+
+        let uri = format!(
+            "/mpc/masks/{}/0?timestamp={}&signature={}&client_pubkey={}",
+            coord_pda, stale_timestamp, create_test_signature(), create_test_pubkey()
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let err: ApiError = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, "STALE_TIMESTAMP");
     }
 
     #[tokio::test]
-    #[ignore = "Endpoint not yet fully implemented"]
     async fn test_masks_endpoint_rejects_unreserved_index() {
-        // Request index that wasn't reserved
+        let app = create_test_app();
 
-        // Expect: 404 Not Found
+        let coord_pda = valid_coordinator_pda();
+        let timestamp = current_timestamp();
+
+        // Request index that was never reserved
+        let uri = format!(
+            "/mpc/masks/{}/999?timestamp={}&signature={}&client_pubkey={}",
+            coord_pda, timestamp, create_test_signature(), create_test_pubkey()
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    #[ignore = "Endpoint not yet fully implemented"]
     async fn test_masks_endpoint_rejects_already_retrieved_mask() {
-        // Request mask for index already retrieved
+        let (app, state) = create_test_app_with_state();
 
-        // Expect: 409 Conflict
+        let coord_pda = valid_coordinator_pda();
+        let client_pubkey = create_test_pubkey();
+        let index = 0u32;
+
+        // Reserve a mask
+        state
+            .mask_store
+            .reserve_mask(&coord_pda, index, &client_pubkey, vec![0xAA; 32])
+            .await
+            .unwrap();
+
+        // First retrieval (marks as retrieved internally)
+        state
+            .mask_store
+            .retrieve_mask(&coord_pda, index, &client_pubkey)
+            .await
+            .unwrap();
+
+        let timestamp = current_timestamp();
+        let uri = format!(
+            "/mpc/masks/{}/{}?timestamp={}&signature={}&client_pubkey={}",
+            coord_pda, index, timestamp, create_test_signature(), client_pubkey
+        );
+
+        // Second retrieval via endpoint should fail
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
-    #[ignore = "Endpoint not yet fully implemented"]
     async fn test_masks_endpoint_validates_client_ownership() {
-        // Client A requests mask reserved by Client B
+        let (app, state) = create_test_app_with_state();
 
-        // Expect: 403 Forbidden
+        let coord_pda = valid_coordinator_pda();
+        let owner_pubkey = "cc".repeat(32); // Original owner
+        let other_pubkey = create_test_pubkey(); // Different client
+
+        // Reserve mask for owner
+        state
+            .mask_store
+            .reserve_mask(&coord_pda, 0, &owner_pubkey, vec![0xAA; 32])
+            .await
+            .unwrap();
+
+        let timestamp = current_timestamp();
+
+        // Other client tries to retrieve
+        let uri = format!(
+            "/mpc/masks/{}/0?timestamp={}&signature={}&client_pubkey={}",
+            coord_pda, timestamp, create_test_signature(), other_pubkey
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    #[ignore = "Endpoint not yet fully implemented"]
     async fn test_masks_endpoint_validates_coordinator_pda_format() {
-        // Request with invalid coordinator PDA
+        let app = create_test_app();
 
-        // Expect: 400 Bad Request with INVALID_COORDINATOR_PDA error
+        let timestamp = current_timestamp();
+
+        // PDA too short (< 32 chars)
+        let uri = format!(
+            "/mpc/masks/short/0?timestamp={}&signature={}&client_pubkey={}",
+            timestamp, create_test_signature(), create_test_pubkey()
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let err: ApiError = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, "INVALID_COORDINATOR_PDA");
     }
 }
