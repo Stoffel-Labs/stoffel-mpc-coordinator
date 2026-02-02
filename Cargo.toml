@@ -3,13 +3,42 @@ name = "stoffel-mpc-coordinator"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
+# Temporarily disabled - uncomment when SSH auth is configured:
+# [[bin]]
+# name = "deploy-coordinator"
+# path = "src/deploy-coordinator/bin/main.rs"
+# required-features = ["ethereum"]
+
 [[bin]]
-name = "deploy-coordinator"
-path = "src/deploy-coordinator/bin/main.rs"
+name = "coordinator"
+path = "src/coordinator/bin/main.rs"
 
 [dependencies]
-stoffel-solidity-bindings = { version = "0.1.0", git = "ssh://git@github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord" }
-alloy = { version = "1.5.2", features = ["full", "node-bindings"] }
-alloy-primitives = "1.5.4"
+# Ethereum dependencies (optional, for deploy-coordinator)
+# Temporarily disabled - uncomment when SSH auth is configured:
+# stoffel-solidity-bindings = { version = "0.1.0", git = "ssh://git@github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord", optional = true }
+# alloy = { version = "1.5.2", features = ["full", "node-bindings"], optional = true }
+# alloy-primitives = { version = "1.5.4", optional = true }
+
+# Core dependencies
 clap = { version = "4.5.56", features = ["derive"] }
-tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net"] }
+
+# REST API dependencies
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+tower = { version = "0.5", features = ["util"] }
+
+# [features]
+# default = []
+# ethereum = ["stoffel-solidity-bindings", "alloy", "alloy-primitives"]
