@@ -27,6 +27,11 @@ path = "src/coordinator/bin/main.rs"
 clap = { version = "4.5.56", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net"] }
 
+# StoffelVM dependencies - temporarily disabled due to API compatibility issues
+# TODO: Re-enable once StoffelVM is updated to work with current mpc-protocols
+# stoffel-vm = { path = "../StoffelVM/crates/stoffel-vm" }
+# stoffel-vm-types = { path = "../StoffelVM/crates/stoffel-vm-types" }
+
 # REST API dependencies
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
@@ -38,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tower = { version = "0.5", features = ["util"] }
+base64 = "0.21"
 
 # [features]
 # default = []

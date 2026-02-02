@@ -6,7 +6,11 @@
 pub mod types;
 pub mod jobs;
 pub mod server;
+pub mod vm;
+pub mod executor;
 
 pub use types::*;
-pub use jobs::JobQueue;
+pub use jobs::{JobQueue, Job};
 pub use server::create_router;
+pub use vm::{VmExecutor, VmError, VmResult, Value};
+pub use executor::{JobExecutor, ExecutorConfig, ExecutorError};
