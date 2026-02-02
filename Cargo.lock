@@ -2259,6 +2259,7 @@ dependencies = [
 [[package]]
 name = "stoffel-vm-types"
 version = "0.1.0"
+source = "git+https://github.com/Stoffel-Labs/StoffelVM.git?branch=feature%2Fcoordinator-client#5dceda89a84854f1777f2d99b3b3c8cb64efdefa"
 dependencies = [
  "object-pool",
  "parking_lot 0.12.5",

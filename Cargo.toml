@@ -27,13 +27,11 @@ path = "src/coordinator/bin/main.rs"
 clap = { version = "4.5.56", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net"] }
 
-# StoffelVM dependencies
-# NOTE: Full VM integration is blocked on mpc-protocols compatibility
-# The main branch of mpc-protocols has SenderId type errors
-# The dev branch compiles but has API changes incompatible with StoffelVM
-# For now, use stoffel-vm-types only (for Value type) and keep mock mode
-stoffel-vm-types = { path = "../StoffelVM/crates/stoffel-vm-types" }
-# stoffel-vm = { path = "../StoffelVM/crates/stoffel-vm" }
+# StoffelVM dependencies - use feature/coordinator-client branch
+# This branch uses mpc-protocols dev branch which compiles correctly
+stoffel-vm-types = { git = "https://github.com/Stoffel-Labs/StoffelVM.git", branch = "feature/coordinator-client", package = "stoffel-vm-types" }
+# Full VM integration available once mpc-protocols API compatibility is resolved:
+# stoffel-vm = { git = "https://github.com/Stoffel-Labs/StoffelVM.git", branch = "feature/coordinator-client", package = "stoffel-vm" }
 
 # REST API dependencies
 axum = { version = "0.7", features = ["macros"] }
