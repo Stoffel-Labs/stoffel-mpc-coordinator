@@ -8,9 +8,15 @@ pub mod jobs;
 pub mod server;
 pub mod vm;
 pub mod executor;
+pub mod handlers;
 
 pub use types::*;
 pub use jobs::{JobQueue, Job};
 pub use server::create_router;
 pub use vm::{VmExecutor, VmError, VmResult, Value};
 pub use executor::{JobExecutor, ExecutorConfig, ExecutorError};
+pub use handlers::{
+    JobHandler, HandlerRegistry, HandlerError, HandlerResult,
+    AuthorizeTransferHandler, ConfidentialTransferHandler, DistributedDecryptHandler,
+    get_default_registry,
+};
