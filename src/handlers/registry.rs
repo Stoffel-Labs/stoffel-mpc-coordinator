@@ -7,8 +7,13 @@ use crate::types::JobType;
 use super::{
     JobHandler,
     AuthorizeTransferHandler,
+    ClaimConfidentialAccountHandler,
     ConfidentialTransferHandler,
+    CreateConfidentialAccountHandler,
     DistributedDecryptHandler,
+    GenerateRangeProofHandler,
+    SetAuditorHandler,
+    WrapMintHandler,
 };
 
 /// Registry for job handlers
@@ -74,12 +79,12 @@ pub fn get_default_registry() -> HandlerRegistry {
     registry.register(ConfidentialTransferHandler::new());
     registry.register(DistributedDecryptHandler::new());
 
-    // TODO: Register additional handlers as they are implemented
-    // registry.register(CreateAccountHandler::new());
-    // registry.register(ClaimAccountHandler::new());
-    // registry.register(WrapMintHandler::new());
-    // registry.register(SetAuditorHandler::new());
-    // registry.register(RangeProofHandler::new());
+    // Register additional handlers
+    registry.register(CreateConfidentialAccountHandler::new());
+    registry.register(ClaimConfidentialAccountHandler::new());
+    registry.register(WrapMintHandler::new());
+    registry.register(SetAuditorHandler::new());
+    registry.register(GenerateRangeProofHandler::new());
 
     registry
 }
@@ -126,10 +131,19 @@ mod tests {
     fn test_default_registry() {
         let registry = get_default_registry();
 
+        // Core handlers
         assert!(registry.has_handler(&JobType::AuthorizeTransfer));
         assert!(registry.has_handler(&JobType::ConfidentialTransfer));
         assert!(registry.has_handler(&JobType::DistributedDecrypt));
-        assert_eq!(registry.len(), 3);
+
+        // Additional handlers
+        assert!(registry.has_handler(&JobType::CreateConfidentialAccount));
+        assert!(registry.has_handler(&JobType::ClaimConfidentialAccount));
+        assert!(registry.has_handler(&JobType::WrapMint));
+        assert!(registry.has_handler(&JobType::SetAuditor));
+        assert!(registry.has_handler(&JobType::GenerateRangeProof));
+
+        assert_eq!(registry.len(), 8);
     }
 
     #[test]
@@ -137,8 +151,16 @@ mod tests {
         let registry = get_default_registry();
         let types = registry.registered_types();
 
+        // Core handlers
         assert!(types.contains(&JobType::AuthorizeTransfer));
         assert!(types.contains(&JobType::ConfidentialTransfer));
         assert!(types.contains(&JobType::DistributedDecrypt));
+
+        // Additional handlers
+        assert!(types.contains(&JobType::CreateConfidentialAccount));
+        assert!(types.contains(&JobType::ClaimConfidentialAccount));
+        assert!(types.contains(&JobType::WrapMint));
+        assert!(types.contains(&JobType::SetAuditor));
+        assert!(types.contains(&JobType::GenerateRangeProof));
     }
 }

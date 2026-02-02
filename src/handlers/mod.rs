@@ -5,14 +5,24 @@
 //! prepare inputs, execute the computation, and format outputs.
 
 mod authorize_transfer;
+mod claim_account;
 mod confidential_transfer;
+mod create_account;
 mod distributed_decrypt;
+mod range_proof;
 mod registry;
+mod set_auditor;
+mod wrap_mint;
 
 pub use authorize_transfer::AuthorizeTransferHandler;
+pub use claim_account::ClaimConfidentialAccountHandler;
 pub use confidential_transfer::ConfidentialTransferHandler;
+pub use create_account::CreateConfidentialAccountHandler;
 pub use distributed_decrypt::DistributedDecryptHandler;
+pub use range_proof::GenerateRangeProofHandler;
 pub use registry::{HandlerRegistry, get_default_registry};
+pub use set_auditor::SetAuditorHandler;
+pub use wrap_mint::WrapMintHandler;
 
 use async_trait::async_trait;
 
@@ -101,20 +111,110 @@ mod tests {
     use crate::types::{JobRequest, ClientInput};
 
     fn make_test_job(job_type: JobType) -> Job {
-        let request = JobRequest {
-            job_type,
-            program_hash: "0x1234".to_string(),
-            inputs: vec![
+        // Create appropriate inputs based on job type
+        let inputs = match job_type {
+            JobType::CreateConfidentialAccount => vec![
                 ClientInput {
                     client_id: "client1".to_string(),
                     index: 0,
-                    data: base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &[1, 2, 3, 4]
-                    ),
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[1u8; 32]),
+                    is_secret: false,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 1,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[2u8; 32]),
+                    is_secret: false,
+                },
+            ],
+            JobType::ClaimConfidentialAccount => vec![
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 0,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[1u8; 32]),
+                    is_secret: false,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 1,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[2u8; 32]),
+                    is_secret: false,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 2,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[3u8; 32]),
+                    is_secret: false,
+                },
+            ],
+            JobType::WrapMint => vec![
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 0,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[1u8; 32]),
+                    is_secret: false,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 1,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[2u8; 32]),
+                    is_secret: false,
+                },
+            ],
+            JobType::SetAuditor => vec![
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 0,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[1u8; 32]),
+                    is_secret: false,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 1,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[2u8; 32]),
+                    is_secret: false,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 2,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[3u8; 32]),
+                    is_secret: false,
+                },
+            ],
+            JobType::GenerateRangeProof => vec![
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 0,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &1000u64.to_le_bytes()),
+                    is_secret: true,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 1,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[42u8; 32]),
+                    is_secret: true,
+                },
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 2,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[64u8]),
+                    is_secret: false,
+                },
+            ],
+            _ => vec![
+                ClientInput {
+                    client_id: "client1".to_string(),
+                    index: 0,
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[1, 2, 3, 4]),
                     is_secret: true,
                 }
             ],
+        };
+
+        let request = JobRequest {
+            job_type,
+            program_hash: "0x1234".to_string(),
+            inputs,
             idempotency_key: uuid::Uuid::new_v4().to_string(),
             key_id: "key1".to_string(),
             client_id: "client1".to_string(),
@@ -179,5 +279,80 @@ mod tests {
         assert!(registry.get(&JobType::AuthorizeTransfer).is_some());
         assert!(registry.get(&JobType::ConfidentialTransfer).is_some());
         assert!(registry.get(&JobType::DistributedDecrypt).is_some());
+        assert!(registry.get(&JobType::CreateConfidentialAccount).is_some());
+        assert!(registry.get(&JobType::ClaimConfidentialAccount).is_some());
+        assert!(registry.get(&JobType::WrapMint).is_some());
+        assert!(registry.get(&JobType::SetAuditor).is_some());
+        assert!(registry.get(&JobType::GenerateRangeProof).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_account_handler() {
+        let handler = CreateConfidentialAccountHandler;
+        let job = make_test_job(JobType::CreateConfidentialAccount);
+        let mut vm = VmExecutor::new();
+        vm.load_bytecode(b"STFL_mock").unwrap();
+
+        let result = handler.execute(&job, &mut vm).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.len(), 32); // Mock returns 32 bytes
+    }
+
+    #[tokio::test]
+    async fn test_claim_account_handler() {
+        let handler = ClaimConfidentialAccountHandler;
+        let job = make_test_job(JobType::ClaimConfidentialAccount);
+        let mut vm = VmExecutor::new();
+        vm.load_bytecode(b"STFL_mock").unwrap();
+
+        let result = handler.execute(&job, &mut vm).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.len(), 64); // Mock returns 64 bytes
+    }
+
+    #[tokio::test]
+    async fn test_wrap_mint_handler() {
+        let handler = WrapMintHandler;
+        let job = make_test_job(JobType::WrapMint);
+        let mut vm = VmExecutor::new();
+        vm.load_bytecode(b"STFL_mock").unwrap();
+
+        let result = handler.execute(&job, &mut vm).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.len(), 32); // Mock returns 32 bytes
+    }
+
+    #[tokio::test]
+    async fn test_set_auditor_handler() {
+        let handler = SetAuditorHandler;
+        let job = make_test_job(JobType::SetAuditor);
+        let mut vm = VmExecutor::new();
+        vm.load_bytecode(b"STFL_mock").unwrap();
+
+        let result = handler.execute(&job, &mut vm).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.len(), 64); // Mock returns 64 bytes
+    }
+
+    #[tokio::test]
+    async fn test_range_proof_handler() {
+        let handler = GenerateRangeProofHandler;
+        let job = make_test_job(JobType::GenerateRangeProof);
+        let mut vm = VmExecutor::new();
+        vm.load_bytecode(b"STFL_mock").unwrap();
+
+        let result = handler.execute(&job, &mut vm).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.len(), 672); // Mock returns Bulletproofs size
     }
 }

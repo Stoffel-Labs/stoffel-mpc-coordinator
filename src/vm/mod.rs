@@ -143,6 +143,61 @@ impl VmExecutor {
                 handler: |_args| Ok(Value::Unit),
             },
         );
+
+        // create_account - returns mock 32-byte PDA address
+        self.functions.insert(
+            "create_account".to_string(),
+            MockFunction {
+                name: "create_account".to_string(),
+                handler: |_args| {
+                    Ok(Value::Bytes(vec![0xDD; 32]))
+                },
+            },
+        );
+
+        // claim_account - returns mock 64-byte output (address + signature)
+        self.functions.insert(
+            "claim_account".to_string(),
+            MockFunction {
+                name: "claim_account".to_string(),
+                handler: |_args| {
+                    Ok(Value::Bytes(vec![0xEE; 64]))
+                },
+            },
+        );
+
+        // wrap_mint - returns mock 32-byte confidential mint address
+        self.functions.insert(
+            "wrap_mint".to_string(),
+            MockFunction {
+                name: "wrap_mint".to_string(),
+                handler: |_args| {
+                    Ok(Value::Bytes(vec![0xFF; 32]))
+                },
+            },
+        );
+
+        // set_auditor - returns mock 64-byte output (mint + confirmation)
+        self.functions.insert(
+            "set_auditor".to_string(),
+            MockFunction {
+                name: "set_auditor".to_string(),
+                handler: |_args| {
+                    Ok(Value::Bytes(vec![0x11; 64]))
+                },
+            },
+        );
+
+        // generate_range_proof - returns mock ~672-byte Bulletproofs proof
+        self.functions.insert(
+            "generate_range_proof".to_string(),
+            MockFunction {
+                name: "generate_range_proof".to_string(),
+                handler: |_args| {
+                    Ok(Value::Bytes(vec![0x22; 672]))
+                },
+            },
+        );
     }
 
     /// Load a compiled program from bytecode bytes
