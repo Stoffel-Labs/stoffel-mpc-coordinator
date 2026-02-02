@@ -1,5 +1,7 @@
 //! Axum REST API server for the MPC Coordinator
 
+pub mod masks;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
