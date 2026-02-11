@@ -30,7 +30,10 @@ struct Args {
     n: u32,
 
     #[arg(long)]
-    t: u32
+    t: u32,
+
+    #[arg(long)]
+    n_inputs: u32,
 }
 
 async fn connect_to_eth_node(addr: &str, sk: &str) -> impl Provider + Clone {
@@ -54,8 +57,9 @@ async fn main() {
     let initial_mpc_nodes: Vec<Address> = args.initial_mpc_nodes.iter()
         .map(|s| Address::from_str(s).expect("invalid initial MPC node address"))
         .collect();
+    let n_inputs = U256::from(args.n_inputs);
 
-    let contract = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes).await.expect("deployment failed");
+    let contract = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes, n_inputs).await.expect("deployment failed");
 
     println!("{}", contract.address());
 }
