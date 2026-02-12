@@ -2,7 +2,6 @@ use std::future::Future;
 use ark_bls12_381::Fr;
 use thiserror::Error;
 use serde::{Serialize, Deserialize};
-use jsonrpsee::core::ClientError;
 
 pub trait Coordinator {
     fn trigger_input(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
@@ -428,7 +427,7 @@ pub mod on_chain {
             fake_coordinator::FakeCoordinator,
         };
         use tokio::time::{timeout, Duration};
-        use rand::Rng;
+        use rand::RngExt;
     
         static SK: [&str; 10] = [
             "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -564,8 +563,8 @@ pub mod on_chain {
                 let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
                 let coord = OnChainCoordinator::new(coord_instance, initial_mpc_nodes).await;
     
-                coord.trigger_pp().await;
-                coord.wait_for_pp().await;
+                coord.trigger_pp().await.unwrap();
+                coord.wait_for_pp().await.unwrap();
             }
     
             // event triggered AFTER waiting for the event
@@ -591,7 +590,7 @@ pub mod on_chain {
                     }
                 });
                     
-                coord.trigger_pp().await;
+                coord.trigger_pp().await.unwrap();
             }
         }
     }
@@ -600,7 +599,7 @@ pub mod on_chain {
 pub mod off_chain {
     use ark_bls12_381::Fr;
     use ark_ff::FftField;
-    use jsonrpsee::{core::{SubscriptionResult, RpcResult, to_json_raw_value}, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::{ServerHandle, ServerBuilder}, ws_client::*};
+    use jsonrpsee::{core::{SubscriptionResult, RpcResult, to_json_raw_value}, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
     use crate::{Coordinator, CoordinatorError};
     use events::*;
     use serde::{Serializer, Deserializer, Deserialize, Serialize};
@@ -609,7 +608,18 @@ pub mod off_chain {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Mutex;
+    use tokio::task::JoinHandle;
     use async_trait::async_trait;
+    use axum::{routing::any_service, Router};
+    use jsonrpsee::server::{RpcModule, Server};
+    use tower::Service;
+    use axum::http::{Request, StatusCode};
+    use axum::body::Body;
+    use axum::response::IntoResponse;
+    use axum_server::Handle;
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use jsonrpsee::async_client::Client;
 
     #[derive(Clone, Debug)]
     pub struct FieldElement<T: FftField> {
@@ -1170,40 +1180,78 @@ pub mod off_chain {
         }
     }
 
-    struct OffChainCoordinator {
+    pub struct OffChainCoordinator {
         rpc_server: Option<CoordinatorRPCServerImpl>,
-        rpc_coord: Option<WsClient>,
+        rpc_coord: Option<Client>,
         addr: Option<String>,
-        server_handle: Option<ServerHandle>,
+        port: Option<u16>,
+        server_handle: Option<JoinHandle<()>>,
+        stop_tx: Option<ServerHandle>,
         timestamp: Option<u64>,
         cid: Option<usize>
     }
 
     impl OffChainCoordinator {
-        pub async fn start_coord(port: u16, prog_hash: [u8; 32], n: usize, t: usize, initial_mpc_nodes: Vec<usize>, n_inputs: usize) -> Self {
+        pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: usize, t: usize, initial_mpc_nodes: Vec<usize>, n_inputs: usize, server_cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
+            let full_addr = format!("{}:{}", addr, port);
             let rpc_server = CoordinatorRPCServerImpl::new(prog_hash, n, t, initial_mpc_nodes.clone(), n_inputs);
-            let server = ServerBuilder::default().build(format!("127.0.0.1:{}", port)).await.unwrap();
-            let addr = server.local_addr().unwrap();
-            let server_handle = server.start(rpc_server.clone().into_rpc());
+            let mut rpc_module = RpcModule::new(());
+            rpc_module.merge(rpc_server.clone().into_rpc()).unwrap();
+
+            let (stop_rx, stop_tx) = jsonrpsee::server::stop_channel();
+            let rpc_service = Server::builder()
+                .to_service_builder()
+                .build(rpc_module, stop_rx);
+
+            let rpc_service_wrapper = tower::service_fn(move |req: Request<Body>| {
+                let mut rpc_service = rpc_service.clone();
+                
+                async move {
+                    match rpc_service.call(req).await {
+                        Ok(response) => Ok::<_, Infallible>(response.map(Body::new)),
+                        Err(_) => Ok::<_, std::convert::Infallible>(
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        ),
+                    }
+                }
+            });
+
+            let app = Router::new().route("/", any_service(rpc_service_wrapper));
+            let tls_config = self_signed_certs::server_tls_config(server_cert);
+            let handle = Handle::new();
+
+            let server_handle = tokio::spawn({
+                let full_addr = full_addr.parse::<SocketAddr>().unwrap();
+                let handle = handle.clone(); async move {
+                axum_server::bind_rustls(full_addr, tls_config)
+                    .handle(handle)
+                    .serve(app.into_make_service()).await.unwrap();
+            }});
+
+            handle.listening().await.expect("server failed to bind");
 
             Self {
                 rpc_server: Some(rpc_server),
                 rpc_coord: None,
-                addr: Some(format!("ws://{}", addr)),
+                addr: Some(String::from(addr)),
+                port: Some(port),
                 server_handle: Some(server_handle),
+                stop_tx: Some(stop_tx),
                 timestamp: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()),
                 cid: None
             }
         }
 
-        pub async fn start_client(addr: String, timestamp: u64, cid: usize) -> Self {
-            let rpc_coord = Some(WsClientBuilder::default().build(&addr).await.unwrap());
+        pub async fn start_rpc_client(addr: &str, port: u16, timestamp: u64, cid: usize, client_cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
+            let rpc_coord = self_signed_certs::setup_client(addr, port, client_cert).await;
 
             Self {
                 rpc_server: None,
-                rpc_coord,
+                rpc_coord: Some(rpc_coord),
                 addr: None,
+                port: None,
                 server_handle: None,
+                stop_tx: None,
                 timestamp: Some(timestamp),
                 cid: Some(cid)
              }
@@ -1246,7 +1294,7 @@ pub mod off_chain {
     
     impl Coordinator for OffChainCoordinator {
         async fn trigger_input(&self) -> Result<(), CoordinatorError> {
-            let _ = self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::InputCollection).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::InputCollection).await.unwrap();
 
             Ok(())
         }
@@ -1259,7 +1307,7 @@ pub mod off_chain {
         }
 
         async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
-            let _ = self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::Preprocessing).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::Preprocessing).await.unwrap();
 
             Ok(())
         }
@@ -1272,7 +1320,7 @@ pub mod off_chain {
         }
 
         async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
-            let _ = self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::InputMaskReservation).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::InputMaskReservation).await.unwrap();
 
             Ok(())
         }
@@ -1292,7 +1340,7 @@ pub mod off_chain {
 
 
         async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
-            let _ = self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::MPC).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::MPC).await.unwrap();
 
             Ok(())
         }
@@ -1324,9 +1372,194 @@ pub mod off_chain {
         }
 
         async fn finalize(&self) -> Result<(), CoordinatorError> {
-            let _ = self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::Idle).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::Idle).await.unwrap();
 
             Ok(())
+        }
+    }
+
+    mod self_signed_certs {
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::UnixTime;
+        use rustls::pki_types::ServerName;
+        use rustls::server::danger::{ClientCertVerifier, ClientCertVerified};
+        use rustls::client::danger::{ServerCertVerifier, ServerCertVerified};
+        use rustls::DistinguishedName;
+        use axum_server::tls_rustls::RustlsConfig;
+        use std::sync::Arc;
+        use jsonrpsee::client_transport::ws::WsTransportClientBuilder;
+        use jsonrpsee::core::client::ClientBuilder;
+        use url::Url;
+        use jsonrpsee::async_client::Client;
+        use rustls::ClientConfig;
+        use tokio_rustls::TlsConnector;
+        use tokio::net::TcpStream;
+
+        #[derive(Debug)]
+        pub struct SelfSignedClientVerifier;
+
+        #[derive(Debug)]
+        pub struct SelfSignedServerVerifier;
+
+        impl ClientCertVerifier for SelfSignedClientVerifier {
+            fn root_hint_subjects(&self) -> &[DistinguishedName] {
+                &[]
+            }
+        
+            fn verify_client_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: UnixTime,
+            ) -> Result<ClientCertVerified, rustls::Error> {
+                Ok(ClientCertVerified::assertion())
+            }
+        
+               fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+        
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+        
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        impl ServerCertVerifier for SelfSignedServerVerifier {
+            fn verify_server_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: &ServerName<'_>,
+                _: &[u8],
+                _: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+        
+               fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+        
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+        
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        pub fn server_cert() -> rcgen::CertifiedKey<rcgen::KeyPair> {
+            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+
+            rcgen::generate_simple_self_signed(subject_alt_names).unwrap()
+        }
+
+        pub fn client_cert() -> rcgen::CertifiedKey<rcgen::KeyPair> {
+            let subject_alt_names = vec!["client".to_string()];
+
+            rcgen::generate_simple_self_signed(subject_alt_names).unwrap()
+        }
+
+        pub fn server_tls_config(cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> RustlsConfig {
+            let certs = {
+                let cert_der = cert.cert.der().to_vec();
+                vec![CertificateDer::from(cert_der)]
+            };
+            let key = {
+                let key_der = cert.signing_key.serialize_der();
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der))
+            };
+        
+            let server_config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(Arc::new(SelfSignedClientVerifier {}))
+                .with_single_cert(certs, key).unwrap();
+            
+            RustlsConfig::from_config(Arc::new(server_config))
+        }
+
+        fn client_tls_config(cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> ClientConfig {
+            let certs = {
+                let cert_der = cert.cert.der().to_vec();
+                vec![CertificateDer::from(cert_der)]
+            };
+            let key = {
+                let key_der = cert.signing_key.serialize_der();
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der))
+            };
+
+            ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_client_auth_cert(certs, key).unwrap()
+        }
+
+        pub async fn setup_client(addr: &str, port: u16, cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Client {
+            let full_addr = format!("{}:{}", addr, port);
+            let url = format!("wss://{}:{}/", addr, port);
+            let mut tls_config = client_tls_config(cert);
+            tls_config.dangerous().set_certificate_verifier(Arc::new(SelfSignedServerVerifier {}));
+
+            let tls_connector = TlsConnector::from(Arc::new(tls_config));
+            let tcp_stream = TcpStream::connect(full_addr).await.unwrap();
+            let domain = ServerName::try_from(addr).unwrap().to_owned();
+            let tls_stream = tls_connector.connect(domain, tcp_stream).await.unwrap();
+            
+            let (sender, receiver) = WsTransportClientBuilder::default()
+                .build_with_stream(Url::parse(&url).unwrap(), tls_stream)
+                .await.unwrap();
+
+            ClientBuilder::default()
+                .build_with_tokio(sender, receiver)
         }
     }
 
@@ -1334,25 +1567,43 @@ pub mod off_chain {
     mod tests {
         use super::*;
         use tokio::sync::Barrier;
+        use super::self_signed_certs::{server_cert, client_cert};
+        use std::sync::Once;
+
+        static INIT: Once = Once::new();
+        fn setup_test() {
+            INIT.call_once(|| {
+                rustls::crypto::ring::default_provider()
+                    .install_default()
+                    .expect("Failed to install default crypto provider");
+            });
+        }
 
         #[tokio::test]
         async fn start_client_server() {
-            let coord = OffChainCoordinator::start_coord(12345, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2).await;
-            let addr = coord.get_addr();
+            setup_test();
+
+            let addr = "127.0.0.1";
+            let port = 12345;
+            let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
             let timestamp = coord.get_timestamp();
-            let _ = OffChainCoordinator::start_client(addr, timestamp, 0).await;
+
+            let _ = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 0, client_cert()).await;
         }
 
         #[tokio::test]
         async fn trigger_pp() {
+            setup_test();
+
             // event triggered BEFORE waiting for the event
             {
-                let coord = OffChainCoordinator::start_coord(12346, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2).await;
-                let addr = coord.get_addr();
+                let addr = "127.0.0.1";
+                let port = 12346;
+                let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
                 let timestamp = coord.get_timestamp();
 
-                let node0 = OffChainCoordinator::start_client(addr.clone(), timestamp, 0).await;
-                let node1 = OffChainCoordinator::start_client(addr, timestamp, 1).await;
+                let node0 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 0, client_cert()).await;
+                let node1 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 1, client_cert()).await;
 
                 node0.trigger_pp().await.unwrap();
 
@@ -1363,13 +1614,14 @@ pub mod off_chain {
 
             // event triggered AFTER waiting for the event
             {
-                let coord = OffChainCoordinator::start_coord(12347, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2).await;
-                let addr = coord.get_addr();
+                let addr = "127.0.0.1";
+                let port = 12347;
+                let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
                 let timestamp = coord.get_timestamp();
                 let barrier = Arc::new(Barrier::new(2));
 
-                let node0 = OffChainCoordinator::start_client(addr.clone(), timestamp, 0).await;
-                let node1 = OffChainCoordinator::start_client(addr.clone(), timestamp, 1).await;
+                let node0 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 0, client_cert()).await;
+                let node1 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 1, client_cert()).await;
 
                 tokio::spawn({
                     let barrier = barrier.clone();
@@ -1388,8 +1640,11 @@ pub mod off_chain {
 
         #[tokio::test]
         async fn end_to_end() {
-            let coord = OffChainCoordinator::start_coord(12348, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2).await;
-            let addr = coord.get_addr();
+            setup_test();
+
+            let addr = "127.0.0.1";
+            let port = 12348;
+            let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
             let timestamp = coord.get_timestamp();
             let cid: usize = 0;
             let barrier = Arc::new(Barrier::new(3));
@@ -1397,7 +1652,7 @@ pub mod off_chain {
             // MPC client, also RPC client
             tokio::spawn({
                 let barrier = barrier.clone();
-                let mut client = OffChainCoordinator::start_client(addr.clone(), timestamp, cid).await;
+                let mut client = OffChainCoordinator::start_rpc_client(addr, port, timestamp, cid, client_cert()).await;
                 async move {
                     let _ = client.wait_for_pp().await;
                     let _ = client.wait_for_input_mask_init().await;
@@ -1418,7 +1673,7 @@ pub mod off_chain {
             // MPC node (designated party), also RPC client
             tokio::spawn({
                 let barrier = barrier.clone();
-                let mut node = OffChainCoordinator::start_client(addr.clone(), timestamp, cid).await;
+                let mut node = OffChainCoordinator::start_rpc_client(addr, port, timestamp, cid, client_cert()).await;
                 async move {
                     node.trigger_pp().await.unwrap();
                     let _ = node.wait_for_pp().await;
@@ -1451,7 +1706,13 @@ pub mod off_chain {
 
         #[tokio::test]
         async fn auth_client() {
+            setup_test();
             // TODO
+        }
+
+        #[tokio::test]
+        async fn stop_rpc_server() {
+            // TODO: try using stop_tx
         }
     }
 }
