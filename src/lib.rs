@@ -2,22 +2,26 @@ use std::future::Future;
 use ark_bls12_381::Fr;
 use thiserror::Error;
 use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 
 pub trait Coordinator {
+    type ClientIdentity;
+    type Index;
+
     fn trigger_input(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn trigger_pp(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn init_input_masks(&mut self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_input(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_pp(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_input_mask_init(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn obtain_mask_indices(&mut self, n_indices: usize) -> impl Future<Output = Result<Vec<usize>, CoordinatorError>>;
-    fn send_masked_input(&self, masked_input: Fr, i: usize) -> impl Future<Output = Result<(), CoordinatorError>>;
-    //fn wait_for_masked_inputs(&self, n_clients: usize) -> impl Future<Output = Result<HashMap<usize, Vec<Fr>>, CoordinatorError>>;
+    fn obtain_mask_indices(&mut self, n_indices: Self::Index) -> impl Future<Output = Result<Vec<Self::Index>, CoordinatorError>>;
+    fn send_masked_input(&self, masked_input: Fr, i: Self::Index) -> impl Future<Output = Result<(), CoordinatorError>>;
+    fn wait_for_masked_inputs(&self, n_clients: usize) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<Fr>>, CoordinatorError>>;
     fn trigger_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn trigger_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-   // fn wait_for_indices(&self, n_clients: usize) -> impl Future<Output = Result<HashMap<usize, usize>, CoordinatorError>>;
+    fn wait_for_indices(&self, n_clients: usize) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Self::Index>, CoordinatorError>>;
     fn finalize(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
 }
 
@@ -53,10 +57,11 @@ pub mod on_chain {
         fake_coordinator::FakeCoordinator
     };
     use futures_util::stream::StreamExt;
-    use serde::{Serialize, Deserialize};
     use std::collections::HashMap;
     use super::{Coordinator, CoordinatorError, ClientSig};
 
+    type ClientIdentity = Address;
+    type Index = U256;
     
     #[derive(Clone)]
     pub struct OnChainCoordinator<P: Provider> {
@@ -179,7 +184,13 @@ pub mod on_chain {
             Ok(())
         }
     
-        pub async fn wait_for_indices(&self, n_clients: usize) -> Result<HashMap<Address, U256>, CoordinatorError> {
+    }
+    
+    impl<P: Provider> Coordinator for OnChainCoordinator<P> {
+        type ClientIdentity = Address;
+        type Index = U256;
+
+        async fn wait_for_indices(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Index>, CoordinatorError> {
             let mut addr_to_i: HashMap<Address, U256> = HashMap::new();
             
             // spawn thread to receive all ReservedInputEvents
@@ -201,7 +212,7 @@ pub mod on_chain {
             Ok(addr_to_i)
         }
 
-        pub async fn wait_for_masked_inputs(&self, n_clients: usize) -> Result<HashMap<Address, Vec<Fr>>, CoordinatorError> {
+        async fn wait_for_masked_inputs(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
             let mut events = self.coord
                 .MaskedInputEvent_filter()
                 .from_block(self.contract_block)
@@ -224,9 +235,7 @@ pub mod on_chain {
             }
             Ok(masked_inputs)
         }
-    }
-    
-    impl<P: Provider> Coordinator for OnChainCoordinator<P> {
+
         async fn trigger_input(&self) -> Result<(), CoordinatorError> {
             let builder = self.coord.collectInputs();
             let result = builder.send().await;
@@ -317,17 +326,14 @@ pub mod on_chain {
             }
         }
         
-        async fn obtain_mask_indices(&mut self, n_indices: usize) -> Result<Vec<usize>, CoordinatorError> {
-            let indices = {
-                let indices = self.coord.obtainInputMasks(fr_to_u256(Fr::from(n_indices as u128))).call().await.expect("sending TX failed");
-                indices.iter().map(|index| u256_to_u64(*index).unwrap() as usize).collect()
-            };
+        async fn obtain_mask_indices(&mut self, n_indices: Index) -> Result<Vec<Index>, CoordinatorError> {
+            let indices = self.coord.obtainInputMasks(n_indices).call().await.expect("sending TX failed");
 
             Ok(indices)
         }
         
-        async fn send_masked_input(&self, masked_input: Fr, i: usize) -> Result<(), CoordinatorError> {
-            let builder = self.coord.submitMaskedInput(fr_to_u256(masked_input), fr_to_u256(Fr::from(i as u128)));
+        async fn send_masked_input(&self, masked_input: Fr, i: Index) -> Result<(), CoordinatorError> {
+            let builder = self.coord.submitMaskedInput(fr_to_u256(masked_input), i);
             let result = builder.send().await;
             match result {
                 Ok(r) => {
@@ -617,6 +623,10 @@ pub mod off_chain {
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
     use hyper_util::service::TowerToHyperService;
     use hyper_util::rt::TokioIo;
+    use x509_parser::prelude::*;
+
+    type ClientIdentity = Vec<u8>;
+    type Index = u64;
 
     #[derive(Clone, Debug)]
     pub struct FieldElement<T: FftField> {
@@ -656,7 +666,7 @@ pub mod off_chain {
     pub mod events {
         use ark_bls12_381::Fr;
         use serde::{Serialize, Deserialize};
-        use super::FieldElement;
+        use super::{ClientIdentity, Index, FieldElement};
         use downcast_rs::{Downcast, impl_downcast};
         use dyn_clone::{DynClone, clone_trait_object};
     //    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
@@ -674,8 +684,8 @@ pub mod off_chain {
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct IndexBufferEvent {
-            pub total_indices: usize,
-            pub designated_party: usize
+            pub total_indices: Index,
+            pub designated_party: ClientIdentity
         }
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -695,12 +705,12 @@ pub mod off_chain {
             //address executor
             //uint256 timeOfExecution
         }
-    
+   
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct MaskedInputEvent {
-            pub client: usize,
+            pub client: ClientIdentity,
             pub masked_input: FieldElement<Fr>,
-            pub reserved_index: usize
+            pub reserved_index: Index
         }
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -717,14 +727,14 @@ pub mod off_chain {
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct PreprocessingStarted {
-            pub designated_party: usize
+            pub designated_party: ClientIdentity,
             //uint256 timeOfExecution
         }
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct ReservedInputEvent {
-            pub client: usize,
-            pub reserved_index: usize
+            pub client: ClientIdentity,
+            pub reserved_index: Index
         }
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -744,7 +754,7 @@ pub mod off_chain {
             //address coordinator
             //uint256 timeofInitialization;
             pub creation_block: u64,
-            pub designated_party: usize
+            pub designated_party: ClientIdentity
         }
         
         #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -807,19 +817,19 @@ pub mod off_chain {
         async fn sub_collect_inputs(&self, timestamp: u64) -> SubscriptionResult;
     
         #[method(name = "auth_client")]
-        async fn auth_client(&self, client_sig: ClientSig, key: Vec<u8>) -> RpcResult<bool>;
+        async fn auth_client(&self, client_sig: ClientSig, key: ClientIdentity) -> RpcResult<bool>;
     
         #[method(name = "available_input_masks")]
-        async fn available_input_masks(&self) -> RpcResult<usize>;
+        async fn available_input_masks(&self) -> RpcResult<u64>;
     
         #[method(name = "obtain_input_masks")]
-        async fn obtain_mask_indices(&self, n_indices: usize, cid: usize) -> RpcResult<Vec<usize>>;
+        async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<Index>>;
 
         #[subscription(name = "sub_reserve_input_masks", unsubscribe = "unsub_reserve_input_masks", item = InputMaskReservationStarted)]
         async fn sub_reserve_input_masks(&self, timestamp: u64) -> SubscriptionResult;
     
         #[method(name = "reset")]
-        async fn reset(&self, prog_hash: [u8; 32], n: usize, t: usize, initial_mpc_nodes: Vec<usize>, n_inputs: usize);
+        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64);
     
         #[subscription(name = "sub_send_outputs", unsubscribe = "unsub_send_outputs", item = OutputSendingStarted)]
         async fn sub_send_outputs(&self, timestamp: u64) -> SubscriptionResult;
@@ -831,7 +841,7 @@ pub mod off_chain {
         async fn sub_start_pp(&self, timestamp: u64) -> SubscriptionResult;
     
         #[method(name = "submit_masked_input")]
-        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: usize, cid: usize) -> RpcResult<()>;
+        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: Index) -> RpcResult<()>;
 
         #[subscription(name = "sub_reserved_indices", unsubscribe = "unsub_reserved_indices", item = ReservedInputEvent)]
         async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
@@ -840,10 +850,13 @@ pub mod off_chain {
         async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
 
         #[method(name = "transition")]
-        async fn transition(&self, cid: usize, next_round: Round) -> RpcResult<()>;
+        async fn transition(&self, next_round: Round) -> RpcResult<()>;
     }
 
-    struct CoordinatorRPCServerImpl(Arc<Mutex<CoordinatorRPCServerImplInternal>>, Vec<u8>);
+    struct CoordinatorRPCServerImpl {
+        d: Arc<Mutex<CoordinatorRPCServerImplInternal>>,
+        id: ClientIdentity
+    }
 
     struct ClientInfo {
         cert: Vec<u8>,
@@ -859,19 +872,19 @@ pub mod off_chain {
         reserved_index_sinks: Vec<SubscriptionSink>,
         masked_input_events: Vec<(u64, MaskedInputEvent)>,
         masked_input_sinks: Vec<SubscriptionSink>,
-        next_i: usize,
-        reserved_indices: Vec<Option<usize>>,
+        next_i: Index,
+        reserved_indices: Vec<Option<ClientIdentity>>,
         input_masks: Vec<Option<Fr>>,
         round: Round,
         prog_hash: [u8; 32],
-        n: usize,
-        t: usize,
-        mpc_nodes: Option<Vec<usize>>,
-        clients: HashMap<Vec<u8>, ClientInfo>,
+        n: u64,
+        t: u64,
+        mpc_nodes: Option<Vec<ClientIdentity>>,
+        clients: HashMap<ClientIdentity, ClientInfo>,
     }
 
     impl CoordinatorRPCServerImplInternal {
-        pub fn new(prog_hash: [u8; 32], n: usize, t: usize, initial_mpc_nodes: Vec<usize>, n_inputs: usize) -> Self {
+        pub fn new(prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index) -> Self {
             Self {
                 sinks: HashMap::from([
                     (Round::Idle, vec![]),
@@ -894,8 +907,8 @@ pub mod off_chain {
                 masked_input_events: vec![],
                 masked_input_sinks: vec![],
                 next_i: 0,
-                reserved_indices: vec![None; n_inputs],
-                input_masks: vec![None; n_inputs],
+                reserved_indices: vec![None; n_inputs as usize],
+                input_masks: vec![None; n_inputs as usize],
                 round: Round::Idle,
                 prog_hash,
                 n,
@@ -1008,9 +1021,6 @@ pub mod off_chain {
         }
     }
 
-    impl CoordinatorRPCServerImpl {
-    }
-
     fn round_before(current: Round) -> Round {
         match current {
             Round::Idle => Round::Output,
@@ -1036,31 +1046,31 @@ pub mod off_chain {
     #[async_trait]
     impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
         async fn sub_collect_inputs(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-            let mut d = self.0.lock().await;
+            let mut d = self.d.lock().await;
 
             d.subscribe_oneshot::<InputCollectionStarted>(pending, timestamp, Round::InputCollection).await
         }
 
-        async fn auth_client(&self, client_sig: ClientSig, key: Vec<u8>) -> RpcResult<bool> {
+        async fn auth_client(&self, client_sig: ClientSig, key: ClientIdentity) -> RpcResult<bool> {
             let message = client_sig.i.to_be_bytes();
             let verifier = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, key);
             Ok(verifier.verify(&message, &client_sig.sig).is_ok())
         }
 
-        async fn available_input_masks(&self) -> RpcResult<usize> {
-            let d = self.0.lock().await;
+        async fn available_input_masks(&self) -> RpcResult<u64> {
+            let d = self.d.lock().await;
 
-            Ok(d.input_masks.len() - d.next_i)
+            Ok(d.input_masks.len() as u64 - d.next_i)
         }
 
         async fn sub_reserve_input_masks(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-            let mut d = self.0.lock().await;
+            let mut d = self.d.lock().await;
 
             d.subscribe_oneshot::<InputMaskReservationStarted>(pending, timestamp, Round::InputMaskReservation).await
         }
 
-        async fn reset(&self, prog_hash: [u8; 32], n: usize, t: usize, initial_mpc_nodes: Vec<usize>, n_inputs: usize) {
-            let mut d = self.0.lock().await;
+        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index) {
+            let mut d = self.d.lock().await;
 
             if d.round != Round::Idle {
                 panic!();
@@ -1068,8 +1078,8 @@ pub mod off_chain {
 
             d.round = Round::Idle;
             d.next_i = 0;
-            d.input_masks = vec![None; n_inputs];
-            d.reserved_indices = vec![None; n_inputs];
+            d.input_masks = vec![None; n_inputs as usize];
+            d.reserved_indices = vec![None; n_inputs as usize];
             d.prog_hash = prog_hash;
             d.n = n;
             d.t = t;
@@ -1077,37 +1087,39 @@ pub mod off_chain {
         }
 
         async fn sub_send_outputs(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-            let mut d = self.0.lock().await;
+            let mut d = self.d.lock().await;
 
             d.subscribe_oneshot::<OutputSendingStarted>(pending, timestamp, Round::Output).await
         }
 
         async fn sub_start_mpc(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-            let mut d = self.0.lock().await;
+            let mut d = self.d.lock().await;
 
             d.subscribe_oneshot::<MPCStarted>(pending, timestamp, Round::MPC).await
         }
 
         async fn sub_start_pp(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-            let mut d = self.0.lock().await;
+            let mut d = self.d.lock().await;
 
             d.subscribe_oneshot::<PreprocessingStarted>(pending, timestamp, Round::Preprocessing).await
         }
 
-        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: usize, cid: usize) -> RpcResult<()> {
-            let mut d = self.0.lock().await;
+        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, raw_reserved_index: Index) -> RpcResult<()> {
+            let mut d = self.d.lock().await;
 
             if d.round != Round::InputCollection {
                 panic!();
             }
 
-            if reserved_index >= d.input_masks.len() {
+            let reserved_index = raw_reserved_index as usize;
+
+            if reserved_index >= d.input_masks.len(){
                 panic!();
             }
 
-            match d.reserved_indices[reserved_index] {
-                Some(other_cid) => {
-                    if other_cid != cid {
+            match &d.reserved_indices[reserved_index] {
+                Some(public_key) => {
+                    if *public_key != self.id {
                         panic!();
                     }
                     if d.input_masks[reserved_index].is_some() {
@@ -1115,7 +1127,7 @@ pub mod off_chain {
                     }
                     d.input_masks[reserved_index] = Some(masked_input.value);
 
-                    let event = MaskedInputEvent { client: cid, masked_input, reserved_index };
+                    let event = MaskedInputEvent { client: self.id.clone(), masked_input, reserved_index: raw_reserved_index };
                     for sink in d.masked_input_sinks.clone().iter() {
                         let json = to_json_raw_value(&event).expect("failed convert to JSON");
                         sink.send(json).await.unwrap();
@@ -1131,7 +1143,7 @@ pub mod off_chain {
         }
 
         async fn sub_reserved_indices(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-            let mut d = self.0.lock().await;
+            let mut d = self.d.lock().await;
 
             if d.round != Round::InputMaskReservation {
                 panic!();
@@ -1141,7 +1153,7 @@ pub mod off_chain {
         }
 
         async fn sub_masked_inputs(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-            let mut d = self.0.lock().await;
+            let mut d = self.d.lock().await;
 
             if d.round != Round::InputCollection {
                 panic!();
@@ -1150,21 +1162,21 @@ pub mod off_chain {
             d.subscribe_masked_inputs(pending, timestamp).await
         }
 
-        async fn obtain_mask_indices(&self, n_indices: usize, cid: usize) -> RpcResult<Vec<usize>> {
-            let mut d = self.0.lock().await;
+        async fn obtain_mask_indices(&self, n_indices: Index) -> RpcResult<Vec<Index>> {
+            let mut d = self.d.lock().await;
 
             if d.round != Round::InputMaskReservation {
                 panic!();
             }
 
-            if d.next_i + n_indices > d.input_masks.len() {
+            if d.next_i + n_indices > d.input_masks.len() as u64 {
                 panic!();
             }
 
             for i in d.next_i..d.next_i + n_indices {
-                d.reserved_indices[i] = Some(cid);
+                d.reserved_indices[i as usize] = Some(self.id.clone());
 
-                let event = ReservedInputEvent { client: cid, reserved_index: i };
+                let event = ReservedInputEvent { client: self.id.clone(), reserved_index: i };
 
                 // broadcast reserved index to all subscribed RPC clients
                 for sink in d.reserved_index_sinks.clone().iter() {
@@ -1181,16 +1193,16 @@ pub mod off_chain {
             Ok(indices)
         }
 
-        async fn transition(&self, cid: usize, next_round: Round) -> RpcResult<()> {
-            let mut d = self.0.lock().await;
+        async fn transition(&self, next_round: Round) -> RpcResult<()> {
+            let mut d = self.d.lock().await;
 
-            if cid != d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0] {
+            if self.id != d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0] {
                 panic!();
             }
 
             match next_round {
                 Round::Idle => d.transition(ExecutionDone { }, next_round).await.unwrap(),
-                Round::Preprocessing => d.transition(PreprocessingStarted { designated_party: cid }, next_round).await.unwrap(),
+                Round::Preprocessing => d.transition(PreprocessingStarted { designated_party: self.id.clone() }, next_round).await.unwrap(),
                 Round::InputMaskReservation => d.transition(InputMaskReservationStarted { }, next_round).await.unwrap(),
                 Round::InputCollection => d.transition(InputCollectionStarted { }, next_round).await.unwrap(),
                 Round::MPC => d.transition(MPCStarted { }, next_round).await.unwrap(),
@@ -1207,12 +1219,11 @@ pub mod off_chain {
         addr: Option<String>,
         port: Option<u16>,
         server_handle: Option<JoinHandle<()>>,
-        timestamp: Option<u64>,
-        cid: Option<usize>
+        timestamp: Option<u64>
     }
 
     impl OffChainCoordinator {
-        pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: usize, t: usize, initial_mpc_nodes: Vec<usize>, n_inputs: usize, server_cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
+        pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index, server_cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
             let full_addr = format!("{}:{}", addr, port);
             let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), n_inputs)));
 
@@ -1240,15 +1251,19 @@ pub mod off_chain {
                     };
                 
                     let (stop_rx, stop_tx) = jsonrpsee::server::stop_channel();
-                    let cert = 
+                    let cert_der = 
                         tls_stream.get_ref().1
                             .peer_certificates()
                             .and_then(|c| c.first())
                             .map(|c| c.to_vec())
                             .expect("Client certificate required");
-                
 
-                    let rpc_server = CoordinatorRPCServerImpl(rpc_server_data.clone(), cert.clone());
+                    let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
+                        .expect("Failed to parse X.509 certificate DER");
+                    let public_key = parsed_cert.public_key()
+                        .subject_public_key.data.as_ref();
+
+                    let rpc_server = CoordinatorRPCServerImpl { d: rpc_server_data.clone(), id: public_key.to_vec() };
                     let mut rpc_module = RpcModule::new(());
                     rpc_module.merge(rpc_server.into_rpc()).unwrap();
                     let rpc_service = Server::builder()
@@ -1271,7 +1286,7 @@ pub mod off_chain {
                         }
                     }});
 
-                    rpc_server_data.lock().await.add_client(cert, client_handle, stop_tx);
+                    rpc_server_data.lock().await.add_client(cert_der, client_handle, stop_tx);
                     barrier.clone().wait().await;
                 }}
             });
@@ -1282,12 +1297,11 @@ pub mod off_chain {
                 addr: Some(String::from(addr)),
                 port: Some(port),
                 server_handle: Some(server_handle),
-                timestamp: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()),
-                cid: None
+                timestamp: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs())
             }
         }
 
-        pub async fn start_rpc_client(addr: &str, port: u16, timestamp: u64, cid: usize, client_cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
+        pub async fn start_rpc_client(addr: &str, port: u16, timestamp: u64, client_cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
             let rpc_coord = self_signed_certs::setup_client(addr, port, client_cert).await;
 
             Self {
@@ -1297,7 +1311,6 @@ pub mod off_chain {
                 port: None,
                 server_handle: None,
                 timestamp: Some(timestamp),
-                cid: Some(cid)
              }
         }
 
@@ -1309,7 +1322,18 @@ pub mod off_chain {
             self.timestamp.expect("Coordinator server not started")
         }
 
-        pub async fn wait_for_indices(&self, n_clients: usize) -> Result<HashMap<usize, usize>, CoordinatorError> {
+        pub async fn verify_client_sig(&self, client_sig: ClientSig, raw_key: Vec<u8>) -> Result<bool, CoordinatorError> {
+            let sig_valid = self.rpc_coord.as_ref().expect("client not started").auth_client(client_sig, raw_key).await.unwrap();
+
+            Ok(sig_valid)
+        }
+    }
+    
+    impl Coordinator for OffChainCoordinator {
+        type ClientIdentity = ClientIdentity;
+        type Index = Index;
+
+        async fn wait_for_indices(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Index>, CoordinatorError> {
             let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_reserved_indices(self.get_timestamp()).await.unwrap();
 
             let mut map = HashMap::new();
@@ -1322,7 +1346,7 @@ pub mod off_chain {
             Ok(map)
         }
 
-        pub async fn wait_for_masked_inputs(&self, n_clients: usize) -> Result<HashMap<usize, Vec<Fr>>, CoordinatorError> {
+        async fn wait_for_masked_inputs(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
             let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_masked_inputs(self.get_timestamp()).await.unwrap();
 
             let mut map = HashMap::new();
@@ -1335,16 +1359,9 @@ pub mod off_chain {
             Ok(map)
         }
 
-        pub async fn verify_client_sig(&self, client_sig: ClientSig, raw_key: Vec<u8>) -> Result<bool, CoordinatorError> {
-            let sig_valid = self.rpc_coord.as_ref().expect("client not started").auth_client(client_sig, raw_key).await.unwrap();
 
-            Ok(sig_valid)
-        }
-    }
-    
-    impl Coordinator for OffChainCoordinator {
         async fn trigger_input(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::InputCollection).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::InputCollection).await.unwrap();
 
             Ok(())
         }
@@ -1357,7 +1374,7 @@ pub mod off_chain {
         }
 
         async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::Preprocessing).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::Preprocessing).await.unwrap();
 
             Ok(())
         }
@@ -1370,7 +1387,7 @@ pub mod off_chain {
         }
 
         async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::InputMaskReservation).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::InputMaskReservation).await.unwrap();
 
             Ok(())
         }
@@ -1382,15 +1399,15 @@ pub mod off_chain {
             Ok(())
         }
 
-        async fn send_masked_input(&self, masked_input: Fr, i: usize) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").submit_masked_input(FieldElement { value: masked_input }, i, self.cid.unwrap()).await.unwrap();
+        async fn send_masked_input(&self, masked_input: Fr, i: Index) -> Result<(), CoordinatorError> {
+            self.rpc_coord.as_ref().expect("client not started").submit_masked_input(FieldElement { value: masked_input }, i).await.unwrap();
 
             Ok(())
         }
 
 
         async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::MPC).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::MPC).await.unwrap();
 
             Ok(())
         }
@@ -1403,7 +1420,7 @@ pub mod off_chain {
         }
 
         async fn trigger_outputs(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::Output).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::Output).await.unwrap();
 
             Ok(())
         }
@@ -1415,14 +1432,14 @@ pub mod off_chain {
             Ok(())
         }
 
-        async fn obtain_mask_indices(&mut self, n_indices: usize) -> Result<Vec<usize>, CoordinatorError> {
-            let indices = self.rpc_coord.as_ref().expect("client not started").obtain_mask_indices(n_indices, self.cid.unwrap()).await.unwrap();
+        async fn obtain_mask_indices(&mut self, n_indices: Index) -> Result<Vec<Index>, CoordinatorError> {
+            let indices = self.rpc_coord.as_ref().expect("client not started").obtain_mask_indices(n_indices).await.unwrap();
 
             Ok(indices)
         }
 
         async fn finalize(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(self.cid.unwrap(), Round::Idle).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::Idle).await.unwrap();
 
             Ok(())
         }
@@ -1631,12 +1648,15 @@ pub mod off_chain {
         async fn start_client_server() {
             setup_test();
 
+            let node_certs = (0..5).map(|_| server_cert()).collect::<Vec<_>>();
+            let node_public_keys = node_certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
+
             let addr = "127.0.0.1";
             let port = 12345;
-            let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
+            let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, node_public_keys, 2, server_cert()).await;
             let timestamp = coord.get_timestamp();
 
-            let _ = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 0, client_cert()).await;
+            let _ = OffChainCoordinator::start_rpc_client(addr, port, timestamp, client_cert()).await;
         }
 
         #[tokio::test]
@@ -1645,13 +1665,16 @@ pub mod off_chain {
 
             // event triggered BEFORE waiting for the event
             {
+                let mut node_certs = (0..5).map(|_| server_cert()).collect::<Vec<_>>();
+                let node_public_keys = node_certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
+
                 let addr = "127.0.0.1";
                 let port = 12346;
-                let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
+                let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, node_public_keys, 2, server_cert()).await;
                 let timestamp = coord.get_timestamp();
 
-                let node0 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 0, client_cert()).await;
-                let node1 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 1, client_cert()).await;
+                let node0 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, node_certs.remove(0)).await;
+                let node1 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, node_certs.remove(0)).await;
 
                 node0.trigger_pp().await.unwrap();
 
@@ -1662,14 +1685,17 @@ pub mod off_chain {
 
             // event triggered AFTER waiting for the event
             {
+                let mut node_certs = (0..5).map(|_| server_cert()).collect::<Vec<_>>();
+                let node_public_keys = node_certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
+
                 let addr = "127.0.0.1";
                 let port = 12347;
-                let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
+                let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, node_public_keys, 2, server_cert()).await;
                 let timestamp = coord.get_timestamp();
                 let barrier = Arc::new(Barrier::new(2));
 
-                let node0 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 0, client_cert()).await;
-                let node1 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, 1, client_cert()).await;
+                let node0 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, node_certs.remove(0)).await;
+                let node1 = OffChainCoordinator::start_rpc_client(addr, port, timestamp, node_certs.remove(0)).await;
 
                 tokio::spawn({
                     let barrier = barrier.clone();
@@ -1690,17 +1716,19 @@ pub mod off_chain {
         async fn end_to_end() {
             setup_test();
 
+            let mut certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
+            let public_keys = certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
+
             let addr = "127.0.0.1";
             let port = 12348;
-            let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, vec![0, 1, 2, 3, 4], 2, server_cert()).await;
+            let coord = OffChainCoordinator::start_coord(addr, port, [0u8; 32], 5, 1, public_keys[..5].to_vec().clone(), 2, server_cert()).await;
             let timestamp = coord.get_timestamp();
-            let cid: usize = 0;
             let barrier = Arc::new(Barrier::new(3));
 
             // MPC client, also RPC client
             tokio::spawn({
                 let barrier = barrier.clone();
-                let mut client = OffChainCoordinator::start_rpc_client(addr, port, timestamp, cid, client_cert()).await;
+                let mut client = OffChainCoordinator::start_rpc_client(addr, port, timestamp, certs.remove(5)).await;
                 async move {
                     let _ = client.wait_for_pp().await;
                     let _ = client.wait_for_input_mask_init().await;
@@ -1721,7 +1749,7 @@ pub mod off_chain {
             // MPC node (designated party), also RPC client
             tokio::spawn({
                 let barrier = barrier.clone();
-                let mut node = OffChainCoordinator::start_rpc_client(addr, port, timestamp, cid, client_cert()).await;
+                let mut node = OffChainCoordinator::start_rpc_client(addr, port, timestamp, certs.remove(0)).await;
                 async move {
                     node.trigger_pp().await.unwrap();
                     let _ = node.wait_for_pp().await;
@@ -1729,14 +1757,14 @@ pub mod off_chain {
                     let _ = node.wait_for_input_mask_init().await;
                     let client_to_index = node.wait_for_indices(1).await.unwrap();  // called by node
                     for (c, i) in client_to_index {
-                        println!("NODE: client {} reserved index {}", c, i);
+                        println!("NODE: client {:?} reserved index {}", c, i);
                     }
                     node.trigger_input().await.unwrap();
                     let _ = node.wait_for_input().await;
                     let client_to_masked_input = node.wait_for_masked_inputs(1).await.unwrap();
                     for (c, masked_inputs) in client_to_masked_input {
                         for masked_input in masked_inputs {
-                            println!("NODE: client {} submitted masked input {}", c, masked_input);
+                            println!("NODE: client {:?} submitted masked input {}", c, masked_input);
                         }
                     }
                     node.trigger_mpc().await.unwrap();

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "deploy-coordinator"
-path = "src/deploy-coordinator/bin/main.rs"
+name = "deploy-contract"
+path = "src/deploy-contract/bin/main.rs"
 
 [dependencies]
 stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git", branch = "add-all-client-conns" }
@@ -33,3 +33,4 @@ rand = "0.10.0"
 ring = "0.17.14"
 hyper = "1.8.1"
 hyper-util = "0.1.20"
+x509-parser = "0.18.1"
