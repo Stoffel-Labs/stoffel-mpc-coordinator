@@ -1,0 +1,70 @@
+use std::fs;
+use clap::Parser;
+use x509_parser::prelude::*;
+use stoffel_mpc_coordinator::{rpc, off_chain::OffChainCoordinator};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(long)]
+    eth_node_addr: String,
+
+    #[arg(long)]
+    sk: String,
+
+    #[arg(long)]
+    hash: String,
+
+    #[arg(long, value_delimiter=',', num_args=1..)]
+    initial_mpc_nodes: Vec<String>,
+
+    #[arg(long)]
+    server_cert: String,
+
+    #[arg(long)]
+    server_key: String,
+
+
+    #[arg(long)]
+    n: u64,
+
+    #[arg(long)]
+    t: u64,
+
+    #[arg(long)]
+    n_inputs: u64,
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    let n = args.n;
+    let t = args.t;
+    let hash = hex::decode(args.hash).expect("invalid hash");
+    if hash.len() != 32 {
+        println!("hash must be 32 bytes");
+        panic!();
+    }
+
+    let public_keys = args.initial_mpc_nodes.iter().map(|cert_file| {
+        let cert_der = fs::read(cert_file).expect("could not read certificate file");
+        let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
+            .expect("Failed to parse X.509 certificate DER");
+        parsed_cert.public_key()
+            .subject_public_key.data.as_ref().to_vec()
+    }).collect();
+
+    let server_cert_der = fs::read(args.server_cert).unwrap();
+    let server_key_der = fs::read(args.server_key).unwrap();
+    
+    let addr = "127.0.0.1";
+    let port = 12345;
+    let coord = OffChainCoordinator::start_coord(addr, port, hash.try_into().unwrap(), n, t, public_keys, 2, server_cert_der, server_key_der).await;
+    let timestamp = coord.get_timestamp();
+
+    println!("Listening on {}:{}", addr, port);
+    println!("Timestamp: {}", timestamp);
+
+    tokio::time::sleep(tokio::time::Duration::MAX).await;
+}

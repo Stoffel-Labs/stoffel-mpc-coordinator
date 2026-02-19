@@ -7,6 +7,10 @@ edition = "2021"
 name = "deploy-contract"
 path = "src/deploy-contract/bin/main.rs"
 
+[[bin]]
+name = "run-coord"
+path = "src/run-coord/bin/main.rs"
+
 [dependencies]
 stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git", branch = "add-all-client-conns" }
 stoffel-solidity-bindings = { version = "0.1.0", git = "ssh://git@github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord" }
@@ -34,3 +38,4 @@ ring = "0.17.14"
 hyper = "1.8.1"
 hyper-util = "0.1.20"
 x509-parser = "0.18.1"
+hex = "0.4.3"
