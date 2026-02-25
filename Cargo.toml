@@ -12,6 +12,7 @@ name = "run-coord"
 path = "src/run-coord/bin/main.rs"
 
 [dependencies]
+stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "with-sender-id-improvements" }
 stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git", branch = "add-all-client-conns" }
 stoffel-solidity-bindings = { version = "0.1.0", git = "ssh://git@github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord" }
 alloy = { version = "1.5.2", features = ["full", "node-bindings"] }
@@ -39,3 +40,4 @@ hyper = "1.8.1"
 hyper-util = "0.1.20"
 x509-parser = "0.18.1"
 hex = "0.4.3"
+ark-std = "0.5.0"

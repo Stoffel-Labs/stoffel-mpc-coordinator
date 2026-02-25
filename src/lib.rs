@@ -1,8 +1,315 @@
 use std::future::Future;
 use ark_bls12_381::Fr;
 use thiserror::Error;
-use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+use std::sync::Once;
+
+static INIT: Once = Once::new();
+fn setup_test() {
+    INIT.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install default crypto provider");
+    });
+}
+
+mod self_signed_certs {
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::UnixTime;
+    use rustls::pki_types::ServerName;
+    use rustls::server::danger::{ClientCertVerifier, ClientCertVerified};
+    use rustls::client::danger::{ServerCertVerifier, ServerCertVerified};
+    use rustls::DistinguishedName;
+    use std::sync::Arc;
+    use jsonrpsee::client_transport::ws::WsTransportClientBuilder;
+    use jsonrpsee::core::client::ClientBuilder;
+    use url::Url;
+    use jsonrpsee::async_client::Client;
+    use rustls::ClientConfig;
+    use tokio_rustls::TlsConnector;
+    use tokio::net::TcpStream;
+
+    #[derive(Debug)]
+    pub struct SelfSignedClientVerifier;
+
+    #[derive(Debug)]
+    pub struct SelfSignedServerVerifier;
+
+    impl ClientCertVerifier for SelfSignedClientVerifier {
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            &[]
+        }
+    
+        fn verify_client_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: UnixTime,
+        ) -> Result<ClientCertVerified, rustls::Error> {
+            Ok(ClientCertVerified::assertion())
+        }
+    
+           fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+    
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+    
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    impl ServerCertVerifier for SelfSignedServerVerifier {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+    
+           fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+    
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+    
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    pub fn server_cert() -> Arc<rcgen::CertifiedKey<rcgen::KeyPair>> {
+        let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+
+        Arc::new(rcgen::generate_simple_self_signed(subject_alt_names).unwrap())
+    }
+
+    pub fn client_cert() -> Arc<rcgen::CertifiedKey<rcgen::KeyPair>> {
+        let subject_alt_names = vec!["client".to_string()];
+
+        Arc::new(rcgen::generate_simple_self_signed(subject_alt_names).unwrap())
+    }
+
+    pub fn server_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> rustls::ServerConfig {
+        let certs = vec![CertificateDer::from(cert_der)];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+    
+        rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(SelfSignedClientVerifier {}))
+            .with_single_cert(certs, key).unwrap()
+    }
+
+    fn client_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> ClientConfig {
+        let certs = vec![CertificateDer::from(cert_der)];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+
+        ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_client_auth_cert(certs, key).unwrap()
+    }
+
+    pub async fn setup_client(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Client {
+        let full_addr = format!("{}:{}", addr, port);
+        let url = format!("wss://{}/", full_addr);
+        let mut tls_config = client_tls_config(cert_der, key_der);
+        tls_config.dangerous().set_certificate_verifier(Arc::new(SelfSignedServerVerifier {}));
+
+        let tls_connector = TlsConnector::from(Arc::new(tls_config));
+        let tcp_stream = TcpStream::connect(full_addr).await.unwrap();
+        let domain = ServerName::try_from(addr).unwrap().to_owned();
+        let tls_stream = tls_connector.connect(domain, tcp_stream).await.unwrap();
+        
+        let (sender, receiver) = WsTransportClientBuilder::default()
+            .build_with_stream(Url::parse(&url).unwrap(), tls_stream)
+            .await.unwrap();
+
+        ClientBuilder::default()
+            .build_with_tokio(sender, receiver)
+    }
+}
+
+pub mod rpc {
+    use serde::{Serialize, Serializer, Deserialize, Deserializer};
+    use ark_ff::FftField;
+    use ark_serialize::{Compress, Validate};
+    use std::sync::Arc;
+    use tokio::task::JoinHandle;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+    use x509_parser::prelude::*;
+    use jsonrpsee::{server::{RpcModule, Server}, server::ServerHandle};
+    use tokio::sync::{Mutex, Barrier};
+    use hyper_util::service::TowerToHyperService;
+    use hyper_util::rt::TokioIo;
+
+    #[derive(Clone, Debug)]
+    pub struct FieldElement<T: FftField> {
+        pub value: T
+    }
+    
+    impl<'d, T: FftField> Deserialize<'d> for FieldElement<T> {
+        fn deserialize<D>(deserializer: D) -> Result<FieldElement<T>, D::Error>
+        where
+            D: Deserializer<'d>
+        {
+            let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+            T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::Yes)
+                .map(|value| FieldElement::<T> { value }).map_err(serde::de::Error::custom)
+        }
+    }
+    
+    impl<T: FftField> Serialize for FieldElement<T> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut bytes = Vec::new();
+            self.value.serialize_with_mode(&mut bytes, Compress::Yes)
+                .map_err(serde::ser::Error::custom)?;
+            
+            serializer.serialize_bytes(&bytes)
+        }
+    }
+
+    pub struct ClientInfo {
+        pub cert: Vec<u8>,
+        pub thread: JoinHandle<()>,
+        pub stop_tx: ServerHandle
+    }
+
+    pub trait RPCServerInternal {
+        fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle);
+    }
+
+    pub trait RPCServerImpl {
+        type Internal : RPCServerInternal + 'static + Send;
+        fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self;
+        fn into_rpc(self) -> RpcModule<Self> where Self: Sized;
+    }
+
+    pub async fn start_coord<T: RPCServerImpl>(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>, rpc_server_data: Arc<Mutex<T::Internal>>) -> JoinHandle<()> {
+        let full_addr = format!("{}:{}", addr, port);
+        let tls_config = crate::self_signed_certs::server_tls_config(cert_der, key_der);
+        let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let listener = TcpListener::bind(full_addr).await.unwrap();
+
+        tokio::spawn({
+            let tls_acceptor = tls_acceptor.clone();
+            let rpc_server_data = rpc_server_data.clone();
+
+            async move {
+            loop {
+                let (tcp_stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+            
+                let tls_acceptor = tls_acceptor.clone();
+                let rpc_server_data = rpc_server_data.clone();
+            
+                let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("Handshake failed: {}", e); return; }
+                };
+            
+                let (stop_rx, stop_tx) = jsonrpsee::server::stop_channel();
+                let cert_der = 
+                    tls_stream.get_ref().1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .map(|c| c.to_vec())
+                        .expect("Client certificate required");
+
+                let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
+                    .expect("Failed to parse X.509 certificate DER");
+                let public_key = parsed_cert.public_key()
+                    .subject_public_key.data.as_ref();
+
+                let rpc_server = T::new(rpc_server_data.clone(), public_key.to_vec());
+                let mut rpc_module = RpcModule::new(());
+                rpc_module.merge(rpc_server.into_rpc()).unwrap();
+                let rpc_service = Server::builder()
+                    .to_service_builder()
+                    .build(rpc_module, stop_rx);
+
+                // Barrier needed, since we start the client thread but only add the client
+                // info afterwards; client info is accessible to the JSON-RPC methods, so if a
+                // request comes in after starting the client thread but before adding the
+                // client info, we may have a problem.
+                let barrier = Arc::new(Barrier::new(2));
+                let client_handle = tokio::spawn({
+                    let barrier = barrier.clone(); async move {
+                    barrier.wait().await;
+                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls_stream), TowerToHyperService::new(rpc_service))
+                        .with_upgrades()
+                        .await {
+                        eprintln!("Connection error: {}", e);
+                    }
+                }});
+
+                rpc_server_data.lock().await.add_client(cert_der, client_handle, stop_tx);
+                barrier.clone().wait().await;
+            }}
+        })
+    }
+}
 
 pub trait Coordinator {
     type ClientIdentity;
@@ -47,7 +354,8 @@ pub mod on_chain {
     use stoffel_solidity_bindings::{
         fake_coordinator::FakeCoordinator::{InputMaskReservationStarted, MaskedInputEvent, ReservedInputEvent},
         fake_coordinator::FakeCoordinator::FakeCoordinatorInstance,
-        fake_coordinator::FakeCoordinator
+        fake_coordinator::FakeCoordinator,
+        fake_coordinator::FakeCoordinator::FakeCoordinatorErrors
     };
     use futures_util::stream::StreamExt;
     use std::collections::HashMap;
@@ -62,12 +370,286 @@ pub mod on_chain {
         contract_block: u64,
         initial_mpc_nodes: Vec<Address>
     }
-    
-    fn u256_to_u64(x: U256) -> Option<u64> {
-        match x.try_into() {
-            Ok(n) => Some(n),
-            Err(_) => None
+
+    pub mod node_rpc {
+        use ark_bls12_381::Fr;
+        use alloy::providers::Provider;
+        use alloy_primitives::{Address, Bytes};
+        use stoffel_solidity_bindings::{
+            fake_coordinator::FakeCoordinator::FakeCoordinatorInstance,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use jsonrpsee::{core::{SubscriptionResult, to_json_raw_value}, async_client::Client, server::RpcModule, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
+        use async_trait::async_trait;
+        use tokio::task::JoinHandle;
+        use super::{ClientIdentity, Index};
+        use crate::rpc::ClientInfo;
+        use tokio::task::JoinSet;
+        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+        use stoffelmpc_mpc::common::SecretSharingScheme;
+        use ark_serialize::CanonicalSerialize;
+
+        pub struct NodeRPCServer<P: Provider + Clone> {
+            rpc_server: Arc<Mutex<NodeRPCServerInternal<P>>>,
+            addr: String,
+            port: u16,
+            server_handle: JoinHandle<()>,
         }
+
+        pub struct NodeRPCClient {
+            node_rpcs: Vec<Client>,
+            t: usize
+        }
+
+        impl NodeRPCClient {
+            pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(&str, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+                Self::start_rpc_client(t, addrs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
+            }
+
+            pub async fn start_rpc_client(t: usize, addrs: Vec<(&str, u16)>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+                let mut node_rpcs = Vec::new();
+
+                // connect to all nodes
+                for (addr, port) in addrs.iter() {
+                    let node_rpc = crate::self_signed_certs::setup_client(addr, *port, cert_der.clone(), key_der.clone()).await;
+                    node_rpcs.push(node_rpc);
+                }
+
+                Self {
+                    node_rpcs,
+                    t
+                }
+            }
+
+            pub async fn receive_mask_share(&self, sig: Vec<u8>, addr: Address) -> Fr {
+                let mut share_futures = JoinSet::new();
+
+                for rpc in self.node_rpcs.iter() {
+                    let mut sub = rpc.receive_mask_share(sig.clone(), addr).await.unwrap();
+                    share_futures.spawn(async move { sub.next().await });
+                }
+
+                let mut mask_shares = Vec::new();
+
+                while let Some(share_bytes) = share_futures.join_next().await {
+                    let share = ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.unwrap().unwrap().unwrap().as_slice()).unwrap();
+                    mask_shares.push(share);
+
+                    if mask_shares.len() >= 2 * self.t + 1 {
+                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
+                            Ok((_, mask)) => {
+                                return mask;
+                            }
+                            Err(_) => {
+                                panic!("reconstruction of mask failed");
+                            }
+                        }
+                    }
+                }
+
+                panic!("mask could not be reconstructed");
+            }
+        }
+
+        impl<P: Provider + Clone + 'static> NodeRPCServer<P> {
+            pub async fn start_from_cert(addr: &str, port: u16, coord: FakeCoordinatorInstance<P>, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+                Self::start(addr, port, coord, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
+            }
+
+            pub async fn start(addr: &str, port: u16, coord: FakeCoordinatorInstance<P>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+                let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::new(coord)));
+                let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl<P>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+                Self {
+                    rpc_server: rpc_server_data,
+                    addr: String::from(addr),
+                    port,
+                    server_handle
+                }
+            }
+
+            pub fn get_addr(&self) -> String {
+                self.addr.clone()
+            }
+
+            pub async fn add_auth_status(&mut self, addr: Address, status: bool) {
+                let mut d = self.rpc_server.lock().await;
+
+                assert!(!d.auth_status.contains_key(&addr));
+                d.auth_status.insert(addr, status);
+
+                if !status {
+                    panic!();
+                }
+
+                if let Some(i) = d.client_to_index.get(&addr) {
+                    if let Some(status) = d.auth_status.get(&addr) {
+                        if !status {
+                            panic!();
+                        }
+                        if let Some(share) = d.mask_shares.get(i) {
+                            if let Some(sink) = d.sinks.get(&addr) {
+                                let mut share_bytes = Vec::new();
+                                share.serialize_compressed(&mut share_bytes).unwrap();
+                                let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                                sink.send(json).await.unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // called when the client has reserved indices at the coordinator
+            pub async fn add_reserved_index(&mut self, addr: ClientIdentity, i: Index) {
+                let mut d = self.rpc_server.lock().await;
+
+                assert!(!d.index_to_client.contains_key(&i));
+                d.index_to_client.insert(i, addr);
+                d.client_to_index.insert(addr, i);
+
+                if let Some(status) = d.auth_status.get(&addr) {
+                    if !status {
+                        panic!();
+                    }
+                    if let Some(share) = d.mask_shares.get(&i) {
+                        if let Some(sink) = d.sinks.get(&addr) {
+                            let mut share_bytes = Vec::new();
+                            share.serialize_compressed(&mut share_bytes).unwrap();
+                            let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                            sink.send(json).await.unwrap();
+                        }
+                    }
+                }
+            }
+            
+            // called when preprocessing has generated the mask shares
+            pub async fn add_mask_share(&mut self, i: Index, share: RobustShare<Fr>) {
+                let mut d = self.rpc_server.lock().await;
+
+                assert!(!d.mask_shares.contains_key(&i));
+                d.mask_shares.insert(i, share.clone());
+
+                if let Some(addr) = d.index_to_client.get(&i) {
+                    if let Some(status) = d.auth_status.get(addr) {
+                        if !status {
+                            panic!();
+                        }
+                    }
+                    if let Some(sink) = d.sinks.get(addr) {
+                        let mut share_bytes = Vec::new();
+                        share.serialize_compressed(&mut share_bytes).unwrap();
+                        let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                        sink.send(json).await.unwrap();
+                    }
+                }
+            }
+        }
+
+        pub struct NodeRPCServerImpl<P: Provider + Clone> {
+            d: Arc<Mutex<NodeRPCServerInternal<P>>>,
+            id: Vec<u8>
+        }
+
+        impl<P: Provider + Clone + 'static> crate::rpc::RPCServerImpl for NodeRPCServerImpl<P> {
+            type Internal = NodeRPCServerInternal<P>;
+
+            fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self {
+                Self { d: internal, id }
+            }
+
+            fn into_rpc(self) -> RpcModule<Self> where Self: Sized {
+                crate::on_chain::node_rpc::OnChainNodeRPCServer::into_rpc(self)
+            }
+        }
+
+        pub struct NodeRPCServerInternal<P: Provider + Clone> {
+            index_to_client: HashMap<Index, ClientIdentity>,
+            client_to_index: HashMap<ClientIdentity, Index>,
+            auth_status: HashMap<ClientIdentity, bool>,
+            sinks: HashMap<ClientIdentity, SubscriptionSink>,
+            mask_shares: HashMap<Index, RobustShare<Fr>>,
+            id_to_addr: HashMap<Vec<u8>, ClientIdentity>,
+            clients: HashMap<Vec<u8>, ClientInfo>,
+            coord: FakeCoordinatorInstance<P>
+        }
+
+        impl<P: Provider + Clone> NodeRPCServerInternal<P> {
+            pub fn new(coord: FakeCoordinatorInstance<P>) -> Self {
+                Self {
+                    index_to_client: HashMap::new(),
+                    client_to_index: HashMap::new(),
+                    auth_status: HashMap::new(),
+                    sinks: HashMap::new(),
+                    mask_shares: HashMap::new(),
+                    id_to_addr: HashMap::new(),
+                    clients: HashMap::new(),
+                    coord
+                }
+            }
+        }
+
+        impl<P: Provider + Clone> crate::rpc::RPCServerInternal for NodeRPCServerInternal<P> {
+            fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
+                self.clients.insert(cert_der.clone(), ClientInfo { cert: cert_der, thread: client_handle, stop_tx });
+            }
+        }
+
+        #[rpc(server, client)]
+        pub trait OnChainNodeRPC {
+            #[subscription(name = "sub_receive_mask_share", unsubscribe = "unsub_receive_mask_share", item = Vec<u8>)]
+            async fn receive_mask_share(&self, sig: Vec<u8>, addr: Address) -> SubscriptionResult;
+        }
+
+        #[async_trait]
+        impl<P: Provider + Clone + 'static> OnChainNodeRPCServer for NodeRPCServerImpl<P> {
+            async fn receive_mask_share(&self, pending: PendingSubscriptionSink, sig: Vec<u8>, addr: Address) -> SubscriptionResult {
+                let sink = pending.accept().await?;
+
+                let mut d = self.d.lock().await;
+
+                // each address can only be used by once client
+                if d.sinks.contains_key(&addr) {
+                    panic!();
+                }
+
+                d.sinks.insert(addr, sink);
+
+                // each client can only request shares once
+                if d.id_to_addr.contains_key(&self.id) {
+                    panic!();
+                }
+
+                // address needs to reserve index before requesting shares, so the contract knows
+                // what message the signature signs, since the signed nonce is index-dependent
+                match d.auth_status.get(&addr) {
+                    Some(false) => { panic!(); }
+                    Some(true) => {
+                        // enough signatures were sent to authenticate the client, no need to send more;
+                        // can send the share immediately if available
+                        if let Some(i) = d.client_to_index.get(&addr) {
+                            if let Some(share) = d.mask_shares.get(i) {
+                                let mut share_bytes = Vec::new();
+                                share.serialize_compressed(&mut share_bytes).unwrap();
+                                let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                                d.sinks.get(&addr).unwrap().send(json).await.unwrap();
+                            }
+                        }
+                    }
+                    None => {
+                        // client not authenticated yet, send signature to coordinator
+                        d.coord.authenticateClient(addr, Bytes::from(sig)).send().await.expect("sending TX failed")
+                            .watch().await.expect("TX failed");
+                    }
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    fn u256_to_u64(x: U256) -> Option<u64> {
+        x.try_into().ok()
     }
 
     // lossless: Fr elements always fit into 256 bits
@@ -91,10 +673,10 @@ pub mod on_chain {
         Some(Fr::from_le_bytes_mod_order(&bytes))
     }
     
-    pub async fn generate_client_sig(i: U256, signer: PrivateKeySigner) -> Signature {
+    pub async fn generate_client_sig(base_nonce: U256, i: U256, signer: PrivateKeySigner) -> Signature {
         let hash = {
             let mut hasher = Keccak256::new();
-            hasher.update(i.abi_encode());
+            hasher.update((base_nonce + i).abi_encode());
             hasher.finalize()
         };
         signer.sign_message(hash.as_slice()).await.expect("signing failed")
@@ -127,23 +709,52 @@ pub mod on_chain {
                 let x = coord.creationBlock().call().await.expect("sending TX failed");
                 u256_to_u64(x).expect("impossible bug: block number does not fit into u64")
         }
+
+        async fn base_nonce(&self) -> u64 {
+            let base_nonce = self.coord.baseNonce().call().await.expect("sending TX failed");
+            u256_to_u64(base_nonce).expect("impossible bug: block number does not fit into u64")
+        }
     
-        pub async fn verify_client_sig(&self, i: Index, raw_sig: Vec<u8>) -> Option<Address> {
-            let i = U256::from(i);
-            let hash = {
-                let mut hasher = Keccak256::new();
-                hasher.update(i.abi_encode());
-                hasher.finalize()
-            };
-            let sig = Signature::try_from(raw_sig.as_slice()).expect("invalid sig");
-            let addr = sig.recover_address_from_msg(hash).expect("recovery failed");
-        
-            if self.coord.authenticateClient(U256::from(i), addr, Bytes::from(raw_sig))
-                .call().await.expect("sending TX failed") {
-                    Some(addr)
-            } else {
-                None
+        pub async fn auth_client(&self, raw_sig: Vec<u8>, addr: Address) {
+            let builder = self.coord.authenticateClient(addr, Bytes::from(raw_sig));
+            let result = builder.send().await;
+            match result {
+                Ok(r) => {
+                    r.watch().await.expect("TX failed");
+                }
+                Err(e) => {
+                    println!("{}", e);
+                    if let Some(decoded_error) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
+                        match decoded_error {
+                            FakeCoordinatorErrors::NoIndicesReserved(FakeCoordinator::NoIndicesReserved { client }) => {
+                                println!("no indices reserved by address {}", client);
+                            }
+                            FakeCoordinatorErrors::AccessControlUnauthorizedAccount(_) => {
+                                println!("unauthorized account");
+                            }
+                            _ => {
+                                println!("other error");
+                            }
+                        }
+                    }
+                    panic!();
+                }
             }
+        }
+
+        pub async fn wait_for_client_auth(&self, addr: Address) -> Result<bool, CoordinatorError> {
+            let mut events = self.coord
+                .ClientAuthenticated_filter()
+                .from_block(self.contract_block)
+                .topic1(addr)
+                .watch()
+                .await.unwrap().into_stream();
+        
+            if let Some(Ok((FakeCoordinator::ClientAuthenticated { client, success }, _))) = events.next().await {
+                return Ok(success);
+            }
+    
+            panic!();
         }
 
         pub async fn grant_roles(&self) -> Result<(), CoordinatorError> {
@@ -153,10 +764,10 @@ pub mod on_chain {
                 let builder = self.coord.PARTY_ROLE();
                 builder.call().await.expect("sending TX failed")
             };
-            let DESIGNATED_PARTY_ROLE = {
-                let builder = self.coord.DESIGNATED_PARTY_ROLE();
-                builder.call().await.expect("sending TX failed")
-            };
+            //let DESIGNATED_PARTY_ROLE = {
+            //    let builder = self.coord.DESIGNATED_PARTY_ROLE();
+            //    builder.call().await.expect("sending TX failed")
+            //};
         
             // grant party roles
             for i in 0..self.initial_mpc_nodes.len() {
@@ -167,16 +778,14 @@ pub mod on_chain {
                         r.watch().await.expect("TX failed");
                     }
                     Err(e) => {
+                        println!("{}", e);
                         panic!();
                     }
                 }
-                builder.send().await.expect("sending TX failed").watch().await.expect("TX failed");
-                println!("Granted party role to {}", self.initial_mpc_nodes[i]);
             }
 
             Ok(())
         }
-    
     }
     
     impl<P: Provider> Coordinator for OnChainCoordinator<P> {
@@ -193,10 +802,11 @@ pub mod on_chain {
                 .watch()
                 .await.unwrap().into_stream();
             
-            while let Some(Ok((ReservedInputEvent { client, reservedIndex }, _))) = events.next().await {
-                addr_to_i.insert(client, reservedIndex);
+            while let Some(Ok((ReservedInputEvent { client, reservedIndices }, _))) = events.next().await {
+                assert_eq!(reservedIndices.len(), 1);
+                addr_to_i.insert(client, reservedIndices[0]);
                 eprintln!("[party] Recorded reserved mask index {} for client address {:?}",
-                         reservedIndex, client);
+                         reservedIndices[0], client);
                 if addr_to_i.len() == n_clients {
                     break;
                 }
@@ -238,8 +848,7 @@ pub mod on_chain {
                     Ok(())
                 }
                 Err(e) => {
-                    let err = e.as_decoded_error::<FakeCoordinator::NotAtRound>().unwrap();
-                    println!("{:?}", err);
+                    println!("{:?}", e);
                     panic!();
                 }
             }
@@ -298,9 +907,8 @@ pub mod on_chain {
                     Ok(())
                 }
                 Err(e) => {
+                    println!("{:?}", e);
                     panic!();
-                    //let err = e.as_decoded_error::<FakeCoordinator::NotAnExistingParty>().unwrap();
-                    //println!("No such account {}", err.account);
                 }
             }
         }
@@ -320,11 +928,26 @@ pub mod on_chain {
         }
         
         async fn obtain_mask_indices(&mut self, n_indices: Index) -> Result<Vec<Index>, CoordinatorError> {
-            let indices = self.coord.obtainInputMasks(n_indices).call().await.expect("sending TX failed");
+            let builder = self.coord.obtainInputMasks(n_indices);
+            let tx = builder.send().await.expect("failed to send TX");
+            let receipt = tx.get_receipt().await.expect("failed to get receipt");
 
-            Ok(indices)
+            if !receipt.status() {
+                panic!();
+            }
+
+            let mut indices = None;
+
+            for log in receipt.inner.logs() {
+                if let Ok(e) = log.log_decode::<FakeCoordinator::ReservedInputEvent>() {
+                    indices = Some(e.inner.reservedIndices.clone());
+                    break; 
+                }
+            }
+
+            Ok(indices.expect("no index reservation event found"))
         }
-        
+
         async fn send_masked_input(&self, masked_input: Fr, i: Index) -> Result<(), CoordinatorError> {
             let builder = self.coord.submitMaskedInput(fr_to_u256(masked_input), i);
             let result = builder.send().await;
@@ -414,6 +1037,7 @@ pub mod on_chain {
     mod tests {
         use super::*;
         use alloy::signers::local::PrivateKeySigner;
+        use ark_std::test_rng;
         use ark_bls12_381::Fr;
         use alloy::{
             node_bindings::{Anvil, AnvilInstance},
@@ -426,8 +1050,12 @@ pub mod on_chain {
             fake_coordinator::FakeCoordinator,
         };
         use tokio::time::{timeout, Duration};
+        use tokio::sync::Barrier;
+        use std::sync::Arc;
         use rand::RngExt;
-    
+        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+        use stoffelmpc_mpc::common::SecretSharingScheme;
+
         static SK: [&str; 10] = [
             "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
             "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
@@ -474,29 +1102,43 @@ pub mod on_chain {
             let n = U256::from(5);
             let t = U256::from(1);
             let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
-            let designated_party = ACC[0];
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
     
-            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-            let coord = OnChainCoordinator::new(coord_instance, initial_mpc_nodes).await;
-    
-            let sk = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-            let signer = PrivateKeySigner::from_str(sk).unwrap();
+            let contract = FakeCoordinator::deploy(provider.clone(), hash, n, t, ACC[0], initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let mut coord = OnChainCoordinator::new(contract.clone(), initial_mpc_nodes.clone()).await;
+            let signer = PrivateKeySigner::from_str(SK[0]).unwrap();
             let i = U256::from(42);
+
+            // grant roles to parties
+            coord.grant_roles().await.expect("granting roles failed");
     
             // Generate signature
-            let sig = generate_client_sig(i, signer.clone()).await;
+            let _ = coord.obtain_mask_indices(U256::from(1)).await.expect("obtaining mask indices failed");
+            let base_nonce = coord.base_nonce().await;
+            let sig = generate_client_sig(U256::from(base_nonce), i, signer.clone()).await;
     
-            match coord.verify_client_sig(U256::from(i), sig.as_bytes().to_vec()).await {
-                Some(addr) => {
-                    let expected_addr = signer.address();
-                    assert_eq!(addr, expected_addr);
-                }
-                None => {
-                    panic!("signature verification failed");
-                }
+            // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
+            {
+                let provider = ws_connect(&anvil.ws_endpoint(), SK[1]).await;
+                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
+                let coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+                coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
             }
+            {
+                let provider = ws_connect(&anvil.ws_endpoint(), SK[2]).await;
+                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
+                let coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+                coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
+            }
+            {
+                let provider = ws_connect(&anvil.ws_endpoint(), SK[3]).await;
+                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
+                let coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+                coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
+            }
+
+            // TODO: wait for ClientAuthenticated event
         }
     
         #[test]
@@ -586,69 +1228,403 @@ pub mod on_chain {
                 coord.trigger_pp().await.unwrap();
             }
         }
+
+        #[tokio::test]
+        pub async fn start_node_rpc() {
+            crate::setup_test();
+
+            let node_rpc_addrs = vec![
+                ("127.0.0.1", 12348),
+                ("127.0.0.1", 12349),
+                ("127.0.0.1", 12350)
+            ];
+            let anvil = spawn_anvil();
+            let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
+            let n = U256::from(5);
+            let t = 1;
+            let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+            let designated_party = ACC[0];
+            let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
+            let n_inputs = U256::from(1);
+    
+            let contract = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+    
+            // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
+            let mut node_rpcs = Vec::new();
+            for i in 0..node_rpc_addrs.len() {
+                let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
+                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
+
+                let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(node_rpc_addrs[i].0,
+                    node_rpc_addrs[i].1, instance.clone(), crate::self_signed_certs::server_cert()).await;
+                node_rpcs.push(node_rpc);
+            }
+            let _ = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), crate::self_signed_certs::client_cert()).await;
+        }
+
+        #[tokio::test]
+        pub async fn end_to_end() {
+            crate::setup_test();
+
+            let node_rpc_addrs = vec![
+                ("127.0.0.1", 12348),
+                ("127.0.0.1", 12349),
+                ("127.0.0.1", 12350)
+            ];
+            let anvil = spawn_anvil();
+            let n = 5;
+            let t = 1;
+            let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+            let designated_party = ACC[0];
+            let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
+            let n_inputs = U256::from(1);
+    
+            let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
+            let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(n), U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+
+            let barrier = Arc::new(Barrier::new(3));
+
+            // MPC node (designated party), also RPC client
+            tokio::spawn({
+                let barrier = barrier.clone();
+
+                let mut instances = Vec::new();
+                for i in 0..3 {
+                    let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
+                    let instance = FakeCoordinatorInstance::new(*contract.address(), provider);
+                    instances.push(instance);
+                }
+
+                // grant roles to parties
+                let mut coord = OnChainCoordinator::new(instances[0].clone(), initial_mpc_nodes.clone()).await;
+                coord.grant_roles().await.expect("granting roles failed");
+
+                // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
+                // node here, but we use 3 RPC nodes to make the process work
+                let mask = Fr::from(42);
+                let mut rng = test_rng();
+                let mask_shares = RobustShare::compute_shares(mask, n, t, None, &mut rng).unwrap();
+
+                let mut node_rpcs = Vec::new();
+                for i in 0..3 {
+                    let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(node_rpc_addrs[i].0,
+                        node_rpc_addrs[i].1, instances[i].clone(), crate::self_signed_certs::server_cert()).await;
+
+                    node_rpc.add_mask_share(U256::from(0), mask_shares[i].clone()).await;
+                    node_rpcs.push(node_rpc);
+                }
+
+                async move {
+                    coord.trigger_pp().await.unwrap();
+                    let _ = coord.wait_for_pp().await;
+                    coord.init_input_masks().await.unwrap();
+                    let _ = coord.wait_for_input_mask_init().await;
+                    let client_to_index = coord.wait_for_indices(1).await.unwrap();  // called by node
+                    for (c, i) in client_to_index {
+                        println!("NODE: client {:?} reserved index {}", c, i);
+                        for node_rpc in node_rpcs.iter_mut() {
+                            // just received by one node here, but in reality would be received by
+                            // all nodes, so we simulate this here for more nodes
+                            node_rpc.add_reserved_index(c, i).await;
+                        }
+                    }
+
+                    // just received by one node here, but in reality would be received by
+                    // all nodes, so we simulate it for more nodes
+                    if !coord.wait_for_client_auth(ACC[5]).await.unwrap() {
+                        panic!();
+                    }
+                    for node_rpc in node_rpcs.iter_mut() {
+                        node_rpc.add_auth_status(ACC[5], true).await;
+                    }
+
+                    coord.trigger_input().await.unwrap();
+                    let _ = coord.wait_for_input().await;
+                    let client_to_masked_input = coord.wait_for_masked_inputs(1).await.unwrap();
+                    for (c, masked_inputs) in client_to_masked_input {
+                        for masked_input in masked_inputs {
+                            println!("NODE: client {:?} submitted masked input {}", c, masked_input);
+                        }
+                    }
+                    coord.trigger_mpc().await.unwrap();
+                    let _ = coord.wait_for_mpc().await;
+                    coord.trigger_outputs().await.unwrap();
+                    let _ = coord.wait_for_outputs().await;
+                    coord.finalize().await.unwrap();
+
+                    barrier.wait().await;
+                }
+            });
+
+            // MPC client, also RPC client
+            tokio::spawn({
+                let barrier = barrier.clone();
+
+                let provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
+                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
+                let mut coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+
+                async move {
+                    let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), crate::self_signed_certs::client_cert()).await;
+                    let _ = coord.wait_for_pp().await;
+                    let _ = coord.wait_for_input_mask_init().await;
+
+                    let indices = coord.obtain_mask_indices(U256::from(1)).await.expect("obtaining mask indices failed");
+                    assert_eq!(indices.len(), 1);
+                    println!("CLIENT: obtained index {}", indices[0]);
+
+                    let base_nonce = coord.base_nonce().await;
+                    let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
+                    let sig = generate_client_sig(U256::from(base_nonce), indices[0], signer.clone()).await;
+                    let mask = rpc_client.receive_mask_share(sig.into(), ACC[5]).await;
+
+                    let _ = coord.wait_for_input().await;
+
+                    let masked_input = mask + Fr::from(1337);
+                    coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
+                    coord.wait_for_masked_inputs(1).await.unwrap();
+
+                    let _ = coord.wait_for_mpc().await;
+                    let _ = coord.wait_for_outputs().await;
+
+                    barrier.wait().await;
+                }
+            });
+
+            barrier.wait().await;
+        }
     }
 }
 
 pub mod off_chain {
     use ark_bls12_381::Fr;
-    use ark_ff::FftField;
     use jsonrpsee::{core::{SubscriptionResult, RpcResult, to_json_raw_value}, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
-    use crate::{Coordinator, CoordinatorError};
+    use serde::{Serialize, Deserialize};
+    use crate::{Coordinator, CoordinatorError, rpc::{FieldElement, ClientInfo}};
     use events::*;
-    use serde::{Serializer, Deserializer, Deserialize, Serialize};
-    use ark_serialize::{Compress, Validate};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::{Mutex, Barrier};
+    use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
-    use tokio::net::TcpListener;
-    use tokio_rustls::TlsAcceptor;
     use async_trait::async_trait;
-    use jsonrpsee::server::{RpcModule, Server};
+    use jsonrpsee::server::RpcModule;
     use jsonrpsee::async_client::Client;
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
-    use hyper_util::service::TowerToHyperService;
-    use hyper_util::rt::TokioIo;
-    use x509_parser::prelude::*;
 
     type ClientIdentity = Vec<u8>;
     type Index = u64;
 
-    #[derive(Clone, Debug)]
-    pub struct FieldElement<T: FftField> {
-        value: T
-    }
+    pub mod node_rpc {
+        use ark_bls12_381::Fr;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use jsonrpsee::{core::{SubscriptionResult, to_json_raw_value}, async_client::Client, server::RpcModule, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
+        use async_trait::async_trait;
+        use tokio::task::JoinHandle;
+        use super::{ClientIdentity, Index};
+        use crate::rpc::ClientInfo;
+        use tokio::task::JoinSet;
+        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+        use stoffelmpc_mpc::common::SecretSharingScheme;
+        use ark_serialize::CanonicalSerialize;
 
-    impl<'d, T: FftField> Deserialize<'d> for FieldElement<T> {
-        fn deserialize<D>(deserializer: D) -> Result<FieldElement<T>, D::Error>
-        where
-            D: Deserializer<'d>
-        {
-            let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-            T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::Yes)
-                .map(|value| FieldElement::<T> { value }).map_err(serde::de::Error::custom)
+        #[rpc(server, client)]
+        pub trait OffChainNodeRPC {
+            #[subscription(name = "sub_receive_mask_share", unsubscribe = "unsub_receive_mask_share", item = Vec<u8>)]
+            async fn receive_mask_share(&self) -> SubscriptionResult;
         }
-    }
 
-    impl<T: FftField> Serialize for FieldElement<T> {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            let mut bytes = Vec::new();
-            self.value.serialize_with_mode(&mut bytes, Compress::Yes)
-                .map_err(serde::ser::Error::custom)?;
+        pub struct NodeRPCServer {
+            rpc_server: Arc<Mutex<NodeRPCServerInternal>>,
+            addr: String,
+            port: u16,
+            server_handle: JoinHandle<()>,
+        }
+
+        pub struct NodeRPCClient {
+            node_rpcs: Vec<Client>,
+            t: usize
+        }
+
+        impl NodeRPCClient {
+            pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(&str, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+                Self::start_rpc_client(t, addrs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
+            }
+
+            pub async fn start_rpc_client(t: usize, addrs: Vec<(&str, u16)>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+                let mut node_rpcs = Vec::new();
+
+                // connect to all nodes
+                for (addr, port) in addrs.iter() {
+                    let node_rpc = crate::self_signed_certs::setup_client(addr, *port, cert_der.clone(), key_der.clone()).await;
+                    node_rpcs.push(node_rpc);
+                }
+
+                Self {
+                    node_rpcs,
+                    t
+                }
+            }
+
+            pub async fn receive_mask_share(&self) -> Fr {
+                let mut share_futures = JoinSet::new();
+
+                for rpc in self.node_rpcs.iter() {
+                    let mut sub = rpc.receive_mask_share().await.unwrap();
+                    share_futures.spawn(async move { sub.next().await });
+                }
+
+                let mut mask_shares = Vec::new();
+
+                while let Some(share_bytes) = share_futures.join_next().await {
+                    let share = ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.unwrap().unwrap().unwrap().as_slice()).unwrap();
+                    mask_shares.push(share);
+
+                    if mask_shares.len() >= 2 * self.t + 1 {
+                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
+                            Ok((_, mask)) => {
+                                return mask;
+                            }
+                            Err(_) => {
+                                panic!("reconstruction of mask failed");
+                            }
+                        }
+                    }
+                }
+
+                panic!("mask could not be reconstructed");
+            }
+        }
+
+        impl NodeRPCServer {
+            pub async fn start_from_cert(addr: &str, port: u16, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+                Self::start(addr, port, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
+            }
+
+            pub async fn start(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+                let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::new()));
+                let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+                Self {
+                    rpc_server: rpc_server_data,
+                    addr: String::from(addr),
+                    port,
+                    server_handle
+                }
+            }
+
+            pub fn get_addr(&self) -> String {
+                self.addr.clone()
+            }
+
+            // called when the client has reserved indices at the coordinator
+            pub async fn add_reserved_index(&mut self, id: ClientIdentity, i: Index) {
+                let mut d = self.rpc_server.lock().await;
+
+                assert!(!d.index_to_client.contains_key(&i));
+                d.index_to_client.insert(i, id.clone());
+                d.client_to_index.insert(id.clone(), i);
+
+                // if mask share is there and share has been requested, send it
+                if let Some(share) = d.mask_shares.get(&i) {
+                    if let Some(sink) = d.sinks.get(&id) {
+                        let mut share_bytes = Vec::new();
+                        share.serialize_compressed(&mut share_bytes).unwrap();
+                        let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                        sink.send(json).await.unwrap();
+                    }
+                }
+            }
             
-            serializer.serialize_bytes(&bytes)
+            // called when preprocessing has generated the mask shares
+            pub async fn add_mask_share(&mut self, i: Index, share: RobustShare<Fr>) {
+                let mut d = self.rpc_server.lock().await;
+
+                assert!(!d.mask_shares.contains_key(&i));
+                d.mask_shares.insert(i, share.clone());
+
+                // if mask share is there and share has been requested, send it
+                if let Some(id) = d.index_to_client.get(&i) {
+                    if let Some(sink) = d.sinks.get(id) {
+                        let mut share_bytes = Vec::new();
+                        share.serialize_compressed(&mut share_bytes).unwrap();
+                        let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                        sink.send(json).await.unwrap();
+                    }
+                }
+            }
+        }
+
+        pub struct NodeRPCServerImpl {
+            d: Arc<Mutex<NodeRPCServerInternal>>,
+            id: Vec<u8>
+        }
+
+        impl crate::rpc::RPCServerImpl for NodeRPCServerImpl {
+            type Internal = NodeRPCServerInternal;
+
+            fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self {
+                Self { d: internal, id }
+            }
+
+            fn into_rpc(self) -> RpcModule<Self> where Self: Sized {
+                crate::off_chain::node_rpc::OffChainNodeRPCServer::into_rpc(self)
+            }
+        }
+
+        pub struct NodeRPCServerInternal {
+            index_to_client: HashMap<Index, ClientIdentity>,
+            client_to_index: HashMap<ClientIdentity, Index>,
+            sinks: HashMap<ClientIdentity, SubscriptionSink>,
+            mask_shares: HashMap<Index, RobustShare<Fr>>,
+            clients: HashMap<Vec<u8>, ClientInfo>,
+        }
+
+        impl crate::rpc::RPCServerInternal for NodeRPCServerInternal {
+            fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
+                self.clients.insert(cert_der.clone(), ClientInfo { cert: cert_der, thread: client_handle, stop_tx });
+            }
+        }
+
+        impl NodeRPCServerInternal {
+            pub fn new() -> Self {
+                Self {
+                    index_to_client: HashMap::new(),
+                    client_to_index: HashMap::new(),
+                    sinks: HashMap::new(),
+                    mask_shares: HashMap::new(),
+                    clients: HashMap::new(),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl OffChainNodeRPCServer for NodeRPCServerImpl {
+            async fn receive_mask_share(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+                let sink = pending.accept().await?;
+
+                let mut d = self.d.lock().await;
+
+                if d.sinks.contains_key(&self.id) {
+                    panic!();
+                }
+                d.sinks.insert(self.id.clone(), sink);
+
+                if let Some(i) = d.client_to_index.get(&self.id) {
+                    if let Some(share) = d.mask_shares.get(i) {
+                        let mut share_bytes = Vec::new();
+                        share.serialize_compressed(&mut share_bytes).unwrap();
+                        let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                        d.sinks.get(&self.id.clone()).unwrap().send(json).await.unwrap();
+                    }
+                }
+
+                Ok(())
+            }
         }
     }
 
-    pub async fn generate_client_sig(i: usize, key: impl rcgen::SigningKey) -> Vec<u8> {
-        let message = i.to_be_bytes();
-
-        key.sign(&message).unwrap()
-    }
 
     pub mod events {
         use ark_bls12_381::Fr;
@@ -721,7 +1697,7 @@ pub mod off_chain {
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct ReservedInputEvent {
             pub client: ClientIdentity,
-            pub reserved_index: Index
+            pub reserved_indices: Vec<Index>
         }
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -772,6 +1748,29 @@ pub mod off_chain {
         MPC,
         Output
     }
+
+    fn round_before(current: Round) -> Round {
+        match current {
+            Round::Idle => Round::Output,
+            Round::Preprocessing => Round::Idle,
+            Round::InputMaskReservation => Round::Preprocessing,
+            Round::InputCollection => Round::InputMaskReservation,
+            Round::MPC => Round::InputCollection,
+            Round::Output => Round::MPC
+        }
+    }
+
+    fn next_round(current: Round) -> Round {
+        match current {
+            Round::Idle => Round::Preprocessing,
+            Round::Preprocessing => Round::InputMaskReservation,
+            Round::InputMaskReservation => Round::InputCollection,
+            Round::InputCollection => Round::MPC,
+            Round::MPC => Round::Output,
+            Round::Output => Round::Idle
+        }
+    }
+
     
     #[rpc(server, client)]
     pub trait CoordinatorRPC {
@@ -843,12 +1842,6 @@ pub mod off_chain {
     struct CoordinatorRPCServerImpl {
         d: Arc<Mutex<CoordinatorRPCServerImplInternal>>,
         id: ClientIdentity
-    }
-
-    struct ClientInfo {
-        cert: Vec<u8>,
-        thread: JoinHandle<()>,
-        stop_tx: ServerHandle
     }
 
     struct CoordinatorRPCServerImplInternal {
@@ -1008,27 +2001,24 @@ pub mod off_chain {
         }
     }
 
-    fn round_before(current: Round) -> Round {
-        match current {
-            Round::Idle => Round::Output,
-            Round::Preprocessing => Round::Idle,
-            Round::InputMaskReservation => Round::Preprocessing,
-            Round::InputCollection => Round::InputMaskReservation,
-            Round::MPC => Round::InputCollection,
-            Round::Output => Round::MPC
+    impl crate::rpc::RPCServerInternal for CoordinatorRPCServerImplInternal {
+        fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
+            self.add_client(cert_der, client_handle, stop_tx);
         }
     }
 
-    fn next_round(current: Round) -> Round {
-        match current {
-            Round::Idle => Round::Preprocessing,
-            Round::Preprocessing => Round::InputMaskReservation,
-            Round::InputMaskReservation => Round::InputCollection,
-            Round::InputCollection => Round::MPC,
-            Round::MPC => Round::Output,
-            Round::Output => Round::Idle
+    impl crate::rpc::RPCServerImpl for CoordinatorRPCServerImpl {
+        type Internal = CoordinatorRPCServerImplInternal;
+
+        fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
+            Self { d: internal, id }
+        }
+
+        fn into_rpc(self) -> RpcModule<Self> {
+            crate::off_chain::CoordinatorRPCServer::into_rpc(self)
         }
     }
+
 
     #[async_trait]
     impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
@@ -1132,19 +2122,11 @@ pub mod off_chain {
         async fn sub_reserved_indices(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
             let mut d = self.d.lock().await;
 
-            if d.round != Round::InputMaskReservation {
-                panic!();
-            }
-
             d.subscribe_reserved_indices(pending, timestamp).await
         }
 
         async fn sub_masked_inputs(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
             let mut d = self.d.lock().await;
-
-            if d.round != Round::InputCollection {
-                panic!();
-            }
 
             d.subscribe_masked_inputs(pending, timestamp).await
         }
@@ -1163,7 +2145,7 @@ pub mod off_chain {
             for i in d.next_i..d.next_i + n_indices {
                 d.reserved_indices[i as usize] = Some(self.id.clone());
 
-                let event = ReservedInputEvent { client: self.id.clone(), reserved_index: i };
+                let event = ReservedInputEvent { client: self.id.clone(), reserved_indices: vec![i] };
 
                 // broadcast reserved index to all subscribed RPC clients
                 for sink in d.reserved_index_sinks.clone().iter() {
@@ -1210,78 +2192,13 @@ pub mod off_chain {
     }
 
     impl OffChainCoordinator {
-        pub async fn start_coord_from_cert(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index, cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
+        pub async fn start_coord_from_cert(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
             Self::start_coord(addr, port, prog_hash, n, t, initial_mpc_nodes, n_inputs, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
         }
 
         pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let full_addr = format!("{}:{}", addr, port);
             let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), n_inputs)));
-
-            let tls_config = self_signed_certs::server_tls_config(cert_der, key_der);
-            let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
-            let listener = TcpListener::bind(full_addr).await.unwrap();
-
-            let server_handle = tokio::spawn({
-                let tls_acceptor = tls_acceptor.clone();
-                let rpc_server_data = rpc_server_data.clone();
-
-                async move {
-                loop {
-                    let (tcp_stream, _) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                
-                    let tls_acceptor = tls_acceptor.clone();
-                    let rpc_server_data = rpc_server_data.clone();
-                
-                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                        Ok(s) => s,
-                        Err(e) => { eprintln!("Handshake failed: {}", e); return; }
-                    };
-                
-                    let (stop_rx, stop_tx) = jsonrpsee::server::stop_channel();
-                    let cert_der = 
-                        tls_stream.get_ref().1
-                            .peer_certificates()
-                            .and_then(|c| c.first())
-                            .map(|c| c.to_vec())
-                            .expect("Client certificate required");
-
-                    let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
-                        .expect("Failed to parse X.509 certificate DER");
-                    let public_key = parsed_cert.public_key()
-                        .subject_public_key.data.as_ref();
-
-                    let rpc_server = CoordinatorRPCServerImpl { d: rpc_server_data.clone(), id: public_key.to_vec() };
-                    let mut rpc_module = RpcModule::new(());
-                    rpc_module.merge(rpc_server.into_rpc()).unwrap();
-                    let rpc_service = Server::builder()
-                        .to_service_builder()
-                        .build(rpc_module, stop_rx);
-
-                    // Barrier needed, since we start the client thread but only add the client
-                    // info afterwards; client info is accessible to the JSON-RPC methods, so if a
-                    // request comes in after starting the client thread but before adding the
-                    // client info, we may have a problem.
-                    let barrier = Arc::new(Barrier::new(2));
-                    let client_handle = tokio::spawn({
-                        let barrier = barrier.clone(); async move {
-                        barrier.wait().await;
-                        if let Err(e) = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(TokioIo::new(tls_stream), TowerToHyperService::new(rpc_service))
-                            .with_upgrades()
-                            .await {
-                            eprintln!("Connection error: {}", e);
-                        }
-                    }});
-
-                    rpc_server_data.lock().await.add_client(cert_der, client_handle, stop_tx);
-                    barrier.clone().wait().await;
-                }}
-            });
-
+            let server_handle = crate::rpc::start_coord::<CoordinatorRPCServerImpl>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
             Self {
                 rpc_server: Some(rpc_server_data),
                 rpc_coord: None,
@@ -1292,12 +2209,12 @@ pub mod off_chain {
             }
         }
 
-        pub async fn start_rpc_client_from_cert(addr: &str, port: u16, timestamp: u64, client_cert: rcgen::CertifiedKey<rcgen::KeyPair>) -> Self {
+        pub async fn start_rpc_client_from_cert(addr: &str, port: u16, timestamp: u64, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
             Self::start_rpc_client(addr, port, timestamp, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
         }
 
         pub async fn start_rpc_client(addr: &str, port: u16, timestamp: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let rpc_coord = self_signed_certs::setup_client(addr, port, cert_der, key_der).await;
+            let rpc_coord = crate::self_signed_certs::setup_client(addr, port, cert_der, key_der).await;
 
             Self {
                 rpc_server: None,
@@ -1316,12 +2233,6 @@ pub mod off_chain {
         pub fn get_timestamp(&self) -> u64 {
             self.timestamp.expect("Coordinator server not started")
         }
-
-        pub async fn verify_client_sig(&self, i: Index, sig: Vec<u8>, raw_key: Vec<u8>) -> Result<bool, CoordinatorError> {
-            let sig_valid = self.rpc_coord.as_ref().expect("client not started").auth_client(i, sig, raw_key).await.unwrap();
-
-            Ok(sig_valid)
-        }
     }
     
     impl Coordinator for OffChainCoordinator {
@@ -1334,8 +2245,9 @@ pub mod off_chain {
             let mut map = HashMap::new();
 
             for _ in 0..n_clients {
-                let ReservedInputEvent { client, reserved_index } = sub.next().await.unwrap().unwrap();
-                map.insert(client, reserved_index);
+                let ReservedInputEvent { client, reserved_indices } = sub.next().await.unwrap().unwrap();
+                assert_eq!(reserved_indices.len(), 1);
+                map.insert(client, reserved_indices[0]);
             }
 
             Ok(map)
@@ -1440,197 +2352,18 @@ pub mod off_chain {
         }
     }
 
-    mod self_signed_certs {
-        use rustls::pki_types::PrivateKeyDer;
-        use rustls::pki_types::PrivatePkcs8KeyDer;
-        use rustls::pki_types::CertificateDer;
-        use rustls::pki_types::UnixTime;
-        use rustls::pki_types::ServerName;
-        use rustls::server::danger::{ClientCertVerifier, ClientCertVerified};
-        use rustls::client::danger::{ServerCertVerifier, ServerCertVerified};
-        use rustls::DistinguishedName;
-        use std::sync::Arc;
-        use jsonrpsee::client_transport::ws::WsTransportClientBuilder;
-        use jsonrpsee::core::client::ClientBuilder;
-        use url::Url;
-        use jsonrpsee::async_client::Client;
-        use rustls::ClientConfig;
-        use tokio_rustls::TlsConnector;
-        use tokio::net::TcpStream;
-        use std::fs;
-        use x509_parser::prelude::*;
-
-        #[derive(Debug)]
-        pub struct SelfSignedClientVerifier;
-
-        #[derive(Debug)]
-        pub struct SelfSignedServerVerifier;
-
-        impl ClientCertVerifier for SelfSignedClientVerifier {
-            fn root_hint_subjects(&self) -> &[DistinguishedName] {
-                &[]
-            }
-        
-            fn verify_client_cert(
-                &self,
-                _: &CertificateDer<'_>,
-                _: &[CertificateDer<'_>],
-                _: UnixTime,
-            ) -> Result<ClientCertVerified, rustls::Error> {
-                Ok(ClientCertVerified::assertion())
-            }
-        
-               fn verify_tls12_signature(
-                &self,
-                message: &[u8],
-                cert: &CertificateDer<'_>,
-                dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                rustls::crypto::verify_tls12_signature(
-                    message,
-                    cert,
-                    dss,
-                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-                )
-            }
-        
-            fn verify_tls13_signature(
-                &self,
-                message: &[u8],
-                cert: &CertificateDer<'_>,
-                dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                rustls::crypto::verify_tls13_signature(
-                    message,
-                    cert,
-                    dss,
-                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-                )
-            }
-        
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
-        }
-
-        impl ServerCertVerifier for SelfSignedServerVerifier {
-            fn verify_server_cert(
-                &self,
-                _: &CertificateDer<'_>,
-                _: &[CertificateDer<'_>],
-                _: &ServerName<'_>,
-                _: &[u8],
-                _: UnixTime,
-            ) -> Result<ServerCertVerified, rustls::Error> {
-                Ok(ServerCertVerified::assertion())
-            }
-        
-               fn verify_tls12_signature(
-                &self,
-                message: &[u8],
-                cert: &CertificateDer<'_>,
-                dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                rustls::crypto::verify_tls12_signature(
-                    message,
-                    cert,
-                    dss,
-                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-                )
-            }
-        
-            fn verify_tls13_signature(
-                &self,
-                message: &[u8],
-                cert: &CertificateDer<'_>,
-                dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                rustls::crypto::verify_tls13_signature(
-                    message,
-                    cert,
-                    dss,
-                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-                )
-            }
-        
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
-        }
-
-        pub fn server_cert() -> rcgen::CertifiedKey<rcgen::KeyPair> {
-            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-
-            rcgen::generate_simple_self_signed(subject_alt_names).unwrap()
-        }
-
-        pub fn client_cert() -> rcgen::CertifiedKey<rcgen::KeyPair> {
-            let subject_alt_names = vec!["client".to_string()];
-
-            rcgen::generate_simple_self_signed(subject_alt_names).unwrap()
-        }
-
-        pub fn server_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> rustls::ServerConfig {
-            let certs = vec![CertificateDer::from(cert_der)];
-            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
-        
-            rustls::ServerConfig::builder()
-                .with_client_cert_verifier(Arc::new(SelfSignedClientVerifier {}))
-                .with_single_cert(certs, key).unwrap()
-        }
-
-        fn client_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> ClientConfig {
-            let certs = vec![CertificateDer::from(cert_der)];
-            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
-
-            ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_client_auth_cert(certs, key).unwrap()
-        }
-
-        pub async fn setup_client(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Client {
-            let full_addr = format!("{}:{}", addr, port);
-            let url = format!("wss://{}/", full_addr);
-            let mut tls_config = client_tls_config(cert_der, key_der);
-            tls_config.dangerous().set_certificate_verifier(Arc::new(SelfSignedServerVerifier {}));
-
-            let tls_connector = TlsConnector::from(Arc::new(tls_config));
-            let tcp_stream = TcpStream::connect(full_addr).await.unwrap();
-            let domain = ServerName::try_from(addr).unwrap().to_owned();
-            let tls_stream = tls_connector.connect(domain, tcp_stream).await.unwrap();
-            
-            let (sender, receiver) = WsTransportClientBuilder::default()
-                .build_with_stream(Url::parse(&url).unwrap(), tls_stream)
-                .await.unwrap();
-
-            ClientBuilder::default()
-                .build_with_tokio(sender, receiver)
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
         use tokio::sync::Barrier;
-        use super::self_signed_certs::{server_cert, client_cert};
-        use std::sync::Once;
-
-        static INIT: Once = Once::new();
-        fn setup_test() {
-            INIT.call_once(|| {
-                rustls::crypto::ring::default_provider()
-                    .install_default()
-                    .expect("Failed to install default crypto provider");
-            });
-        }
+        use crate::self_signed_certs::{server_cert, client_cert};
+        use ark_std::test_rng;
+        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+        use stoffelmpc_mpc::common::SecretSharingScheme;
 
         #[tokio::test]
         async fn start_client_server() {
-            setup_test();
+            crate::setup_test();
 
             let certs = (0..7).map(|_| server_cert()).collect::<Vec<_>>();
             let public_keys = certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
@@ -1645,7 +2378,7 @@ pub mod off_chain {
 
         #[tokio::test]
         async fn trigger_pp() {
-            setup_test();
+            crate::setup_test();
 
             // event triggered BEFORE waiting for the event
             {
@@ -1698,64 +2431,105 @@ pub mod off_chain {
 
         #[tokio::test]
         async fn end_to_end() {
-            setup_test();
+            crate::setup_test();
+
+            let node_rpc_addrs = vec![
+                ("127.0.0.1", 12349),
+                ("127.0.0.1", 12350),
+                ("127.0.0.1", 12351)
+            ];
 
             let mut certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
             let public_keys = certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
 
-            let addr = "127.0.0.1";
-            let port = 12348;
-            let coord = OffChainCoordinator::start_coord_from_cert(addr, port, [0u8; 32], 5, 1, public_keys[..5].to_vec().clone(), 2, server_cert()).await;
+            let n: usize = 5;
+            let t: usize = 1;
+            let coord_addr = "127.0.0.1";
+            let coord_port = 12348;
+            let coord = OffChainCoordinator::start_coord_from_cert(coord_addr, coord_port, [0u8; 32], n as u64, t as u64, public_keys[..5].to_vec().clone(), 2, server_cert()).await;
             let timestamp = coord.get_timestamp();
             let barrier = Arc::new(Barrier::new(3));
-
-            // MPC client, also RPC client
-            tokio::spawn({
-                let barrier = barrier.clone();
-                let mut client = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, certs.remove(5)).await;
-                async move {
-                    let _ = client.wait_for_pp().await;
-                    let _ = client.wait_for_input_mask_init().await;
-                    let indices = client.obtain_mask_indices(1).await.unwrap();
-                    for i in indices {
-                        println!("CLIENT: obtained index {}", i);
-                    }
-                    let _ = client.wait_for_input().await;
-                    client.send_masked_input(Fr::from(42), 0).await.unwrap();
-                    client.wait_for_masked_inputs(1).await.unwrap();
-                    let _ = client.wait_for_mpc().await;
-                    let _ = client.wait_for_outputs().await;
-
-                    barrier.wait().await;
-                }
-            });
 
             // MPC node (designated party), also RPC client
             tokio::spawn({
                 let barrier = barrier.clone();
-                let mut node = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, certs.remove(0)).await;
+
+                let mut coord =
+                    OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, certs.remove(0)).await;
+
+                // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
+                // node here, but we use 3 RPC nodes to make the process work
+                let mask = Fr::from(42);
+                let mut rng = test_rng();
+                let mask_shares = RobustShare::compute_shares(mask, n, t, None, &mut rng).unwrap();
+
+                let mut node_rpcs = Vec::new();
+                for i in 0..3 {
+                    let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(node_rpc_addrs[i].0,
+                        node_rpc_addrs[i].1, crate::self_signed_certs::server_cert()).await;
+
+                    node_rpc.add_mask_share(0, mask_shares[i].clone()).await;
+                    node_rpcs.push(node_rpc);
+                }
+
                 async move {
-                    node.trigger_pp().await.unwrap();
-                    let _ = node.wait_for_pp().await;
-                    node.init_input_masks().await.unwrap();
-                    let _ = node.wait_for_input_mask_init().await;
-                    let client_to_index = node.wait_for_indices(1).await.unwrap();  // called by node
-                    for (c, i) in client_to_index {
+                    coord.trigger_pp().await.unwrap();
+                    coord.wait_for_pp().await.unwrap();
+                    coord.init_input_masks().await.unwrap();
+                    coord.wait_for_input_mask_init().await.unwrap();
+                    let client_to_index = coord.wait_for_indices(1).await.unwrap();  // called by node
+                    for (c, i) in &client_to_index {
                         println!("NODE: client {:?} reserved index {}", c, i);
+                        for node_rpc in node_rpcs.iter_mut() {
+                            // just received by one node here, but in reality would be received by
+                            // all nodes, so we simulate this here for more nodes
+                            node_rpc.add_reserved_index(c.to_vec(), *i).await;
+                        }
                     }
-                    node.trigger_input().await.unwrap();
-                    let _ = node.wait_for_input().await;
-                    let client_to_masked_input = node.wait_for_masked_inputs(1).await.unwrap();
+
+                    coord.trigger_input().await.unwrap();
+                    coord.wait_for_input().await.unwrap();
+                    let client_to_masked_input = coord.wait_for_masked_inputs(1).await.unwrap();
                     for (c, masked_inputs) in client_to_masked_input {
                         for masked_input in masked_inputs {
                             println!("NODE: client {:?} submitted masked input {}", c, masked_input);
                         }
                     }
-                    node.trigger_mpc().await.unwrap();
-                    let _ = node.wait_for_mpc().await;
-                    node.trigger_outputs().await.unwrap();
-                    let _ = node.wait_for_outputs().await;
-                    node.finalize().await.unwrap();
+                    coord.trigger_mpc().await.unwrap();
+                    coord.wait_for_mpc().await.unwrap();
+                    coord.trigger_outputs().await.unwrap();
+                    coord.wait_for_outputs().await.unwrap();
+                    coord.finalize().await.unwrap();
+
+                    barrier.wait().await;
+                }
+            });
+
+            // MPC client, also RPC client
+            tokio::spawn({
+                let barrier = barrier.clone();
+                let cert = certs.remove(0);
+                let mut coord =
+                    OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, cert.clone()).await;
+                let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), cert.clone()).await;
+                async move {
+                    coord.wait_for_pp().await.unwrap();
+                    coord.wait_for_input_mask_init().await.unwrap();
+
+                    let indices = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
+                    assert_eq!(indices.len(), 1);
+                    println!("CLIENT: obtained index {}", indices[0]);
+
+                    let mask = rpc_client.receive_mask_share().await;
+
+                    coord.wait_for_input().await.unwrap();
+
+                    let masked_input = mask + Fr::from(1337);
+                    coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
+                    coord.wait_for_masked_inputs(1).await.unwrap();
+
+                    coord.wait_for_mpc().await.unwrap();
+                    coord.wait_for_outputs().await.unwrap();
 
                     barrier.wait().await;
                 }
