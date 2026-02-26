@@ -358,6 +358,7 @@ pub mod on_chain {
     };
     use futures_util::stream::StreamExt;
     use std::collections::HashMap;
+    use std::str::FromStr;
     use super::{Coordinator, CoordinatorError};
 
     type ClientIdentity = Address;
@@ -366,7 +367,6 @@ pub mod on_chain {
     pub struct OnChainCoordinator<P: Provider> {
         coord: FakeCoordinatorInstance<P>,
         contract_block: u64,
-        initial_mpc_nodes: Vec<Address>
     }
 
     pub mod node_rpc {
@@ -402,11 +402,11 @@ pub mod on_chain {
         }
 
         impl NodeRPCClient {
-            pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(&str, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+            pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(String, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
                 Self::start_rpc_client(t, addrs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
             }
 
-            pub async fn start_rpc_client(t: usize, addrs: Vec<(&str, u16)>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+            pub async fn start_rpc_client(t: usize, addrs: Vec<(String, u16)>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
                 let mut node_rpcs = Vec::new();
 
                 // connect to all nodes
@@ -436,7 +436,7 @@ pub mod on_chain {
                     mask_shares.push(share);
 
                     if mask_shares.len() >= 2 * self.t + 1 {
-                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
+                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
                             Ok((_, mask)) => {
                                 return mask;
                             }
@@ -680,27 +680,31 @@ pub mod on_chain {
         signer.sign_message(hash.as_slice()).await.expect("signing failed")
     }
     
-    pub async fn setup_node(addr: String, wallet_sk: PrivateKeySigner) -> impl Provider + Clone {
-        let ws = WsConnect::new(addr.clone());
-        let wallet = EthereumWallet::from(wallet_sk);
+    pub async fn ws_connect(addr: &str, wallet_sk: &str) -> impl Provider + Clone {
+        let ws = WsConnect::new(addr);
+        let wallet = EthereumWallet::from(PrivateKeySigner::from_str(wallet_sk).expect("invalid private key"));
 
         match ProviderBuilder::new().wallet(wallet).connect_ws(ws).await {
             Ok(p) => { p }
             Err(e) => {
-                panic!("could not connect to Ethereum node at {} via WebSockets: {}", addr.clone(), e);
+                panic!("could not connect to Ethereum node at {} via WebSockets: {}", addr, e);
             }
         }
     }
     
-    pub async fn setup_mock_coord(eth: impl Provider + Clone, contract_addr: Address, initial_mpc_nodes: Vec<Address>) -> OnChainCoordinator<impl Provider + Clone> {
+    pub async fn setup_coord(eth: impl Provider + Clone, contract_addr: Address) -> OnChainCoordinator<impl Provider + Clone> {
         let coord_instance = FakeCoordinator::new(contract_addr, eth.clone());
-        OnChainCoordinator::new(coord_instance, initial_mpc_nodes).await
+        OnChainCoordinator::new(coord_instance).await
     }
     
-    impl<P: Provider> OnChainCoordinator<P> {
-        pub async fn new(coord: FakeCoordinatorInstance<P>, initial_mpc_nodes: Vec<Address>) -> Self {
+    impl<P: Provider + Clone> OnChainCoordinator<P> {
+        pub async fn new(coord: FakeCoordinatorInstance<P>) -> Self {
             let contract_block = Self::coord_creation_block(&coord).await;
-            Self { coord, contract_block, initial_mpc_nodes }
+            Self { coord, contract_block }
+        }
+
+        pub fn coord(&self) -> FakeCoordinatorInstance<P> {
+            self.coord.clone()
         }
     
         async fn coord_creation_block(coord: &FakeCoordinatorInstance<P>) -> u64 {
@@ -708,7 +712,7 @@ pub mod on_chain {
                 u256_to_u64(x).expect("impossible bug: block number does not fit into u64")
         }
 
-        async fn base_nonce(&self) -> u64 {
+        pub async fn base_nonce(&self) -> u64 {
             let base_nonce = self.coord.baseNonce().call().await.expect("sending TX failed");
             u256_to_u64(base_nonce).expect("impossible bug: block number does not fit into u64")
         }
@@ -755,8 +759,8 @@ pub mod on_chain {
             panic!();
         }
 
-        pub async fn grant_roles(&self) -> Result<(), CoordinatorError> {
-            assert!(self.initial_mpc_nodes.len() == 5);
+        pub async fn grant_roles(&self, nodes: Vec<Address>) -> Result<(), CoordinatorError> {
+            assert_eq!(nodes.len(), 5);
         
             let PARTY_ROLE = {
                 let builder = self.coord.PARTY_ROLE();
@@ -768,8 +772,8 @@ pub mod on_chain {
             //};
         
             // grant party roles
-            for i in 0..self.initial_mpc_nodes.len() {
-                let builder = self.coord.grantRole(PARTY_ROLE, self.initial_mpc_nodes[i]);
+            for i in 0..nodes.len() {
+                let builder = self.coord.grantRole(PARTY_ROLE, nodes[i]);
                 let result = builder.send().await;
                 match result {
                     Ok(r) => {
@@ -1044,13 +1048,8 @@ pub mod on_chain {
         use alloy::signers::local::PrivateKeySigner;
         use ark_std::test_rng;
         use ark_bls12_381::Fr;
-        use alloy::{
-            node_bindings::{Anvil, AnvilInstance},
-            providers::{Provider, ProviderBuilder, WsConnect},
-            network::EthereumWallet,
-        };
+        use alloy::node_bindings::{Anvil, AnvilInstance};
         use alloy_primitives::{Address, U256, FixedBytes, address};
-        use std::str::FromStr;
         use stoffel_solidity_bindings::{
             fake_coordinator::FakeCoordinator,
         };
@@ -1091,15 +1090,6 @@ pub mod on_chain {
             Anvil::new().spawn()
         }
         
-        async fn ws_connect(ws_addr: &str, key: &str) -> impl Provider + Clone {
-            let ws = WsConnect::new(ws_addr);
-            let wallet = EthereumWallet::from(PrivateKeySigner::from_str(key).expect("invalid private key"));
-        
-            ProviderBuilder::new()
-                .wallet(wallet)
-                .connect_ws(ws).await.expect("could not connect to Anvil via WebSockets")
-        }
-    
         #[tokio::test]
         pub async fn sig_gen_onchain() {
             let anvil = spawn_anvil();
@@ -1111,12 +1101,12 @@ pub mod on_chain {
             let n_inputs = U256::from(1);
     
             let contract = FakeCoordinator::deploy(provider.clone(), hash, n, t, ACC[0], initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-            let mut coord = OnChainCoordinator::new(contract.clone(), initial_mpc_nodes.clone()).await;
+            let mut coord = OnChainCoordinator::new(contract.clone()).await;
             let signer = PrivateKeySigner::from_str(SK[0]).unwrap();
             let i = 42;
 
             // grant roles to parties
-            coord.grant_roles().await.expect("granting roles failed");
+            coord.grant_roles(initial_mpc_nodes).await.expect("granting roles failed");
     
             // Generate signature
             let _ = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
@@ -1127,19 +1117,19 @@ pub mod on_chain {
             {
                 let provider = ws_connect(&anvil.ws_endpoint(), SK[1]).await;
                 let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
-                let coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+                let coord = OnChainCoordinator::new(instance).await;
                 coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
             }
             {
                 let provider = ws_connect(&anvil.ws_endpoint(), SK[2]).await;
                 let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
-                let coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+                let coord = OnChainCoordinator::new(instance).await;
                 coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
             }
             {
                 let provider = ws_connect(&anvil.ws_endpoint(), SK[3]).await;
                 let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
-                let coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+                let coord = OnChainCoordinator::new(instance).await;
                 coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
             }
 
@@ -1183,7 +1173,7 @@ pub mod on_chain {
             let n_inputs = U256::from(1);
     
             let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-            let coord = OnChainCoordinator::new(coord_instance, initial_mpc_nodes).await;
+            let coord = OnChainCoordinator::new(coord_instance).await;
             assert_eq!(coord.contract_block, 1);
         }
     
@@ -1201,7 +1191,7 @@ pub mod on_chain {
                 let n_inputs = U256::from(1);
     
                 let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-                let coord = OnChainCoordinator::new(coord_instance, initial_mpc_nodes).await;
+                let coord = OnChainCoordinator::new(coord_instance).await;
     
                 coord.trigger_pp().await.unwrap();
                 coord.wait_for_pp().await.unwrap();
@@ -1219,7 +1209,7 @@ pub mod on_chain {
                 let n_inputs = U256::from(1);
     
                 let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-                let coord = OnChainCoordinator::new(coord_instance, initial_mpc_nodes).await;
+                let coord = OnChainCoordinator::new(coord_instance).await;
     
                 tokio::spawn({
                     let coord = coord.clone();
@@ -1239,9 +1229,9 @@ pub mod on_chain {
             crate::setup_test();
 
             let node_rpc_addrs = vec![
-                ("127.0.0.1", 12348),
-                ("127.0.0.1", 12349),
-                ("127.0.0.1", 12350)
+                ("127.0.0.1".to_string(), 12348),
+                ("127.0.0.1".to_string(), 12349),
+                ("127.0.0.1".to_string(), 12350)
             ];
             let anvil = spawn_anvil();
             let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
@@ -1260,7 +1250,7 @@ pub mod on_chain {
                 let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
                 let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
 
-                let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(node_rpc_addrs[i].0,
+                let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
                     node_rpc_addrs[i].1, instance.clone(), crate::self_signed_certs::server_cert()).await;
                 node_rpcs.push(node_rpc);
             }
@@ -1272,9 +1262,9 @@ pub mod on_chain {
             crate::setup_test();
 
             let node_rpc_addrs = vec![
-                ("127.0.0.1", 12348),
-                ("127.0.0.1", 12349),
-                ("127.0.0.1", 12350)
+                ("127.0.0.1".to_string(), 12348),
+                ("127.0.0.1".to_string(), 12349),
+                ("127.0.0.1".to_string(), 12350)
             ];
             let anvil = spawn_anvil();
             let n = 5;
@@ -1301,8 +1291,8 @@ pub mod on_chain {
                 }
 
                 // grant roles to parties
-                let mut coord = OnChainCoordinator::new(instances[0].clone(), initial_mpc_nodes.clone()).await;
-                coord.grant_roles().await.expect("granting roles failed");
+                let mut coord = OnChainCoordinator::new(instances[0].clone()).await;
+                coord.grant_roles(initial_mpc_nodes.clone()).await.expect("granting roles failed");
 
                 // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
                 // node here, but we use 3 RPC nodes to make the process work
@@ -1312,7 +1302,7 @@ pub mod on_chain {
 
                 let mut node_rpcs = Vec::new();
                 for i in 0..3 {
-                    let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(node_rpc_addrs[i].0,
+                    let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
                         node_rpc_addrs[i].1, instances[i].clone(), crate::self_signed_certs::server_cert()).await;
 
                     node_rpc.add_mask_share(0, mask_shares[i].clone()).await;
@@ -1367,7 +1357,7 @@ pub mod on_chain {
 
                 let provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
                 let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
-                let mut coord = OnChainCoordinator::new(instance, initial_mpc_nodes.clone()).await;
+                let mut coord = OnChainCoordinator::new(instance).await;
 
                 async move {
                     let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), crate::self_signed_certs::client_cert()).await;
@@ -1453,11 +1443,11 @@ pub mod off_chain {
         }
 
         impl NodeRPCClient {
-            pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(&str, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+            pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(String, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
                 Self::start_rpc_client(t, addrs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
             }
 
-            pub async fn start_rpc_client(t: usize, addrs: Vec<(&str, u16)>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+            pub async fn start_rpc_client(t: usize, addrs: Vec<(String, u16)>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
                 let mut node_rpcs = Vec::new();
 
                 // connect to all nodes
@@ -1487,7 +1477,7 @@ pub mod off_chain {
                     mask_shares.push(share);
 
                     if mask_shares.len() >= 2 * self.t + 1 {
-                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
+                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
                             Ok((_, mask)) => {
                                 return mask;
                             }
@@ -2437,9 +2427,9 @@ pub mod off_chain {
             crate::setup_test();
 
             let node_rpc_addrs = vec![
-                ("127.0.0.1", 12349),
-                ("127.0.0.1", 12350),
-                ("127.0.0.1", 12351)
+                ("127.0.0.1".to_string(), 12349),
+                ("127.0.0.1".to_string(), 12350),
+                ("127.0.0.1".to_string(), 12351)
             ];
 
             let mut certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
@@ -2468,7 +2458,7 @@ pub mod off_chain {
 
                 let mut node_rpcs = Vec::new();
                 for i in 0..3 {
-                    let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(node_rpc_addrs[i].0,
+                    let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
                         node_rpc_addrs[i].1, crate::self_signed_certs::server_cert()).await;
 
                     node_rpc.add_mask_share(0, mask_shares[i].clone()).await;
