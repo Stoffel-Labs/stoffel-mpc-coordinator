@@ -313,7 +313,6 @@ pub mod rpc {
 
 pub trait Coordinator {
     type ClientIdentity;
-    type Index;
 
     fn trigger_input(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn trigger_pp(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
@@ -321,14 +320,14 @@ pub trait Coordinator {
     fn wait_for_input(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_pp(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_input_mask_init(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn obtain_mask_indices(&mut self, n_indices: Self::Index) -> impl Future<Output = Result<Vec<Self::Index>, CoordinatorError>>;
-    fn send_masked_input(&self, masked_input: Fr, i: Self::Index) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn wait_for_masked_inputs(&self, n_clients: usize) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<Fr>>, CoordinatorError>>;
+    fn obtain_mask_indices(&mut self, n_indices: u64) -> impl Future<Output = Result<Vec<u64>, CoordinatorError>>;
+    fn send_masked_input(&self, masked_input: Fr, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
+    fn wait_for_masked_inputs(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<Fr>>, CoordinatorError>>;
     fn trigger_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn trigger_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn wait_for_indices(&self, n_clients: usize) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Self::Index>, CoordinatorError>>;
+    fn wait_for_indices(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, u64>, CoordinatorError>>;
     fn finalize(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
 }
 
@@ -362,7 +361,6 @@ pub mod on_chain {
     use super::{Coordinator, CoordinatorError};
 
     type ClientIdentity = Address;
-    type Index = U256;
     
     #[derive(Clone)]
     pub struct OnChainCoordinator<P: Provider> {
@@ -384,7 +382,7 @@ pub mod on_chain {
         use jsonrpsee::{core::{SubscriptionResult, to_json_raw_value}, async_client::Client, server::RpcModule, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
         use async_trait::async_trait;
         use tokio::task::JoinHandle;
-        use super::{ClientIdentity, Index};
+        use super::ClientIdentity;
         use crate::rpc::ClientInfo;
         use tokio::task::JoinSet;
         use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -501,7 +499,7 @@ pub mod on_chain {
             }
 
             // called when the client has reserved indices at the coordinator
-            pub async fn add_reserved_index(&mut self, addr: ClientIdentity, i: Index) {
+            pub async fn add_reserved_index(&mut self, addr: ClientIdentity, i: u64) {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.index_to_client.contains_key(&i));
@@ -524,7 +522,7 @@ pub mod on_chain {
             }
             
             // called when preprocessing has generated the mask shares
-            pub async fn add_mask_share(&mut self, i: Index, share: RobustShare<Fr>) {
+            pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.mask_shares.contains_key(&i));
@@ -564,11 +562,11 @@ pub mod on_chain {
         }
 
         pub struct NodeRPCServerInternal<P: Provider + Clone> {
-            index_to_client: HashMap<Index, ClientIdentity>,
-            client_to_index: HashMap<ClientIdentity, Index>,
+            index_to_client: HashMap<u64, ClientIdentity>,
+            client_to_index: HashMap<ClientIdentity, u64>,
             auth_status: HashMap<ClientIdentity, bool>,
             sinks: HashMap<ClientIdentity, SubscriptionSink>,
-            mask_shares: HashMap<Index, RobustShare<Fr>>,
+            mask_shares: HashMap<u64, RobustShare<Fr>>,
             id_to_addr: HashMap<Vec<u8>, ClientIdentity>,
             clients: HashMap<Vec<u8>, ClientInfo>,
             coord: FakeCoordinatorInstance<P>
@@ -673,7 +671,7 @@ pub mod on_chain {
         Some(Fr::from_le_bytes_mod_order(&bytes))
     }
     
-    pub async fn generate_client_sig(base_nonce: U256, i: U256, signer: PrivateKeySigner) -> Signature {
+    pub async fn generate_client_sig(base_nonce: u64, i: u64, signer: PrivateKeySigner) -> Signature {
         let hash = {
             let mut hasher = Keccak256::new();
             hasher.update((base_nonce + i).abi_encode());
@@ -790,10 +788,9 @@ pub mod on_chain {
     
     impl<P: Provider> Coordinator for OnChainCoordinator<P> {
         type ClientIdentity = Address;
-        type Index = U256;
 
-        async fn wait_for_indices(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Index>, CoordinatorError> {
-            let mut addr_to_i: HashMap<Address, U256> = HashMap::new();
+        async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
+            let mut addr_to_i: HashMap<Address, u64> = HashMap::new();
             
             // spawn thread to receive all ReservedInputEvents
             let mut events = self.coord
@@ -804,10 +801,10 @@ pub mod on_chain {
             
             while let Some(Ok((ReservedInputEvent { client, reservedIndices }, _))) = events.next().await {
                 assert_eq!(reservedIndices.len(), 1);
-                addr_to_i.insert(client, reservedIndices[0]);
+                addr_to_i.insert(client, u256_to_u64(reservedIndices[0]).expect("conversion from U256 to u64 failed"));
                 eprintln!("[party] Recorded reserved mask index {} for client address {:?}",
                          reservedIndices[0], client);
-                if addr_to_i.len() == n_clients {
+                if addr_to_i.len() as u64 == n_clients {
                     break;
                 }
             }
@@ -815,14 +812,14 @@ pub mod on_chain {
             Ok(addr_to_i)
         }
 
-        async fn wait_for_masked_inputs(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
+        async fn wait_for_masked_inputs(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
             let mut events = self.coord
                 .MaskedInputEvent_filter()
                 .from_block(self.contract_block)
                 .watch()
                 .await.unwrap().into_stream();
         
-            let mut masked_inputs: HashMap<Address, Vec<Fr>> = HashMap::new();
+            let mut masked_inputs: HashMap<ClientIdentity, Vec<Fr>> = HashMap::new();
             for _ in 0..n_clients {
                 if let Some(Ok((MaskedInputEvent { client, maskedInput, reservedIndex }, _))) = events.next().await {
                     let masked_input = match u256_to_fr(maskedInput) {
@@ -927,8 +924,8 @@ pub mod on_chain {
             }
         }
         
-        async fn obtain_mask_indices(&mut self, n_indices: Index) -> Result<Vec<Index>, CoordinatorError> {
-            let builder = self.coord.obtainInputMasks(n_indices);
+        async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
+            let builder = self.coord.obtainInputMasks(U256::from(n_indices));
             let tx = builder.send().await.expect("failed to send TX");
             let receipt = tx.get_receipt().await.expect("failed to get receipt");
 
@@ -945,11 +942,19 @@ pub mod on_chain {
                 }
             }
 
-            Ok(indices.expect("no index reservation event found"))
+            if let Some(indices) = indices {
+                return indices.iter().map(|i| {
+                    u256_to_u64(*i).ok_or_else(|| {
+                        panic!("conversion from U256 to u64 failed for index {}", i);
+                    })
+                }).collect();
+            }
+
+            panic!("no index reservation event found");
         }
 
-        async fn send_masked_input(&self, masked_input: Fr, i: Index) -> Result<(), CoordinatorError> {
-            let builder = self.coord.submitMaskedInput(fr_to_u256(masked_input), i);
+        async fn send_masked_input(&self, masked_input: Fr, i: u64) -> Result<(), CoordinatorError> {
+            let builder = self.coord.submitMaskedInput(fr_to_u256(masked_input), U256::from(i));
             let result = builder.send().await;
             match result {
                 Ok(r) => {
@@ -1108,15 +1113,15 @@ pub mod on_chain {
             let contract = FakeCoordinator::deploy(provider.clone(), hash, n, t, ACC[0], initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
             let mut coord = OnChainCoordinator::new(contract.clone(), initial_mpc_nodes.clone()).await;
             let signer = PrivateKeySigner::from_str(SK[0]).unwrap();
-            let i = U256::from(42);
+            let i = 42;
 
             // grant roles to parties
             coord.grant_roles().await.expect("granting roles failed");
     
             // Generate signature
-            let _ = coord.obtain_mask_indices(U256::from(1)).await.expect("obtaining mask indices failed");
+            let _ = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
             let base_nonce = coord.base_nonce().await;
-            let sig = generate_client_sig(U256::from(base_nonce), i, signer.clone()).await;
+            let sig = generate_client_sig(base_nonce, i, signer.clone()).await;
     
             // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
             {
@@ -1310,7 +1315,7 @@ pub mod on_chain {
                     let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(node_rpc_addrs[i].0,
                         node_rpc_addrs[i].1, instances[i].clone(), crate::self_signed_certs::server_cert()).await;
 
-                    node_rpc.add_mask_share(U256::from(0), mask_shares[i].clone()).await;
+                    node_rpc.add_mask_share(0, mask_shares[i].clone()).await;
                     node_rpcs.push(node_rpc);
                 }
 
@@ -1369,13 +1374,13 @@ pub mod on_chain {
                     let _ = coord.wait_for_pp().await;
                     let _ = coord.wait_for_input_mask_init().await;
 
-                    let indices = coord.obtain_mask_indices(U256::from(1)).await.expect("obtaining mask indices failed");
+                    let indices = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
                     assert_eq!(indices.len(), 1);
                     println!("CLIENT: obtained index {}", indices[0]);
 
                     let base_nonce = coord.base_nonce().await;
                     let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
-                    let sig = generate_client_sig(U256::from(base_nonce), indices[0], signer.clone()).await;
+                    let sig = generate_client_sig(base_nonce, indices[0], signer.clone()).await;
                     let mask = rpc_client.receive_mask_share(sig.into(), ACC[5]).await;
 
                     let _ = coord.wait_for_input().await;
@@ -1413,7 +1418,6 @@ pub mod off_chain {
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 
     type ClientIdentity = Vec<u8>;
-    type Index = u64;
 
     pub mod node_rpc {
         use ark_bls12_381::Fr;
@@ -1423,7 +1427,7 @@ pub mod off_chain {
         use jsonrpsee::{core::{SubscriptionResult, to_json_raw_value}, async_client::Client, server::RpcModule, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
         use async_trait::async_trait;
         use tokio::task::JoinHandle;
-        use super::{ClientIdentity, Index};
+        use super::ClientIdentity;
         use crate::rpc::ClientInfo;
         use tokio::task::JoinSet;
         use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -1519,7 +1523,7 @@ pub mod off_chain {
             }
 
             // called when the client has reserved indices at the coordinator
-            pub async fn add_reserved_index(&mut self, id: ClientIdentity, i: Index) {
+            pub async fn add_reserved_index(&mut self, id: ClientIdentity, i: u64) {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.index_to_client.contains_key(&i));
@@ -1538,7 +1542,7 @@ pub mod off_chain {
             }
             
             // called when preprocessing has generated the mask shares
-            pub async fn add_mask_share(&mut self, i: Index, share: RobustShare<Fr>) {
+            pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.mask_shares.contains_key(&i));
@@ -1574,10 +1578,10 @@ pub mod off_chain {
         }
 
         pub struct NodeRPCServerInternal {
-            index_to_client: HashMap<Index, ClientIdentity>,
-            client_to_index: HashMap<ClientIdentity, Index>,
+            index_to_client: HashMap<u64, ClientIdentity>,
+            client_to_index: HashMap<ClientIdentity, u64>,
             sinks: HashMap<ClientIdentity, SubscriptionSink>,
-            mask_shares: HashMap<Index, RobustShare<Fr>>,
+            mask_shares: HashMap<u64, RobustShare<Fr>>,
             clients: HashMap<Vec<u8>, ClientInfo>,
         }
 
@@ -1629,7 +1633,7 @@ pub mod off_chain {
     pub mod events {
         use ark_bls12_381::Fr;
         use serde::{Serialize, Deserialize};
-        use super::{ClientIdentity, Index, FieldElement};
+        use super::{ClientIdentity, FieldElement};
         use downcast_rs::{Downcast, impl_downcast};
         use dyn_clone::{DynClone, clone_trait_object};
     //    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
@@ -1647,7 +1651,7 @@ pub mod off_chain {
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct IndexBufferEvent {
-            pub total_indices: Index,
+            pub total_indices: u64,
             pub designated_party: ClientIdentity
         }
     
@@ -1673,7 +1677,7 @@ pub mod off_chain {
         pub struct MaskedInputEvent {
             pub client: ClientIdentity,
             pub masked_input: FieldElement<Fr>,
-            pub reserved_index: Index
+            pub reserved_index: u64
         }
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1697,7 +1701,7 @@ pub mod off_chain {
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct ReservedInputEvent {
             pub client: ClientIdentity,
-            pub reserved_indices: Vec<Index>
+            pub reserved_indices: Vec<u64>
         }
     
         #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1803,13 +1807,13 @@ pub mod off_chain {
         async fn sub_collect_inputs(&self, timestamp: u64) -> SubscriptionResult;
     
         #[method(name = "auth_client")]
-        async fn auth_client(&self, i: Index, sig: Vec<u8>, key: ClientIdentity) -> RpcResult<bool>;
+        async fn auth_client(&self, i: u64, sig: Vec<u8>, key: ClientIdentity) -> RpcResult<bool>;
     
         #[method(name = "available_input_masks")]
         async fn available_input_masks(&self) -> RpcResult<u64>;
     
         #[method(name = "obtain_input_masks")]
-        async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<Index>>;
+        async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>>;
 
         #[subscription(name = "sub_reserve_input_masks", unsubscribe = "unsub_reserve_input_masks", item = InputMaskReservationStarted)]
         async fn sub_reserve_input_masks(&self, timestamp: u64) -> SubscriptionResult;
@@ -1827,7 +1831,7 @@ pub mod off_chain {
         async fn sub_start_pp(&self, timestamp: u64) -> SubscriptionResult;
     
         #[method(name = "submit_masked_input")]
-        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: Index) -> RpcResult<()>;
+        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: u64) -> RpcResult<()>;
 
         #[subscription(name = "sub_reserved_indices", unsubscribe = "unsub_reserved_indices", item = ReservedInputEvent)]
         async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
@@ -1852,7 +1856,7 @@ pub mod off_chain {
         reserved_index_sinks: Vec<SubscriptionSink>,
         masked_input_events: Vec<(u64, MaskedInputEvent)>,
         masked_input_sinks: Vec<SubscriptionSink>,
-        next_i: Index,
+        next_i: u64,
         reserved_indices: Vec<Option<ClientIdentity>>,
         input_masks: Vec<Option<Fr>>,
         round: Round,
@@ -1864,7 +1868,7 @@ pub mod off_chain {
     }
 
     impl CoordinatorRPCServerImplInternal {
-        pub fn new(prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index) -> Self {
+        pub fn new(prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> Self {
             Self {
                 sinks: HashMap::from([
                     (Round::Idle, vec![]),
@@ -2028,7 +2032,7 @@ pub mod off_chain {
             d.subscribe_oneshot::<InputCollectionStarted>(pending, timestamp, Round::InputCollection).await
         }
 
-        async fn auth_client(&self, i: Index, sig: Vec<u8>, key: ClientIdentity) -> RpcResult<bool> {
+        async fn auth_client(&self, i: u64, sig: Vec<u8>, key: ClientIdentity) -> RpcResult<bool> {
             let message = i.to_be_bytes();
             let verifier = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, key);
             Ok(verifier.verify(&message, &sig).is_ok())
@@ -2046,7 +2050,7 @@ pub mod off_chain {
             d.subscribe_oneshot::<InputMaskReservationStarted>(pending, timestamp, Round::InputMaskReservation).await
         }
 
-        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index) {
+        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) {
             let mut d = self.d.lock().await;
 
             if d.round != Round::Idle {
@@ -2081,7 +2085,7 @@ pub mod off_chain {
             d.subscribe_oneshot::<PreprocessingStarted>(pending, timestamp, Round::Preprocessing).await
         }
 
-        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, raw_reserved_index: Index) -> RpcResult<()> {
+        async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, raw_reserved_index: u64) -> RpcResult<()> {
             let mut d = self.d.lock().await;
 
             if d.round != Round::InputCollection {
@@ -2131,7 +2135,7 @@ pub mod off_chain {
             d.subscribe_masked_inputs(pending, timestamp).await
         }
 
-        async fn obtain_mask_indices(&self, n_indices: Index) -> RpcResult<Vec<Index>> {
+        async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>> {
             let mut d = self.d.lock().await;
 
             if d.round != Round::InputMaskReservation {
@@ -2192,11 +2196,11 @@ pub mod off_chain {
     }
 
     impl OffChainCoordinator {
-        pub async fn start_coord_from_cert(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+        pub async fn start_coord_from_cert(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
             Self::start_coord(addr, port, prog_hash, n, t, initial_mpc_nodes, n_inputs, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
         }
 
-        pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: Index, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+        pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
             let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), n_inputs)));
             let server_handle = crate::rpc::start_coord::<CoordinatorRPCServerImpl>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
             Self {
@@ -2237,9 +2241,8 @@ pub mod off_chain {
     
     impl Coordinator for OffChainCoordinator {
         type ClientIdentity = ClientIdentity;
-        type Index = Index;
 
-        async fn wait_for_indices(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Index>, CoordinatorError> {
+        async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
             let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_reserved_indices(self.get_timestamp()).await.unwrap();
 
             let mut map = HashMap::new();
@@ -2253,7 +2256,7 @@ pub mod off_chain {
             Ok(map)
         }
 
-        async fn wait_for_masked_inputs(&self, n_clients: usize) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
+        async fn wait_for_masked_inputs(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
             let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_masked_inputs(self.get_timestamp()).await.unwrap();
 
             let mut map = HashMap::new();
@@ -2306,7 +2309,7 @@ pub mod off_chain {
             Ok(())
         }
 
-        async fn send_masked_input(&self, masked_input: Fr, i: Index) -> Result<(), CoordinatorError> {
+        async fn send_masked_input(&self, masked_input: Fr, i: u64) -> Result<(), CoordinatorError> {
             self.rpc_coord.as_ref().expect("client not started").submit_masked_input(FieldElement { value: masked_input }, i).await.unwrap();
 
             Ok(())
@@ -2339,7 +2342,7 @@ pub mod off_chain {
             Ok(())
         }
 
-        async fn obtain_mask_indices(&mut self, n_indices: Index) -> Result<Vec<Index>, CoordinatorError> {
+        async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
             let indices = self.rpc_coord.as_ref().expect("client not started").obtain_mask_indices(n_indices).await.unwrap();
 
             Ok(indices)
