@@ -59,7 +59,16 @@ async fn main() {
         .collect();
     let n_inputs = U256::from(args.n_inputs);
 
-    let contract = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes, n_inputs).await.expect("deployment failed");
+    let contract = match FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes, n_inputs).await {
+        Ok(contract) => contract,
+        Err(e) => {
+            eprintln!("Failed to deploy contract: {}", e);
+            if let Some(decoded_err) = e.as_decoded_interface_error::<FakeCoordinator::FakeCoordinatorErrors>() {
+                println!("Decoded error: {:?}", decoded_err);
+            } 
+            return;
+        }
+    };
 
     println!("{}", contract.address());
 }
