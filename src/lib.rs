@@ -4,6 +4,7 @@ use thiserror::Error;
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use std::sync::Once;
+use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 
 static INIT: Once = Once::new();
 fn setup_test() {
@@ -322,7 +323,7 @@ pub trait Coordinator {
     fn wait_for_input_mask_init(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn obtain_mask_indices(&mut self, n_indices: u64) -> impl Future<Output = Result<Vec<u64>, CoordinatorError>>;
     fn send_masked_input(&self, masked_input: Fr, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn wait_for_masked_inputs(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<Fr>>, CoordinatorError>>;
+    fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<Fr>>) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<RobustShare<Fr>>>, CoordinatorError>>;
     fn trigger_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn trigger_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
@@ -360,6 +361,7 @@ pub mod on_chain {
     use std::collections::HashMap;
     use std::str::FromStr;
     use super::{Coordinator, CoordinatorError};
+    use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 
     type ClientIdentity = Address;
     
@@ -436,7 +438,7 @@ pub mod on_chain {
                     mask_shares.push(share);
 
                     if mask_shares.len() >= 2 * self.t + 1 {
-                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
+                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
                             Ok((_, mask)) => {
                                 return mask;
                             }
@@ -816,14 +818,14 @@ pub mod on_chain {
             Ok(addr_to_i)
         }
 
-        async fn wait_for_masked_inputs(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
+        async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<Fr>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<Fr>>>, CoordinatorError> {
             let mut events = self.coord
                 .MaskedInputEvent_filter()
                 .from_block(self.contract_block)
                 .watch()
                 .await.unwrap().into_stream();
         
-            let mut masked_inputs: HashMap<ClientIdentity, Vec<Fr>> = HashMap::new();
+            let mut inputs: HashMap<ClientIdentity, Vec<RobustShare<Fr>>> = HashMap::new();
             for _ in 0..n_clients {
                 if let Some(Ok((MaskedInputEvent { client, maskedInput, reservedIndex }, _))) = events.next().await {
                     let masked_input = match u256_to_fr(maskedInput) {
@@ -832,12 +834,20 @@ pub mod on_chain {
                             panic!();
                         }
                     };
-                    masked_inputs.insert(client, vec![masked_input]);
+                    let i = u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed") as usize;
+                    let mask_share = &mask_shares[i];
+                    let input = RobustShare::new(
+                        masked_input - mask_share.share[0],
+                        mask_share.id,
+                        mask_share.degree
+                    );
+
+                    inputs.insert(client, vec![input]);
                 } else {
                     panic!();
                 }
             }
-            Ok(masked_inputs)
+            Ok(inputs)
         }
 
         async fn trigger_input(&self) -> Result<(), CoordinatorError> {
@@ -1335,10 +1345,10 @@ pub mod on_chain {
 
                     coord.trigger_input().await.unwrap();
                     let _ = coord.wait_for_input().await;
-                    let client_to_masked_input = coord.wait_for_masked_inputs(1).await.unwrap();
+                    let client_to_masked_input = coord.wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
                     for (c, masked_inputs) in client_to_masked_input {
                         for masked_input in masked_inputs {
-                            println!("NODE: client {:?} submitted masked input {}", c, masked_input);
+                            println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
                         }
                     }
                     coord.trigger_mpc().await.unwrap();
@@ -1377,7 +1387,6 @@ pub mod on_chain {
 
                     let masked_input = mask + Fr::from(1337);
                     coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
-                    coord.wait_for_masked_inputs(1).await.unwrap();
 
                     let _ = coord.wait_for_mpc().await;
                     let _ = coord.wait_for_outputs().await;
@@ -1406,6 +1415,7 @@ pub mod off_chain {
     use jsonrpsee::server::RpcModule;
     use jsonrpsee::async_client::Client;
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+    use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 
     type ClientIdentity = Vec<u8>;
 
@@ -1477,7 +1487,7 @@ pub mod off_chain {
                     mask_shares.push(share);
 
                     if mask_shares.len() >= 2 * self.t + 1 {
-                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
+                        match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
                             Ok((_, mask)) => {
                                 return mask;
                             }
@@ -2246,19 +2256,27 @@ pub mod off_chain {
             Ok(map)
         }
 
-        async fn wait_for_masked_inputs(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<Fr>>, CoordinatorError> {
+        async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<Fr>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<Fr>>>, CoordinatorError> {
             let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_masked_inputs(self.get_timestamp()).await.unwrap();
 
             let mut map = HashMap::new();
 
             for _ in 0..n_clients {
                 let MaskedInputEvent { client, masked_input, reserved_index } = sub.next().await.unwrap().unwrap();
-                map.insert(client, vec![masked_input.value]);
+                let masked_input = masked_input.value;
+                let i = reserved_index as usize;
+                let mask_share = &mask_shares[i];
+                let input = RobustShare::new(
+                    masked_input - mask_share.share[0],
+                    mask_share.id,
+                    mask_share.degree
+                );
+
+                map.insert(client, vec![input]);
             }
 
             Ok(map)
         }
-
 
         async fn trigger_input(&self) -> Result<(), CoordinatorError> {
             self.rpc_coord.as_ref().expect("client not started").transition(Round::InputCollection).await.unwrap();
@@ -2482,10 +2500,10 @@ pub mod off_chain {
 
                     coord.trigger_input().await.unwrap();
                     coord.wait_for_input().await.unwrap();
-                    let client_to_masked_input = coord.wait_for_masked_inputs(1).await.unwrap();
+                    let client_to_masked_input = coord.wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
                     for (c, masked_inputs) in client_to_masked_input {
                         for masked_input in masked_inputs {
-                            println!("NODE: client {:?} submitted masked input {}", c, masked_input);
+                            println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
                         }
                     }
                     coord.trigger_mpc().await.unwrap();
@@ -2519,7 +2537,6 @@ pub mod off_chain {
 
                     let masked_input = mask + Fr::from(1337);
                     coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
-                    coord.wait_for_masked_inputs(1).await.unwrap();
 
                     coord.wait_for_mpc().await.unwrap();
                     coord.wait_for_outputs().await.unwrap();
