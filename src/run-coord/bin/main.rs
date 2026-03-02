@@ -7,12 +7,6 @@ use stoffel_mpc_coordinator::{rpc, off_chain::OffChainCoordinator};
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long)]
-    eth_node_addr: String,
-
-    #[arg(long)]
-    sk: String,
-
-    #[arg(long)]
     hash: String,
 
     #[arg(long, value_delimiter=',', num_args=1..)]
@@ -37,6 +31,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install default crypto provider");
+
     let args = Args::parse();
 
     let n = args.n;
@@ -59,7 +57,7 @@ async fn main() {
     let server_key_der = fs::read(args.server_key).unwrap();
     
     let addr = "127.0.0.1";
-    let port = 12345;
+    let port = 31415;
     let coord = OffChainCoordinator::start_coord(addr, port, hash.try_into().unwrap(), n, t, public_keys, 2, server_cert_der, server_key_der).await;
     let timestamp = coord.get_timestamp();
 
