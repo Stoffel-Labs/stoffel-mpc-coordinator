@@ -493,7 +493,12 @@ pub mod on_chain {
                                 let mut share_bytes = Vec::new();
                                 share.serialize_compressed(&mut share_bytes).unwrap();
                                 let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                                sink.send(json).await.unwrap();
+                                match sink.send(json).await {
+                                    Ok(_) => { },
+                                    Err(_) => {
+                                        println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
+                                    }
+                                };
                             }
                         }
                     }
@@ -517,7 +522,12 @@ pub mod on_chain {
                             let mut share_bytes = Vec::new();
                             share.serialize_compressed(&mut share_bytes).unwrap();
                             let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                            sink.send(json).await.unwrap();
+                            match sink.send(json).await {
+                                Ok(_) => { },
+                                Err(_) => {
+                                    println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
+                                }
+                            };
                         }
                     }
                 }
@@ -540,7 +550,12 @@ pub mod on_chain {
                         let mut share_bytes = Vec::new();
                         share.serialize_compressed(&mut share_bytes).unwrap();
                         let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                        sink.send(json).await.unwrap();
+                        match sink.send(json).await {
+                            Ok(_) => { },
+                            Err(_) => {
+                                println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
+                            }
+                        };
                     }
                 }
             }
@@ -632,7 +647,12 @@ pub mod on_chain {
                                 let mut share_bytes = Vec::new();
                                 share.serialize_compressed(&mut share_bytes).unwrap();
                                 let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                                d.sinks.get(&addr).unwrap().send(json).await.unwrap();
+                                match d.sinks.get(&addr).unwrap().send(json).await {
+                                    Ok(_) => { },
+                                    Err(_) => {
+                                        println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
+                                    }
+                                };
                             }
                         }
                     }
@@ -1045,7 +1065,11 @@ pub mod on_chain {
                     r.watch().await.expect("TX failed");
                     Ok(())
                 }
-                Err(_) => {
+                Err(e) => {
+                    println!("{}", e);
+                    if let Some(decoded) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
+                        println!("{:?}", decoded);
+                    }
                     panic!();
                 }
             }
