@@ -2133,7 +2133,7 @@ pub mod off_chain {
                     d.input_masks[reserved_index] = Some(masked_input.value);
 
                     let event = MaskedInputEvent { client: self.id.clone(), masked_input, reserved_index: raw_reserved_index };
-                    for sink in d.masked_input_sinks.clone().iter() {
+                    for sink in &d.masked_input_sinks {
                         let json = to_json_raw_value(&event).expect("failed convert to JSON");
                         sink.send(json).await.unwrap();
                     }
@@ -2176,7 +2176,7 @@ pub mod off_chain {
                 let event = ReservedInputEvent { client: self.id.clone(), reserved_indices: vec![i] };
 
                 // broadcast reserved index to all subscribed RPC clients
-                for sink in d.reserved_index_sinks.clone().iter() {
+                for sink in &d.reserved_index_sinks {
                     let json = to_json_raw_value(&event).expect("failed convert to JSON");
                     sink.send(json).await.unwrap();
                 }
