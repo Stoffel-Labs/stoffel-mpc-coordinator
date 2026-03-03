@@ -330,6 +330,8 @@ pub trait Coordinator {
     fn wait_for_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_indices(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, u64>, CoordinatorError>>;
     fn finalize(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
+    fn obtain_outputs(&self) -> impl Future<Output = Result<Vec<Fr>, CoordinatorError>>;
+    fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> impl Future<Output = Result<(), CoordinatorError>>;
 }
 
 #[derive(Error, Clone, Debug, Serialize, Deserialize)]
@@ -1074,6 +1076,9 @@ pub mod on_chain {
                 }
             }
         }
+
+        async fn obtain_outputs(&self) -> Result<Vec<Fr>, CoordinatorError> { Ok(vec![]) }
+        async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> Result<(), CoordinatorError> { Ok(()) }
     }
     
     #[cfg(test)]
@@ -1090,7 +1095,7 @@ pub mod on_chain {
         use tokio::time::{timeout, Duration};
         use tokio::sync::Barrier;
         use std::sync::Arc;
-        use rand::RngExt;
+        use rand::Rng;
         use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
         use stoffelmpc_mpc::common::SecretSharingScheme;
 
@@ -1440,6 +1445,22 @@ pub mod off_chain {
     use jsonrpsee::async_client::Client;
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
     use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+    use stoffelmpc_mpc::common::SecretSharingScheme;
+    use hpke::{
+        aead::AesGcm256, 
+        kdf::HkdfSha256, 
+        kem::{DhP256HkdfSha256, Kem},
+        single_shot_open, single_shot_seal, 
+        Deserializable, Serializable,
+        HpkeError, OpModeR, OpModeS,
+    };
+    use p256::{SecretKey, pkcs8::DecodePrivateKey};
+    use rand::{SeedableRng, rngs::StdRng};
+    use ark_serialize::CanonicalSerialize;
+
+    type KemImpl = DhP256HkdfSha256;
+    type KdfImpl = HkdfSha256;
+    type AeadImpl = AesGcm256;
 
     type ClientIdentity = Vec<u8>;
 
@@ -1496,7 +1517,7 @@ pub mod off_chain {
                 }
             }
 
-            pub async fn receive_mask_share(&self) -> Fr {
+            pub async fn receive_mask(&self) -> Fr {
                 let mut share_futures = JoinSet::new();
 
                 for rpc in self.node_rpcs.iter() {
@@ -1865,6 +1886,12 @@ pub mod off_chain {
 
         #[method(name = "transition")]
         async fn transition(&self, next_round: Round) -> RpcResult<()>;
+
+        #[method(name = "send_output_shares")]
+        async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()>;
+
+        #[subscription(name = "sub_obtain_output_shares", unsubscribe = "unsub_obtain_output_shares", item = Vec<(Vec<u8>, Vec<u8>)>)]
+        async fn obtain_output_shares(&self) -> SubscriptionResult;
     }
 
     struct CoordinatorRPCServerImpl {
@@ -1889,6 +1916,8 @@ pub mod off_chain {
         t: u64,
         mpc_nodes: Option<Vec<ClientIdentity>>,
         clients: HashMap<ClientIdentity, ClientInfo>,
+        output_shares: HashMap<(ClientIdentity, ClientIdentity), (Vec<u8>, Vec<u8>)>,
+        output_sinks: HashMap<ClientIdentity, SubscriptionSink>,
     }
 
     impl CoordinatorRPCServerImplInternal {
@@ -1923,6 +1952,8 @@ pub mod off_chain {
                 t,
                 mpc_nodes: Some(initial_mpc_nodes),
                 clients: HashMap::new(),
+                output_shares: HashMap::new(),
+                output_sinks: HashMap::new()
             }
         }
 
@@ -2208,6 +2239,50 @@ pub mod off_chain {
 
             Ok(())
         }
+
+        async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()> {
+            let mut d = self.d.lock().await;
+
+            if d.output_shares.contains_key(&(client_id.clone(), self.id.clone())) {
+                // a node cannot send output shares for a client twice
+                panic!();
+            }
+
+            // output shares for `client_id` from `self.id`
+            d.output_shares.insert((client_id.clone(), self.id.clone()), enc_shares);
+
+            let output_shares: Vec<_> = d.output_shares.iter().filter(|((cid, _), _)| *cid == client_id).map(|(_, shares)| shares.clone()).collect();
+
+            if output_shares.len() as u64 >= 2 * d.t + 1 {
+                if let Some(sink) = d.output_sinks.get(&client_id) {
+                    let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
+                    sink.send(json.clone()).await.unwrap();
+                }
+            }
+            Ok(())
+        }
+
+        async fn obtain_output_shares(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+            let sink = pending.accept().await?;
+
+            let mut d = self.d.lock().await;
+
+            if d.output_sinks.contains_key(&self.id) {
+                panic!();
+            }
+            d.output_sinks.insert(self.id.clone(), sink);
+
+            let output_shares: Vec<_> = d.output_shares.iter().filter(|((client_id, _), _)| *client_id == self.id).map(|(_, shares)| shares.clone()).collect();
+
+            if output_shares.len() as u64 >= 2 * d.t + 1 {
+                let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
+                let sink = d.output_sinks.get(&self.id).unwrap();
+
+                sink.send(json.clone()).await.unwrap();
+            }
+
+            Ok(())
+        }
     }
 
     pub struct OffChainCoordinator {
@@ -2216,16 +2291,19 @@ pub mod off_chain {
         addr: Option<String>,
         port: Option<u16>,
         server_handle: Option<JoinHandle<()>>,
-        timestamp: Option<u64>
+        timestamp: Option<u64>,
+        t: u64,
+        n_outputs: Option<u64>,
+        key_der: Option<Vec<u8>>
     }
 
     impl OffChainCoordinator {
-        pub async fn start_coord_from_cert(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
-            Self::start_coord(addr, port, prog_hash, n, t, initial_mpc_nodes, n_inputs, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
+        pub async fn start_coord_from_cert(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_outputs: u64, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+            Self::start_coord(addr, port, prog_hash, n, t, initial_mpc_nodes, n_outputs, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
         }
 
-        pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), n_inputs)));
+        pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_outputs: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+            let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), n_outputs)));
             let server_handle = crate::rpc::start_coord::<CoordinatorRPCServerImpl>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
             Self {
                 rpc_server: Some(rpc_server_data),
@@ -2233,16 +2311,19 @@ pub mod off_chain {
                 addr: Some(String::from(addr)),
                 port: Some(port),
                 server_handle: Some(server_handle),
-                timestamp: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs())
+                timestamp: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()),
+                t,
+                n_outputs: None,
+                key_der: None
             }
         }
 
-        pub async fn start_rpc_client_from_cert(addr: &str, port: u16, timestamp: u64, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
-            Self::start_rpc_client(addr, port, timestamp, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
+        pub async fn start_rpc_client_from_cert(addr: &str, port: u16, timestamp: u64, t: u64, n_outputs: u64, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+            Self::start_rpc_client(addr, port, timestamp, t, n_outputs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
         }
 
-        pub async fn start_rpc_client(addr: &str, port: u16, timestamp: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let rpc_coord = crate::self_signed_certs::setup_client(addr, port, cert_der, key_der).await;
+        pub async fn start_rpc_client(addr: &str, port: u16, timestamp: u64, t: u64, n_outputs: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+            let rpc_coord = crate::self_signed_certs::setup_client(addr, port, cert_der, key_der.clone()).await;
 
             Self {
                 rpc_server: None,
@@ -2251,6 +2332,9 @@ pub mod off_chain {
                 port: None,
                 server_handle: None,
                 timestamp: Some(timestamp),
+                t,
+                n_outputs: Some(n_outputs),
+                key_der: Some(key_der)
              }
         }
 
@@ -2262,6 +2346,8 @@ pub mod off_chain {
             self.timestamp.expect("Coordinator server not started")
         }
     }
+
+    static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
     
     impl Coordinator for OffChainCoordinator {
         type ClientIdentity = ClientIdentity;
@@ -2385,6 +2471,84 @@ pub mod off_chain {
 
             Ok(())
         }
+
+        async fn obtain_outputs(&self) -> Result<Vec<Fr>, CoordinatorError> {
+            let mut sub = self.rpc_coord.as_ref().expect("client not started").obtain_output_shares().await.unwrap();
+
+            let client_sk = {
+                let der_bytes = self.key_der.clone().unwrap();
+                let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes)
+                    .expect("Failed to parse the DER envelope as PKCS#8");
+                let raw_sk = parsed_secret_key.to_bytes();
+
+                <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).unwrap()
+            };
+
+            loop {
+                let enc_output_shares = sub.next().await.unwrap().unwrap();
+
+                if (enc_output_shares.len() as u64) < 2 * self.t + 1 {
+                    println!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
+                    panic!();
+                }
+
+                let output_shares = enc_output_shares.iter().filter_map(|(encapped_key_bytes, c)| {
+                    let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes).unwrap();
+                    let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
+                        &OpModeR::Base, &client_sk, &encapped_key, ENC_INFO, c, b"",
+                    ).unwrap();
+                    let shares: Vec<RobustShare<Fr>> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).unwrap();
+
+                    if shares.len() as u64 != self.n_outputs.unwrap() {
+                        println!("Some node sent an invalid number of output shares, ignoring.");
+                        return None;
+                    }
+
+                    Some(shares)
+                }).collect::<Vec<_>>();
+
+                let outputs: Vec<_> = (0..self.n_outputs.unwrap() as usize).filter_map(|i| {
+                    // shares for the ith output
+                    let shares_i: Vec<_> = output_shares.iter().map(|shares| shares[i].clone()).collect();
+
+                    // at least 2t+1 shares available as checked previously by the coordinator
+                    match RobustShare::recover_secret(&shares_i, (4 * self.t + 1) as usize) {
+                        Ok((_, output_i)) => {
+                            Some(output_i)
+                        }
+                        Err(_) => {
+                            println!("Reconstruction failed for output {}, waiting for more shares.", i);
+                            None
+                        }
+                    }
+                }).collect();
+
+                if outputs.len() == self.n_outputs.unwrap() as usize {
+                    return Ok(outputs);
+                }
+            }
+        }
+
+        async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> Result<(), CoordinatorError> {
+            let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key).unwrap();
+            let mut output_shares_bytes = Vec::new();
+            output_shares.serialize_compressed(&mut output_shares_bytes).unwrap();
+
+            let mut rng = StdRng::from_os_rng();
+            let (encapsulated_key, ciphertext) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
+                &OpModeS::Base,
+                &client_pk,
+                ENC_INFO,
+                &output_shares_bytes,
+                b"",
+                &mut rng,
+            ).unwrap();
+            let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
+
+            self.rpc_coord.as_ref().expect("client not started").send_output_shares(client_id, c).await.unwrap();
+
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -2408,7 +2572,7 @@ pub mod off_chain {
             let coord = OffChainCoordinator::start_coord_from_cert(addr, port, [0u8; 32], 5, 1, public_keys, 2, server_cert()).await;
             let timestamp = coord.get_timestamp();
 
-            let _ = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, client_cert()).await;
+            let _ = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, client_cert()).await;
         }
 
         #[tokio::test]
@@ -2425,8 +2589,8 @@ pub mod off_chain {
                 let coord = OffChainCoordinator::start_coord_from_cert(addr, port, [0u8; 32], 5, 1, public_keys, 2, server_cert()).await;
                 let timestamp = coord.get_timestamp();
 
-                let node0 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, certs.remove(0)).await;
-                let node1 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, certs.remove(0)).await;
+                let node0 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
+                let node1 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
 
                 node0.trigger_pp().await.unwrap();
 
@@ -2446,8 +2610,8 @@ pub mod off_chain {
                 let timestamp = coord.get_timestamp();
                 let barrier = Arc::new(Barrier::new(2));
 
-                let node0 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, certs.remove(0)).await;
-                let node1 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, certs.remove(0)).await;
+                let node0 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
+                let node1 = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
 
                 tokio::spawn({
                     let barrier = barrier.clone();
@@ -2474,8 +2638,11 @@ pub mod off_chain {
                 ("127.0.0.1".to_string(), 12351)
             ];
 
-            let mut certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
+            let certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
             let public_keys = certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
+
+            let correct_mask = Fr::from(42);
+            let correct_output = Fr::from(31415);
 
             let n: usize = 5;
             let t: usize = 1;
@@ -2489,14 +2656,18 @@ pub mod off_chain {
             tokio::spawn({
                 let barrier = barrier.clone();
 
-                let mut coord =
-                    OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, certs.remove(0)).await;
+                let mut coords = Vec::new();
+                for i in 0..3 {
+                    let coord =
+                        OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, certs[i].clone()).await;
+                    coords.push(coord);
+                }
 
                 // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
                 // node here, but we use 3 RPC nodes to make the process work
-                let mask = Fr::from(42);
                 let mut rng = test_rng();
-                let mask_shares = RobustShare::compute_shares(mask, n, t, None, &mut rng).unwrap();
+                let mask_shares = RobustShare::compute_shares(correct_mask, n, t, None, &mut rng).unwrap();
+                let output_shares = RobustShare::compute_shares(correct_output, n, t, None, &mut rng).unwrap();
 
                 let mut node_rpcs = Vec::new();
                 for i in 0..3 {
@@ -2508,11 +2679,11 @@ pub mod off_chain {
                 }
 
                 async move {
-                    coord.trigger_pp().await.unwrap();
-                    coord.wait_for_pp().await.unwrap();
-                    coord.init_input_masks().await.unwrap();
-                    coord.wait_for_input_mask_init().await.unwrap();
-                    let client_to_index = coord.wait_for_indices(1).await.unwrap();  // called by node
+                    coords[0].trigger_pp().await.unwrap();
+                    coords[0].wait_for_pp().await.unwrap();
+                    coords[0].init_input_masks().await.unwrap();
+                    coords[0].wait_for_input_mask_init().await.unwrap();
+                    let client_to_index = coords[0].wait_for_indices(1).await.unwrap();  // called by node
                     for (c, i) in &client_to_index {
                         println!("NODE: client {:?} reserved index {}", c, i);
                         for node_rpc in node_rpcs.iter_mut() {
@@ -2522,19 +2693,22 @@ pub mod off_chain {
                         }
                     }
 
-                    coord.trigger_input().await.unwrap();
-                    coord.wait_for_input().await.unwrap();
-                    let client_to_masked_input = coord.wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
+                    coords[0].trigger_input().await.unwrap();
+                    coords[0].wait_for_input().await.unwrap();
+                    let client_to_masked_input = coords[0].wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
                     for (c, masked_inputs) in client_to_masked_input {
                         for masked_input in masked_inputs {
                             println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
                         }
                     }
-                    coord.trigger_mpc().await.unwrap();
-                    coord.wait_for_mpc().await.unwrap();
-                    coord.trigger_outputs().await.unwrap();
-                    coord.wait_for_outputs().await.unwrap();
-                    coord.finalize().await.unwrap();
+                    coords[0].trigger_mpc().await.unwrap();
+                    coords[0].wait_for_mpc().await.unwrap();
+                    coords[0].trigger_outputs().await.unwrap();
+                    coords[0].wait_for_outputs().await.unwrap();
+                    for (i, coord) in coords.iter_mut().enumerate() {
+                        coord.send_output_shares(public_keys[5].clone(), public_keys[5].clone(), vec![output_shares[i].clone()]).await.unwrap();
+                    }
+                    coords[0].finalize().await.unwrap();
 
                     barrier.wait().await;
                 }
@@ -2543,9 +2717,9 @@ pub mod off_chain {
             // MPC client, also RPC client
             tokio::spawn({
                 let barrier = barrier.clone();
-                let cert = certs.remove(0);
+                let cert = certs[5].clone();
                 let mut coord =
-                    OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, cert.clone()).await;
+                    OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, cert.clone()).await;
                 let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), cert.clone()).await;
                 async move {
                     coord.wait_for_pp().await.unwrap();
@@ -2555,7 +2729,8 @@ pub mod off_chain {
                     assert_eq!(indices.len(), 1);
                     println!("CLIENT: obtained index {}", indices[0]);
 
-                    let mask = rpc_client.receive_mask_share().await;
+                    let mask = rpc_client.receive_mask().await;
+                    assert_eq!(mask, correct_mask);
 
                     coord.wait_for_input().await.unwrap();
 
@@ -2564,6 +2739,10 @@ pub mod off_chain {
 
                     coord.wait_for_mpc().await.unwrap();
                     coord.wait_for_outputs().await.unwrap();
+                    let outputs = coord.obtain_outputs().await.unwrap();
+                    println!("CLIENT: obtained outputs {:?}", outputs);
+                    assert_eq!(outputs.len(), 1);
+                    assert_eq!(outputs[0], correct_output);
 
                     barrier.wait().await;
                 }
