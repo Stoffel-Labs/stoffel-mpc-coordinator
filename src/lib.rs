@@ -411,6 +411,9 @@ pub mod on_chain {
         use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
         use stoffelmpc_mpc::common::SecretSharingScheme;
         use ark_serialize::CanonicalSerialize;
+        use stoffel_solidity_bindings::fake_coordinator::{
+            FakeCoordinator, FakeCoordinator::FakeCoordinatorErrors
+        };
 
         pub struct NodeRPCServer<P: Provider + WalletProvider + Clone> {
             rpc_server: Arc<Mutex<NodeRPCServerInternal<P>>>,
@@ -444,7 +447,7 @@ pub mod on_chain {
                 }
             }
 
-            pub async fn receive_mask_share(&self, sig: Vec<u8>, addr: Address) -> Fr {
+            pub async fn receive_mask(&self, sig: Vec<u8>, addr: Address) -> Fr {
                 let mut share_futures = JoinSet::new();
 
                 for rpc in self.node_rpcs.iter() {
@@ -477,6 +480,10 @@ pub mod on_chain {
         impl<P: Provider + WalletProvider + Clone + 'static> NodeRPCServer<P> {
             pub async fn start_from_cert(addr: &str, port: u16, coord: FakeCoordinatorInstance<P>, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
                 Self::start(addr, port, coord, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
+            }
+
+            pub async fn ids_and_addrs(&self) -> Vec<(Vec<u8>, ClientIdentity)> {
+                self.rpc_server.lock().await.ids_and_addrs.clone()
             }
 
             pub async fn start(addr: &str, port: u16, coord: FakeCoordinatorInstance<P>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
@@ -605,7 +612,7 @@ pub mod on_chain {
             auth_status: HashMap<ClientIdentity, bool>,
             sinks: HashMap<ClientIdentity, SubscriptionSink>,
             mask_shares: HashMap<u64, RobustShare<Fr>>,
-            id_to_addr: HashMap<Vec<u8>, ClientIdentity>,
+            ids_and_addrs: Vec<(Vec<u8>, ClientIdentity)>,
             clients: HashMap<Vec<u8>, ClientInfo>,
             coord: FakeCoordinatorInstance<P>
         }
@@ -618,7 +625,7 @@ pub mod on_chain {
                     auth_status: HashMap::new(),
                     sinks: HashMap::new(),
                     mask_shares: HashMap::new(),
-                    id_to_addr: HashMap::new(),
+                    ids_and_addrs: Vec::new(),
                     clients: HashMap::new(),
                     coord
                 }
@@ -651,10 +658,14 @@ pub mod on_chain {
 
                 d.sinks.insert(addr, sink);
 
-                // each client can only request shares once
-                if d.id_to_addr.contains_key(&self.id) {
+                // each client can only authenticate one address and each address can only be
+                // authenticated once
+                if d.ids_and_addrs.iter().any(|(id, prev_addr)| {
+                    self.id == *id || addr == *prev_addr
+                }) {
                     panic!();
                 }
+                d.ids_and_addrs.push((self.id.clone(), addr));
 
                 // address needs to reserve index before requesting shares, so the contract knows
                 // what message the signature signs, since the signed nonce is index-dependent
@@ -679,8 +690,30 @@ pub mod on_chain {
                     }
                     None => {
                         // client not authenticated yet, send signature to coordinator
-                        d.coord.authenticateClient(addr, Bytes::from(sig)).send().await.expect("sending TX failed")
-                            .watch().await.expect("TX failed");
+                        let builder = d.coord.authenticateClient(addr, Bytes::from(sig));
+                        let result = builder.send().await;
+                        match result {
+                            Ok(r) => {
+                                r.watch().await.expect("TX failed");
+                            }
+                            Err(e) => {
+                                println!("{}", e);
+                                if let Some(decoded_error) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
+                                    match decoded_error {
+                                        FakeCoordinatorErrors::NoIndicesReserved(FakeCoordinator::NoIndicesReserved { client }) => {
+                                            println!("no indices reserved by address {}", client);
+                                        }
+                                        FakeCoordinatorErrors::AccessControlUnauthorizedAccount(_) => {
+                                            println!("unauthorized account");
+                                        }
+                                        _ => {
+                                            println!("other error");
+                                        }
+                                    }
+                                }
+                                panic!();
+                            }
+                        }
                     }
                 }
 
@@ -762,33 +795,6 @@ pub mod on_chain {
             u256_to_u64(base_nonce).expect("impossible bug: block number does not fit into u64")
         }
     
-        pub async fn auth_client(&self, raw_sig: Vec<u8>, addr: Address) {
-            let builder = self.coord.authenticateClient(addr, Bytes::from(raw_sig));
-            let result = builder.send().await;
-            match result {
-                Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                }
-                Err(e) => {
-                    println!("{}", e);
-                    if let Some(decoded_error) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
-                        match decoded_error {
-                            FakeCoordinatorErrors::NoIndicesReserved(FakeCoordinator::NoIndicesReserved { client }) => {
-                                println!("no indices reserved by address {}", client);
-                            }
-                            FakeCoordinatorErrors::AccessControlUnauthorizedAccount(_) => {
-                                println!("unauthorized account");
-                            }
-                            _ => {
-                                println!("other error");
-                            }
-                        }
-                    }
-                    panic!();
-                }
-            }
-        }
-
         pub async fn wait_for_client_auth(&self, addr: Address) -> Result<bool, CoordinatorError> {
             let mut events = self.coord
                 .ClientAuthenticated_filter()
@@ -1249,52 +1255,6 @@ pub mod on_chain {
             Anvil::new().spawn()
         }
         
-        #[tokio::test]
-        pub async fn sig_gen_onchain() {
-            let anvil = spawn_anvil();
-            let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
-            let n = U256::from(5);
-            let t = 1;
-            let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
-            let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
-            let n_inputs = U256::from(1);
-    
-            let contract = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), ACC[0], initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-            let mut coord = OnChainCoordinator::new(contract.clone(), t, 1, None).await;
-            let signer = PrivateKeySigner::from_str(SK[0]).unwrap();
-            let i = 42;
-
-            // grant roles to parties
-            coord.grant_roles(initial_mpc_nodes).await.expect("granting roles failed");
-    
-            // Generate signature
-            let _ = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
-            let base_nonce = coord.base_nonce().await;
-            let sig = generate_client_sig(base_nonce, i, signer.clone()).await;
-    
-            // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
-            {
-                let provider = ws_connect(&anvil.ws_endpoint(), SK[1]).await;
-                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
-                let coord = OnChainCoordinator::new(instance, t, 1, None).await;
-                coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
-            }
-            {
-                let provider = ws_connect(&anvil.ws_endpoint(), SK[2]).await;
-                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
-                let coord = OnChainCoordinator::new(instance, t, 1, None).await;
-                coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
-            }
-            {
-                let provider = ws_connect(&anvil.ws_endpoint(), SK[3]).await;
-                let instance = FakeCoordinatorInstance::new(*contract.address(), provider.clone());
-                let coord = OnChainCoordinator::new(instance, t, 1, None).await;
-                coord.auth_client(sig.as_bytes().to_vec(), ACC[0]).await;
-            }
-
-            // TODO: wait for ClientAuthenticated event
-        }
-    
         #[test]
         pub fn fr_u256_conversion() {
             let mut rng = rand::rng();
@@ -1481,14 +1441,14 @@ pub mod on_chain {
                     node_rpcs.push(node_rpc);
                 }
 
-                let client_public_key = public_keys[5].clone();
-
                 async move {
                     coords[0].trigger_pp().await.unwrap();
                     let _ = coords[0].wait_for_pp().await;
                     coords[0].init_input_masks().await.unwrap();
                     let _ = coords[0].wait_for_input_mask_init().await;
                     let client_to_index = coords[0].wait_for_indices(1).await.unwrap();  // called by node
+                    assert_eq!(client_to_index.len(), 1);
+                    assert!(client_to_index.contains_key(&ACC[5]));
                     for (c, i) in client_to_index {
                         println!("NODE: client {:?} reserved index {}", c, i);
                         for node_rpc in node_rpcs.iter_mut() {
@@ -1519,8 +1479,18 @@ pub mod on_chain {
                     let _ = coords[0].wait_for_mpc().await;
                     coords[0].trigger_outputs().await.unwrap();
                     let _ = coords[0].wait_for_outputs().await;
+                    
+                    // check that all nodes have the same mapping
+                    for node_rpc in node_rpcs.iter_mut() {
+                        let ids_and_addrs = node_rpc.ids_and_addrs().await;
+                        assert_eq!(ids_and_addrs.len(), 1);
+                        let client_public_key = &ids_and_addrs.iter().find(|(_, addr)| *addr == ACC[5]).expect("client address not found").0;
+                        assert_eq!(public_keys[5], *client_public_key);
+                    }
+
+                    // all nodes send output shares to the coordinator
                     for (i, coord) in coords.iter_mut().enumerate() {
-                        coord.send_output_shares(ACC[5], client_public_key.clone(), vec![output_shares[i].clone()]).await.unwrap();
+                        coord.send_output_shares(ACC[5], public_keys[5].clone(), vec![output_shares[i].clone()]).await.unwrap();
                     }
                     coords[0].finalize().await.unwrap();
 
@@ -1548,7 +1518,7 @@ pub mod on_chain {
                     let base_nonce = coord.base_nonce().await;
                     let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
                     let sig = generate_client_sig(base_nonce, indices[0], signer.clone()).await;
-                    let mask = rpc_client.receive_mask_share(sig.into(), ACC[5]).await;
+                    let mask = rpc_client.receive_mask(sig.into(), ACC[5]).await;
                     assert_eq!(mask, correct_mask);
 
                     let _ = coord.wait_for_input().await;
@@ -1994,9 +1964,6 @@ pub mod off_chain {
         #[subscription(name = "sub_collect_input", unsubscribe = "unsub_collect_inputs", item = InputCollectionStarted)]
         async fn sub_collect_inputs(&self, timestamp: u64) -> SubscriptionResult;
     
-        #[method(name = "auth_client")]
-        async fn auth_client(&self, i: u64, sig: Vec<u8>, key: ClientIdentity) -> RpcResult<bool>;
-    
         #[method(name = "available_input_masks")]
         async fn available_input_masks(&self) -> RpcResult<u64>;
     
@@ -2228,12 +2195,6 @@ pub mod off_chain {
             let mut d = self.d.lock().await;
 
             d.subscribe_oneshot::<InputCollectionStarted>(pending, timestamp, Round::InputCollection).await
-        }
-
-        async fn auth_client(&self, i: u64, sig: Vec<u8>, key: ClientIdentity) -> RpcResult<bool> {
-            let message = i.to_be_bytes();
-            let verifier = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, key);
-            Ok(verifier.verify(&message, &sig).is_ok())
         }
 
         async fn available_input_masks(&self) -> RpcResult<u64> {
