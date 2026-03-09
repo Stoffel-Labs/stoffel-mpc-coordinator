@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use std::sync::Once;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use alloy_primitives::U256;
 
 static INIT: Once = Once::new();
 fn setup_test() {
@@ -340,6 +341,38 @@ pub enum CoordinatorError {
     IndexAlreadyReserved(usize),
     #[error("The masked input for index {0:?} has already been sent.")]
     MaskedInputAlreadySent(usize),
+    #[error("Mask reconstruction from {0:?} shares failed.")]
+    MaskReconstructionFailed(usize),
+    #[error("Interaction with Ethereum blockchain failed: {0}")]
+    EthereumError(String),
+    #[error("U256 value out of range for Fr")]
+    U256ToFrError,
+    #[error("U256 value out of range for u64")]
+    U256ToU64Error,
+    #[error("U64 value out of range for usize")]
+    U64ToUsizeError,
+    #[error("Parsing DER-encoded key as PKCS#8 failed")]
+    ParsingDERAsPKCS8Failed,
+    #[error("Parsing DER-encoded private key failed")]
+    ParsingDERAsPrivateKeyFailed,
+    #[error("Deserialization failed")]
+    DeserializationError,
+    #[error("Serialization failed")]
+    SerializationError,
+    #[error("Parsing public key failed")]
+    ParsingPublicKeyFailed,
+    #[error("Encryption failed")]
+    EncryptionError,
+}
+
+#[derive(Error, Clone, Debug)]
+pub enum NodeRPCError {
+    #[error("Index already added")]
+    IndexAlreadyAdded,
+    #[error("JSON error")]
+    JSONError,
+    #[error("Serialization error")]
+    SerializationError,
 }
 
 pub mod on_chain {
@@ -402,11 +435,19 @@ pub mod on_chain {
         use std::collections::HashMap;
         use std::sync::Arc;
         use tokio::sync::Mutex;
-        use jsonrpsee::{core::{SubscriptionResult, to_json_raw_value}, async_client::Client, server::RpcModule, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
+        use jsonrpsee::{
+            core::{SubscriptionResult, to_json_raw_value},
+            async_client::Client,
+            server::{RpcModule, ServerHandle},
+            proc_macros::rpc,
+            PendingSubscriptionSink, SubscriptionSink,
+            types::{ErrorObjectOwned, error::ErrorCode},
+        };
+
         use async_trait::async_trait;
         use tokio::task::JoinHandle;
         use super::ClientIdentity;
-        use crate::rpc::ClientInfo;
+        use crate::{CoordinatorError, rpc::ClientInfo};
         use tokio::task::JoinSet;
         use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
         use stoffelmpc_mpc::common::SecretSharingScheme;
@@ -414,6 +455,8 @@ pub mod on_chain {
         use stoffel_solidity_bindings::fake_coordinator::{
             FakeCoordinator, FakeCoordinator::FakeCoordinatorErrors
         };
+        use serde::{Serialize, Deserialize};
+        use crate::NodeRPCError;
 
         pub struct NodeRPCServer<P: Provider + WalletProvider + Clone> {
             rpc_server: Arc<Mutex<NodeRPCServerInternal<P>>>,
@@ -447,7 +490,7 @@ pub mod on_chain {
                 }
             }
 
-            pub async fn receive_mask(&self, sig: Vec<u8>, addr: Address) -> Fr {
+            pub async fn receive_mask(&self, sig: Vec<u8>, addr: Address) -> Result<Fr, CoordinatorError> {
                 let mut share_futures = JoinSet::new();
 
                 for rpc in self.node_rpcs.iter() {
@@ -464,16 +507,16 @@ pub mod on_chain {
                     if mask_shares.len() >= 2 * self.t + 1 {
                         match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
                             Ok((_, mask)) => {
-                                return mask;
+                                return Ok(mask);
                             }
                             Err(_) => {
-                                panic!("reconstruction of mask failed");
+                                return Err(CoordinatorError::MaskReconstructionFailed(mask_shares.len()));
                             }
                         }
                     }
                 }
 
-                panic!("mask could not be reconstructed");
+                Err(CoordinatorError::MaskReconstructionFailed(mask_shares.len()))
             }
         }
 
@@ -501,91 +544,69 @@ pub mod on_chain {
                 self.addr.clone()
             }
 
-            pub async fn add_auth_status(&mut self, addr: Address, status: bool) {
+            pub async fn add_auth_status(&mut self, addr: Address) -> Result<(), NodeRPCError> {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.auth_status.contains_key(&addr));
-                d.auth_status.insert(addr, status);
-
-                if !status {
-                    panic!();
-                }
+                d.auth_status.insert(addr, true);
 
                 if let Some(i) = d.client_to_index.get(&addr) {
-                    if let Some(status) = d.auth_status.get(&addr) {
-                        if !status {
-                            panic!();
-                        }
+                    if d.auth_status.contains_key(&addr) {
                         if let Some(share) = d.mask_shares.get(i) {
                             if let Some(sink) = d.sinks.get(&addr) {
                                 let mut share_bytes = Vec::new();
-                                share.serialize_compressed(&mut share_bytes).unwrap();
+                                share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
                                 let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                                match sink.send(json).await {
-                                    Ok(_) => { },
-                                    Err(_) => {
-                                        println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
-                                    }
-                                };
+                                sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                             }
                         }
                     }
                 }
+
+                Ok(())
             }
 
             // called when the client has reserved indices at the coordinator
-            pub async fn add_reserved_index(&mut self, addr: ClientIdentity, i: u64) {
+            pub async fn add_reserved_index(&mut self, addr: ClientIdentity, i: u64) -> Result<(), NodeRPCError> {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.index_to_client.contains_key(&i));
                 d.index_to_client.insert(i, addr);
                 d.client_to_index.insert(addr, i);
 
-                if let Some(status) = d.auth_status.get(&addr) {
-                    if !status {
-                        panic!();
-                    }
+                if d.auth_status.contains_key(&addr) {
                     if let Some(share) = d.mask_shares.get(&i) {
                         if let Some(sink) = d.sinks.get(&addr) {
                             let mut share_bytes = Vec::new();
-                            share.serialize_compressed(&mut share_bytes).unwrap();
-                            let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                            match sink.send(json).await {
-                                Ok(_) => { },
-                                Err(_) => {
-                                    println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
-                                }
-                            };
+                            share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                            let json = to_json_raw_value(&share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                            sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                         }
                     }
                 }
+
+                Ok(())
             }
             
             // called when preprocessing has generated the mask shares
-            pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) {
+            pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) -> Result<(), NodeRPCError> {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.mask_shares.contains_key(&i));
                 d.mask_shares.insert(i, share.clone());
 
                 if let Some(addr) = d.index_to_client.get(&i) {
-                    if let Some(status) = d.auth_status.get(addr) {
-                        if !status {
-                            panic!();
+                    if d.auth_status.contains_key(addr) {
+                        if let Some(sink) = d.sinks.get(addr) {
+                            let mut share_bytes = Vec::new();
+                            share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                            let json = to_json_raw_value(&share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                            sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                         }
                     }
-                    if let Some(sink) = d.sinks.get(addr) {
-                        let mut share_bytes = Vec::new();
-                        share.serialize_compressed(&mut share_bytes).unwrap();
-                        let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                        match sink.send(json).await {
-                            Ok(_) => { },
-                            Err(_) => {
-                                println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
-                            }
-                        };
-                    }
                 }
+
+                Ok(())
             }
         }
 
@@ -610,6 +631,9 @@ pub mod on_chain {
             index_to_client: HashMap<u64, ClientIdentity>,
             client_to_index: HashMap<ClientIdentity, u64>,
             auth_status: HashMap<ClientIdentity, bool>,
+
+            // sinks stored if some info to send shares to clients is still missing, but client has
+            // already sent the RPC request
             sinks: HashMap<ClientIdentity, SubscriptionSink>,
             mask_shares: HashMap<u64, RobustShare<Fr>>,
             ids_and_addrs: Vec<(Vec<u8>, ClientIdentity)>,
@@ -644,49 +668,71 @@ pub mod on_chain {
             async fn receive_mask_share(&self, sig: Vec<u8>, addr: Address) -> SubscriptionResult;
         }
 
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        pub enum OnChainNodeRPCServerError {
+            SerializationError = 1,
+            EthereumError = 2,
+        }
+
         #[async_trait]
         impl<P: Provider + WalletProvider + Clone + 'static> OnChainNodeRPCServer for NodeRPCServerImpl<P> {
             async fn receive_mask_share(&self, pending: PendingSubscriptionSink, sig: Vec<u8>, addr: Address) -> SubscriptionResult {
-                let sink = pending.accept().await?;
+                use OnChainNodeRPCServerError::*;
 
                 let mut d = self.d.lock().await;
-
-                // each address can only be used by once client
-                if d.sinks.contains_key(&addr) {
-                    panic!();
-                }
-
-                d.sinks.insert(addr, sink);
 
                 // each client can only authenticate one address and each address can only be
                 // authenticated once
                 if d.ids_and_addrs.iter().any(|(id, prev_addr)| {
                     self.id == *id || addr == *prev_addr
                 }) {
-                    panic!();
+                    pending.reject(ErrorObjectOwned::owned(
+                        ErrorCode::InvalidParams.code(),
+                        format!("Client {} already requested mask share", addr),
+                        None::<()>)
+                    ).await;
+                    return Ok(());
                 }
-                d.ids_and_addrs.push((self.id.clone(), addr));
 
                 // address needs to reserve index before requesting shares, so the contract knows
                 // what message the signature signs, since the signed nonce is index-dependent
                 match d.auth_status.get(&addr) {
-                    Some(false) => { panic!(); }
+                    Some(false) => { panic!("BUG: only true values inserted"); }
                     Some(true) => {
                         // enough signatures were sent to authenticate the client, no need to send more;
                         // can send the share immediately if available
                         if let Some(i) = d.client_to_index.get(&addr) {
                             if let Some(share) = d.mask_shares.get(i) {
                                 let mut share_bytes = Vec::new();
-                                share.serialize_compressed(&mut share_bytes).unwrap();
-                                let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                                match d.sinks.get(&addr).unwrap().send(json).await {
+                                match share.serialize_compressed(&mut share_bytes) {
                                     Ok(_) => { },
-                                    Err(_) => {
-                                        println!("Client {} disconnected, either true error or already reconstructed input masks", addr);
+                                    Err(e) => {
+                                        pending.reject(ErrorObjectOwned::owned(
+                                            ErrorCode::ServerError(SerializationError as i32).code(),
+                                            format!("Serializing share bytes failed: {e}"),
+                                            None::<()>)
+                                        ).await;
+                                        return Ok(());
                                     }
                                 };
+
+                                let json = match to_json_raw_value(&share_bytes) {
+                                    Ok(j) => j,
+                                    Err(e) => {
+                                        pending.reject(ErrorObjectOwned::owned(
+                                            ErrorCode::ServerError(SerializationError as i32).code(),
+                                            format!("Converting serialized shares to JSON failed: {e}"),
+                                            None::<()>)
+                                        ).await;
+                                        return Ok(());
+                                    }
+                                };  
+                                let sink = pending.accept().await?;
+                                sink.send(json).await?;
                             }
                         }
+
+                        d.ids_and_addrs.push((self.id.clone(), addr));
                     }
                     None => {
                         // client not authenticated yet, send signature to coordinator
@@ -694,24 +740,39 @@ pub mod on_chain {
                         let result = builder.send().await;
                         match result {
                             Ok(r) => {
-                                r.watch().await.expect("TX failed");
+                                r.watch().await?;
+
+                                let sink = pending.accept().await?;
+                                d.sinks.insert(addr, sink);
+                                d.ids_and_addrs.push((self.id.clone(), addr));
                             }
                             Err(e) => {
-                                println!("{}", e);
-                                if let Some(decoded_error) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
-                                    match decoded_error {
-                                        FakeCoordinatorErrors::NoIndicesReserved(FakeCoordinator::NoIndicesReserved { client }) => {
-                                            println!("no indices reserved by address {}", client);
+                                let msg = {
+                                    if let Some(decoded_error) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
+                                        match decoded_error {
+                                            FakeCoordinatorErrors::NoIndicesReserved(FakeCoordinator::NoIndicesReserved { client }) => {
+                                                format!("No indices reserved by address {}", client)
+                                            }
+                                            FakeCoordinatorErrors::AccessControlUnauthorizedAccount(_) => {
+                                                "Unauthorized account".to_string()
+                                            }
+                                            _ => {
+                                                "Unexpected error".to_string()
+                                            }
                                         }
-                                        FakeCoordinatorErrors::AccessControlUnauthorizedAccount(_) => {
-                                            println!("unauthorized account");
-                                        }
-                                        _ => {
-                                            println!("other error");
-                                        }
+                                    } else {
+                                        "Unknown error".to_string()
                                     }
-                                }
-                                panic!();
+                                };
+                                let err = format!("Authenticating client via smart contract failed: {e}: {msg}");
+
+                                println!("{}", err);
+                                pending.reject(ErrorObjectOwned::owned(
+                                    ErrorCode::ServerError(EthereumError as i32).code(),
+                                    err,
+                                    None::<()>)
+                                ).await;
+                                return Ok(());
                             }
                         }
                     }
@@ -796,43 +857,49 @@ pub mod on_chain {
         }
     
         pub async fn wait_for_client_auth(&self, addr: Address) -> Result<bool, CoordinatorError> {
-            let mut events = self.coord
+            let mut events = match self.coord
                 .ClientAuthenticated_filter()
                 .from_block(self.contract_block)
                 .topic1(addr)
-                .watch()
-                .await.unwrap().into_stream();
+                .watch().await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for ClientAuthenticated events: {}", e)));
+                }
+           };
         
-            if let Some(Ok((FakeCoordinator::ClientAuthenticated { client, success }, _))) = events.next().await {
-                return Ok(success);
+            match events.next().await {
+                Some(Ok((FakeCoordinator::ClientAuthenticated { client, success }, _))) => {
+                    Ok(success)
+                }
+                _ => {
+                    Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for ClientAuthenticated event".to_string()))
+                }
             }
-    
-            panic!();
         }
 
         pub async fn grant_roles(&self, nodes: Vec<Address>) -> Result<(), CoordinatorError> {
             assert_eq!(nodes.len(), 5);
         
-            let PARTY_ROLE = {
+            let party_role = {
                 let builder = self.coord.PARTY_ROLE();
                 builder.call().await.expect("sending TX failed")
             };
-            //let DESIGNATED_PARTY_ROLE = {
-            //    let builder = self.coord.DESIGNATED_PARTY_ROLE();
-            //    builder.call().await.expect("sending TX failed")
-            //};
         
             // grant party roles
             for i in 0..nodes.len() {
-                let builder = self.coord.grantRole(PARTY_ROLE, nodes[i]);
-                let result = builder.send().await;
-                match result {
+                let builder = self.coord.grantRole(party_role, nodes[i]);
+                match builder.send().await {
                     Ok(r) => {
-                        r.watch().await.expect("TX failed");
+                        match r.watch().await {
+                            Ok(_) => { },
+                            Err(e) => {
+                                return Err(CoordinatorError::EthereumError(format!("error waiting for transaction to grant role to be mined: {}", e)));
+                            }
+                        }
                     }
                     Err(e) => {
-                        println!("{}", e);
-                        panic!();
+                        return Err(CoordinatorError::EthereumError(format!("error sending transaction to grant role: {}", e)));
                     }
                 }
             }
@@ -871,32 +938,37 @@ pub mod on_chain {
         }
 
         async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<Fr>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<Fr>>>, CoordinatorError> {
-            let mut events = self.coord
+            let mut events = match self.coord
                 .MaskedInputEvent_filter()
                 .from_block(self.contract_block)
                 .watch()
-                .await.unwrap().into_stream();
+                .await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MaskedInputEvent events: {}", e)));
+                }
+            };
         
             let mut inputs: HashMap<ClientIdentity, Vec<RobustShare<Fr>>> = HashMap::new();
             for _ in 0..n_clients {
-                if let Some(Ok((MaskedInputEvent { client, maskedInput, reservedIndex }, _))) = events.next().await {
-                    let masked_input = match u256_to_fr(maskedInput) {
-                        Some(v) => v,
-                        None => {
-                            panic!();
-                        }
-                    };
-                    let i = u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed") as usize;
-                    let mask_share = &mask_shares[i];
-                    let input = RobustShare::new(
-                        masked_input - mask_share.share[0],
-                        mask_share.id,
-                        mask_share.degree
-                    );
+                match events.next().await {
+                    Some(Ok((MaskedInputEvent { client, maskedInput, reservedIndex }, _))) => {
+                        let masked_input = u256_to_fr(maskedInput).ok_or(CoordinatorError::U256ToFrError)?;
+                        let i: usize = u256_to_u64(reservedIndex)
+                            .ok_or(CoordinatorError::U256ToU64Error)?.try_into()
+                            .map_err(|_| CoordinatorError::U256ToU64Error)?;
+                        let mask_share = &mask_shares[i];
+                        let input = RobustShare::new(
+                            masked_input - mask_share.share[0],
+                            mask_share.id,
+                            mask_share.degree
+                        );
 
-                    inputs.insert(client, vec![input]);
-                } else {
-                    panic!();
+                        inputs.insert(client, vec![input]);
+                    }
+                    _ => {
+                        return Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for MaskedInputEvent events".to_string()));
+                    }
                 }
             }
             Ok(inputs)
@@ -904,89 +976,118 @@ pub mod on_chain {
 
         async fn trigger_input(&self) -> Result<(), CoordinatorError> {
             let builder = self.coord.collectInputs();
-            let result = builder.send().await;
-            match result {
+            match builder.send().await {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to trigger input phase to be mined: {}", e)))
+                        }
+                    }
                 }
                 Err(e) => {
-                    println!("{:?}", e);
-                    panic!();
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to trigger input phase: {}", e)))
                 }
             }
         }
         
         async fn wait_for_input(&self) -> Result<(), CoordinatorError> {
-            let mut events = self.coord
-                .InputMaskReservationStarted_filter()
+            let mut events = match self.coord
+                .InputCollectionStarted_filter()
                 .from_block(self.contract_block)
                 .watch()
-                .await.unwrap().into_stream();
+                .await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for InputCollectionStarted events: {}", e)));
+                }
+            };
         
-            if let Some(Ok((_, _))) = events.next().await {
-                Ok(())
-            } else {
-                panic!();
+            match events.next().await {
+                Some(Ok((_, _))) => {
+                    Ok(())
+                }
+                _ => {
+                    Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for InputCollectionStarted events".to_string()))
+                }
             }
         }
         
         async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
             let builder = self.coord.startPreprocessing();
-            let result = builder.send().await;
-            match result {
+            match builder.send().await {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to start preprocessing to be mined: {}", e)))
+                        }
+                    }
                 }
                 Err(e) => {
-                    let err = e.as_decoded_error::<FakeCoordinator::NotAnExistingParty>().unwrap();
-                    println!("No such account {}", err.account);
-                    panic!();
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to start preprocessing: {}", e)))
                 }
             }
         }
         
         async fn wait_for_pp(&self) -> Result<(), CoordinatorError> {
-            let mut events = self.coord
+            let mut events = match self.coord
                 .PreprocessingStarted_filter()
                 .from_block(self.contract_block)
                 .watch()
-                .await.unwrap().into_stream();
+                .await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for PreprocessingStarted events: {}", e)));
+                }
+            };
         
-            if let Some(Ok((_, _))) = events.next().await {
-                Ok(())
-            } else {
-                panic!();
+            match events.next().await {
+                Some(Ok((_, _))) => {
+                    Ok(())
+                }
+                _ => {
+                    Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for PreprocessingStarted events".to_string()))
+                }
             }
         }
         
         async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
             let builder = self.coord.reserveInputMasks();
-            let result = builder.send().await;
-            match result {
+            match builder.send().await {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to start reservation of mask indices be mined: {}", e)))
+                        }
+                    }
                 }
                 Err(e) => {
-                    println!("{:?}", e);
-                    panic!();
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to start reservation of mask indices: {}", e)))
                 }
             }
         }
         
         async fn wait_for_input_mask_init(&self) -> Result<(), CoordinatorError> {
-            let mut events = self.coord
+            let mut events = match self.coord
                 .InputMaskReservationStarted_filter()
                 .from_block(self.contract_block)
                 .watch()
-                .await.unwrap().into_stream();
+                .await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for InputMaskReservationStarted events: {}", e)));
+                }
+            };
         
-            if let Some(Ok((InputMaskReservationStarted { executor, timeOfExecution }, _))) = events.next().await {
-                Ok(())
-            } else {
-                panic!();
+            match events.next().await {
+                Some(Ok((_, _))) => {
+                    Ok(())
+                }
+                _ => {
+                    Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for InputMaskReservationStarted events".to_string()))
+                }
             }
         }
         
@@ -1008,101 +1109,127 @@ pub mod on_chain {
                 }
             }
 
-            if let Some(indices) = indices {
-                return indices.iter().map(|i| {
-                    u256_to_u64(*i).ok_or_else(|| {
-                        panic!("conversion from U256 to u64 failed for index {}", i);
-                    })
-                }).collect();
-            }
+            if let Some(indices_u256) = indices {
+                let mut indices = Vec::new();
+                for i_u256 in indices_u256.iter() {
+                    let i = u256_to_u64(*i_u256).ok_or(CoordinatorError::U256ToU64Error)?;
+                    indices.push(i);
+                }
 
-            panic!("no index reservation event found");
+                Ok(indices)
+            } else {
+                panic!("BUG: no ReservedInputEvent found in transaction logs, coordinator should emit such an event!!!");
+            }
         }
 
         async fn send_masked_input(&self, masked_input: Fr, i: u64) -> Result<(), CoordinatorError> {
             let builder = self.coord.submitMaskedInput(fr_to_u256(masked_input), U256::from(i));
-            let result = builder.send().await;
-            match result {
+            match builder.send().await {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to submit masked inputs be mined: {}", e)))
+                        }
+                    }
                 }
                 Err(e) => {
-                    panic!();
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to submit masked inputs: {}", e)))
                 }
             }
         }
         
         async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
             let builder = self.coord.startMPC();
-            let result = builder.send().await;
-            match result {
+            match builder.send().await {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to trigger MPC to be mined: {}", e)))
+                        }
+                    }
                 }
                 Err(e) => {
-                    panic!();
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to trigger MPC: {}", e)))
                 }
             }
         }
         
         async fn wait_for_mpc(&self) -> Result<(), CoordinatorError> {
-            let mut events = self.coord
+            let mut events = match self.coord
                 .MPCStarted_filter()
                 .from_block(self.contract_block)
                 .watch()
-                .await.unwrap().into_stream();
+                .await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MPCStarted events: {}", e)));
+                }
+            };
         
-            if let Some(Ok((_, _))) = events.next().await {
-                Ok(())
-            } else {
-                panic!();
+            match events.next().await {
+                Some(Ok((_, _))) => {
+                    Ok(())
+                }
+                _ => {
+                    Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for MPCStarted events".to_string()))
+                }
             }
         }
         
         async fn trigger_outputs(&self) -> Result<(), CoordinatorError> {
             let builder = self.coord.sendOutputs();
-            let result = builder.send().await;
-            match result {
+            match builder.send().await {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to trigger output phase to be mined: {}", e)))
+                        }
+                    }
                 }
-                Err(_) => {
-                    panic!();
+                Err(e) => {
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to trigger output phase: {}", e)))
                 }
             }
         }
         
         async fn wait_for_outputs(&self) -> Result<(), CoordinatorError> {
-            let mut events = self.coord
+            let mut events = match self.coord
                 .OutputSendingStarted_filter()
                 .from_block(self.contract_block)
                 .watch()
-                .await.unwrap().into_stream();
+                .await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for OutputSendingStarted events: {}", e)));
+                }
+            };
         
-            if let Some(Ok((_, _))) = events.next().await {
-                Ok(())
-            } else {
-                panic!();
+            match events.next().await {
+                Some(Ok((_, _))) => {
+                    Ok(())
+                }
+                _ => {
+                    Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for OutputSendingStarted events".to_string()))
+                }
             }
         }
 
         async fn finalize(&self) -> Result<(), CoordinatorError> {
             let builder = self.coord.finalize();
-            let result = builder.send().await;
-            match result {
+            match builder.send().await {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to finalize be mined: {}", e)))
+                        }
+                    }
                 }
                 Err(e) => {
-                    println!("{}", e);
-                    if let Some(decoded) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
-                        println!("{:?}", decoded);
-                    }
-                    panic!();
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to finalize: {}", e)))
                 }
             }
         }
@@ -1110,28 +1237,32 @@ pub mod on_chain {
         async fn obtain_outputs(&self) -> Result<Vec<Fr>, CoordinatorError> {
             let client_sk = {
                 let der_bytes = self.key_der.clone().unwrap();
-                let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes)
-                    .expect("Failed to parse the DER envelope as PKCS#8");
+                let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes).map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
                 let raw_sk = parsed_secret_key.to_bytes();
 
-                <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).unwrap()
+                <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).map_err(|_| CoordinatorError::ParsingDERAsPrivateKeyFailed)?
             };
 
-            let mut events = self.coord
+            let mut events = match self.coord
                 .EnoughPrivateOutputShares_filter()
                 .from_block(self.contract_block)
                 .topic1(self.coord.provider().default_signer_address())
                 .watch()
-                .await.unwrap().into_stream();
+                .await {
+                Ok(e) => e.into_stream(),
+                Err(e) => {
+                    return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MPCStarted events: {}", e)));
+                }
+            };
         
             while let Some(Ok((EnoughPrivateOutputShares { client: _, shares }, _))) = events.next().await {
                 if (shares.len() as u64) < 2 * self.t + 1 {
-                    println!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
-                    panic!();
+                    panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
                 }
 
-                let output_shares = shares.iter().filter_map(|bytes| {
-                    let (encapped_key_bytes, c): (Vec<u8>, Vec<u8>) = ark_serialize::CanonicalDeserialize::deserialize_compressed(bytes.to_vec().as_slice()).unwrap();
+                let mut output_shares = Vec::new();
+                for bytes in shares.iter() {
+                    let (encapped_key_bytes, c): (Vec<u8>, Vec<u8>) = ark_serialize::CanonicalDeserialize::deserialize_compressed(bytes.to_vec().as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
                     let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(&encapped_key_bytes).unwrap();
                     let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
                         &OpModeR::Base, &client_sk, &encapped_key, ENC_INFO, &c, b"",
@@ -1140,11 +1271,11 @@ pub mod on_chain {
 
                     if shares.len() as u64 != self.n_outputs.unwrap() {
                         println!("Some node sent an invalid number of output shares, ignoring.");
-                        return None;
+                        continue;
                     }
 
-                    Some(shares)
-                }).collect::<Vec<_>>();
+                    output_shares.push(shares);
+                }
 
                 let outputs: Vec<_> = (0..self.n_outputs.unwrap() as usize).filter_map(|i| {
                     // shares for the ith output
@@ -1167,13 +1298,13 @@ pub mod on_chain {
                 }
             }
 
-            panic!();
+            Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for EnoughPrivateOutputShares events".to_string()))
         }
 
         async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> Result<(), CoordinatorError> {
-            let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key).unwrap();
+            let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key).map_err(|_| CoordinatorError::ParsingPublicKeyFailed)?;
             let mut output_shares_bytes = Vec::new();
-            output_shares.serialize_compressed(&mut output_shares_bytes).unwrap();
+            output_shares.serialize_compressed(&mut output_shares_bytes).map_err(|_| CoordinatorError::SerializationError)?;
 
             let mut rng = StdRng::from_os_rng();
             let (encapsulated_key, ciphertext) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
@@ -1183,25 +1314,25 @@ pub mod on_chain {
                 &output_shares_bytes,
                 b"",
                 &mut rng,
-            ).unwrap();
+            ).map_err(|_| CoordinatorError::EncryptionError)?;
             let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
 
             let mut bytes = Vec::new();
-            c.serialize_compressed(&mut bytes).unwrap();
+            c.serialize_compressed(&mut bytes).map_err(|_| CoordinatorError::SerializationError)?;
             let builder = self.coord.sendPrivateOutputShares(client_id, Bytes::from(bytes));
             let result = builder.send().await;
 
             match result {
                 Ok(r) => {
-                    r.watch().await.expect("TX failed");
-                    Ok(())
+                    match r.watch().await {
+                        Ok(_) => { Ok(()) },
+                        Err(e) => {
+                            Err(CoordinatorError::EthereumError(format!("error waiting for transaction to send output shares to be mined: {}", e)))
+                        }
+                    }
                 }
                 Err(e) => {
-                    println!("{}", e);
-                    if let Some(decoded) = e.as_decoded_interface_error::<FakeCoordinatorErrors>() {
-                        println!("{:?}", decoded);
-                    }
-                    panic!();
+                    Err(CoordinatorError::EthereumError(format!("error sending transaction to send output shares: {}", e)))
                 }
             }
         }
@@ -1437,7 +1568,7 @@ pub mod on_chain {
                     let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
                         node_rpc_addrs[i].1, instances[i].clone(), certs[i].clone()).await;
 
-                    node_rpc.add_mask_share(0, mask_shares[i].clone()).await;
+                    node_rpc.add_mask_share(0, mask_shares[i].clone()).await.unwrap();
                     node_rpcs.push(node_rpc);
                 }
 
@@ -1454,7 +1585,7 @@ pub mod on_chain {
                         for node_rpc in node_rpcs.iter_mut() {
                             // just received by one node here, but in reality would be received by
                             // all nodes, so we simulate this here for more nodes
-                            node_rpc.add_reserved_index(c, i).await;
+                            node_rpc.add_reserved_index(c, i).await.unwrap();
                         }
                     }
 
@@ -1464,7 +1595,7 @@ pub mod on_chain {
                         panic!();
                     }
                     for node_rpc in node_rpcs.iter_mut() {
-                        node_rpc.add_auth_status(ACC[5], true).await;
+                        node_rpc.add_auth_status(ACC[5]).await.unwrap();
                     }
 
                     coords[0].trigger_input().await.unwrap();
@@ -1518,7 +1649,7 @@ pub mod on_chain {
                     let base_nonce = coord.base_nonce().await;
                     let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
                     let sig = generate_client_sig(base_nonce, indices[0], signer.clone()).await;
-                    let mask = rpc_client.receive_mask(sig.into(), ACC[5]).await;
+                    let mask = rpc_client.receive_mask(sig.into(), ACC[5]).await.unwrap();
                     assert_eq!(mask, correct_mask);
 
                     let _ = coord.wait_for_input().await;
@@ -1556,7 +1687,6 @@ pub mod off_chain {
     use async_trait::async_trait;
     use jsonrpsee::server::RpcModule;
     use jsonrpsee::async_client::Client;
-    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
     use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
     use stoffelmpc_mpc::common::SecretSharingScheme;
     use hpke::{
@@ -1565,7 +1695,7 @@ pub mod off_chain {
         kem::{DhP256HkdfSha256, Kem},
         single_shot_open, single_shot_seal, 
         Deserializable, Serializable,
-        HpkeError, OpModeR, OpModeS,
+        OpModeR, OpModeS,
     };
     use p256::{SecretKey, pkcs8::DecodePrivateKey};
     use rand::{SeedableRng, rngs::StdRng};
@@ -1582,15 +1712,22 @@ pub mod off_chain {
         use std::collections::HashMap;
         use std::sync::Arc;
         use tokio::sync::Mutex;
-        use jsonrpsee::{core::{SubscriptionResult, to_json_raw_value}, async_client::Client, server::RpcModule, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
+        use jsonrpsee::{core::{SubscriptionResult, to_json_raw_value}, async_client::Client, server::RpcModule, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle, types::{ErrorObjectOwned, error::ErrorCode}};
         use async_trait::async_trait;
         use tokio::task::JoinHandle;
         use super::ClientIdentity;
-        use crate::rpc::ClientInfo;
+        use crate::{CoordinatorError, rpc::ClientInfo};
         use tokio::task::JoinSet;
         use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
         use stoffelmpc_mpc::common::SecretSharingScheme;
         use ark_serialize::CanonicalSerialize;
+        use crate::NodeRPCError;
+        use serde::{Serialize, Deserialize};
+
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        pub enum OffChainNodeRPCServerError {
+            SerializationError = 1,
+        }
 
         #[rpc(server, client)]
         pub trait OffChainNodeRPC {
@@ -1630,7 +1767,7 @@ pub mod off_chain {
                 }
             }
 
-            pub async fn receive_mask(&self) -> Fr {
+            pub async fn receive_mask(&self) -> Result<Fr, CoordinatorError> {
                 let mut share_futures = JoinSet::new();
 
                 for rpc in self.node_rpcs.iter() {
@@ -1647,16 +1784,16 @@ pub mod off_chain {
                     if mask_shares.len() >= 2 * self.t + 1 {
                         match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
                             Ok((_, mask)) => {
-                                return mask;
+                                return Ok(mask);
                             }
                             Err(_) => {
-                                panic!("reconstruction of mask failed");
+                                return Err(CoordinatorError::MaskReconstructionFailed(mask_shares.len()));
                             }
                         }
                     }
                 }
 
-                panic!("mask could not be reconstructed");
+                Err(CoordinatorError::MaskReconstructionFailed(mask_shares.len()))
             }
         }
 
@@ -1681,10 +1818,13 @@ pub mod off_chain {
             }
 
             // called when the client has reserved indices at the coordinator
-            pub async fn add_reserved_index(&mut self, id: ClientIdentity, i: u64) {
+            pub async fn add_reserved_index(&mut self, id: ClientIdentity, i: u64) -> Result<(), NodeRPCError> {
                 let mut d = self.rpc_server.lock().await;
 
-                assert!(!d.index_to_client.contains_key(&i));
+                if d.index_to_client.contains_key(&i) {
+                    return Err(NodeRPCError::IndexAlreadyAdded);
+                }
+
                 d.index_to_client.insert(i, id.clone());
                 d.client_to_index.insert(id.clone(), i);
 
@@ -1692,15 +1832,17 @@ pub mod off_chain {
                 if let Some(share) = d.mask_shares.get(&i) {
                     if let Some(sink) = d.sinks.get(&id) {
                         let mut share_bytes = Vec::new();
-                        share.serialize_compressed(&mut share_bytes).unwrap();
-                        let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                        sink.send(json).await.unwrap();
+                        share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                        let json = to_json_raw_value(&share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                        sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                     }
                 }
+
+                Ok(())
             }
             
             // called when preprocessing has generated the mask shares
-            pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) {
+            pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) -> Result<(), NodeRPCError> {
                 let mut d = self.rpc_server.lock().await;
 
                 assert!(!d.mask_shares.contains_key(&i));
@@ -1710,11 +1852,13 @@ pub mod off_chain {
                 if let Some(id) = d.index_to_client.get(&i) {
                     if let Some(sink) = d.sinks.get(id) {
                         let mut share_bytes = Vec::new();
-                        share.serialize_compressed(&mut share_bytes).unwrap();
+                        share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
                         let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                        sink.send(json).await.unwrap();
+                        sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                     }
                 }
+
+                Ok(())
             }
         }
 
@@ -1764,23 +1908,55 @@ pub mod off_chain {
         #[async_trait]
         impl OffChainNodeRPCServer for NodeRPCServerImpl {
             async fn receive_mask_share(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
-                let sink = pending.accept().await?;
+                use OffChainNodeRPCServerError::*;
 
                 let mut d = self.d.lock().await;
 
+                // each client can only request shares once from a node
                 if d.sinks.contains_key(&self.id) {
-                    panic!();
+                    pending.reject(ErrorObjectOwned::owned(
+                        ErrorCode::InvalidParams.code(),
+                        format!("Client {:?} already requested mask share", self.id),
+                        None::<()>)
+                    ).await;
+                    return Ok(());
                 }
-                d.sinks.insert(self.id.clone(), sink);
 
                 if let Some(i) = d.client_to_index.get(&self.id) {
                     if let Some(share) = d.mask_shares.get(i) {
                         let mut share_bytes = Vec::new();
-                        share.serialize_compressed(&mut share_bytes).unwrap();
-                        let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                        d.sinks.get(&self.id.clone()).unwrap().send(json).await.unwrap();
+                        match share.serialize_compressed(&mut share_bytes) {
+                            Ok(_) => { },
+                            Err(e) => {
+                                pending.reject(ErrorObjectOwned::owned(
+                                    ErrorCode::ServerError(SerializationError as i32).code(),
+                                    format!("Serializing share bytes failed: {e}"),
+                                    None::<()>)
+                                ).await;
+                                return Ok(());
+                            }
+                        };
+                        let json = match to_json_raw_value(&share_bytes) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                pending.reject(ErrorObjectOwned::owned(
+                                    ErrorCode::ServerError(SerializationError as i32).code(),
+                                    format!("Converting serialized shares to JSON failed: {e}"),
+                                    None::<()>)
+                                ).await;
+                                return Ok(());
+                            }
+                        };
+
+                        let sink = pending.accept().await?;
+                        sink.send(json).await?;
+
+                        return Ok(());
                     }
                 }
+
+                let sink = pending.accept().await?;
+                d.sinks.insert(self.id.clone(), sink);
 
                 Ok(())
             }
@@ -2778,7 +2954,7 @@ pub mod off_chain {
                     let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
                         node_rpc_addrs[i].1, certs[i].clone()).await;
 
-                    node_rpc.add_mask_share(0, mask_shares[i].clone()).await;
+                    node_rpc.add_mask_share(0, mask_shares[i].clone()).await.unwrap();
                     node_rpcs.push(node_rpc);
                 }
 
@@ -2793,7 +2969,7 @@ pub mod off_chain {
                         for node_rpc in node_rpcs.iter_mut() {
                             // just received by one node here, but in reality would be received by
                             // all nodes, so we simulate this here for more nodes
-                            node_rpc.add_reserved_index(c.to_vec(), *i).await;
+                            node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
                         }
                     }
 
@@ -2833,7 +3009,7 @@ pub mod off_chain {
                     assert_eq!(indices.len(), 1);
                     println!("CLIENT: obtained index {}", indices[0]);
 
-                    let mask = rpc_client.receive_mask().await;
+                    let mask = rpc_client.receive_mask().await.unwrap();
                     assert_eq!(mask, correct_mask);
 
                     coord.wait_for_input().await.unwrap();
