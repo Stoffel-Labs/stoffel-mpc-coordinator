@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use std::sync::Once;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use alloy_primitives::U256;
+use jsonrpsee::core::error::SubscriptionError;
 
 static INIT: Once = Once::new();
 fn setup_test() {
@@ -353,8 +353,8 @@ pub enum CoordinatorError {
     U64ToUsizeError,
     #[error("Parsing DER-encoded key as PKCS#8 failed")]
     ParsingDERAsPKCS8Failed,
-    #[error("Parsing DER-encoded private key failed")]
-    ParsingDERAsPrivateKeyFailed,
+    #[error("Parsing private key failed")]
+    ParsingPrivateKeyFailed,
     #[error("Deserialization failed")]
     DeserializationError,
     #[error("Serialization failed")]
@@ -363,6 +363,14 @@ pub enum CoordinatorError {
     ParsingPublicKeyFailed,
     #[error("Encryption failed")]
     EncryptionError,
+    #[error("Decryption failed")]
+    DecryptionError,
+    #[error("JSON error: {0}")]
+    JSONError(String),
+    #[error("Subscription error: {0}")]
+    SubscriptionError(String),
+    #[error("Parsing an encapsulated key failed")]
+    ParsingEncapsulatedKeyFailed
 }
 
 #[derive(Error, Clone, Debug)]
@@ -387,10 +395,9 @@ pub mod on_chain {
     };
     use alloy_primitives::{U256, Address, Signature, Bytes, Keccak256};
     use stoffel_solidity_bindings::{
-        fake_coordinator::FakeCoordinator::{InputMaskReservationStarted, MaskedInputEvent, ReservedInputEvent, EnoughPrivateOutputShares },
+        fake_coordinator::FakeCoordinator::{MaskedInputEvent, ReservedInputEvent, EnoughPrivateOutputShares },
         fake_coordinator::FakeCoordinator::FakeCoordinatorInstance,
         fake_coordinator::FakeCoordinator,
-        fake_coordinator::FakeCoordinator::FakeCoordinatorErrors
     };
     use futures_util::stream::StreamExt;
     use std::collections::HashMap;
@@ -404,7 +411,7 @@ pub mod on_chain {
         kem::{DhP256HkdfSha256, Kem},
         single_shot_open, single_shot_seal, 
         Deserializable, Serializable,
-        HpkeError, OpModeR, OpModeS,
+        OpModeR, OpModeS,
     };
     use p256::{SecretKey, pkcs8::DecodePrivateKey};
     use rand::{SeedableRng, rngs::StdRng};
@@ -1240,7 +1247,7 @@ pub mod on_chain {
                 let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes).map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
                 let raw_sk = parsed_secret_key.to_bytes();
 
-                <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).map_err(|_| CoordinatorError::ParsingDERAsPrivateKeyFailed)?
+                <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).map_err(|_| CoordinatorError::ParsingPrivateKeyFailed)?
             };
 
             let mut events = match self.coord
@@ -1263,11 +1270,11 @@ pub mod on_chain {
                 let mut output_shares = Vec::new();
                 for bytes in shares.iter() {
                     let (encapped_key_bytes, c): (Vec<u8>, Vec<u8>) = ark_serialize::CanonicalDeserialize::deserialize_compressed(bytes.to_vec().as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
-                    let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(&encapped_key_bytes).unwrap();
+                    let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(&encapped_key_bytes).map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
                     let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
                         &OpModeR::Base, &client_sk, &encapped_key, ENC_INFO, &c, b"",
-                    ).unwrap();
-                    let shares: Vec<RobustShare<Fr>> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).unwrap();
+                    ).map_err(|_| CoordinatorError::DecryptionError)?;
+                    let shares: Vec<RobustShare<Fr>> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
 
                     if shares.len() as u64 != self.n_outputs.unwrap() {
                         println!("Some node sent an invalid number of output shares, ignoring.");
@@ -2638,154 +2645,174 @@ pub mod off_chain {
             let mut map = HashMap::new();
 
             for _ in 0..n_clients {
-                let ReservedInputEvent { client, reserved_indices } = sub.next().await.unwrap().unwrap();
-                assert_eq!(reserved_indices.len(), 1);
-                map.insert(client, reserved_indices[0]);
+                if let Some(Ok(ReservedInputEvent { client, reserved_indices })) = sub.next().await {
+                    assert_eq!(reserved_indices.len(), 1);
+                    map.insert(client, reserved_indices[0]);
+                } else {
+                    return Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()));
+                }
             }
 
             Ok(map)
         }
 
         async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<Fr>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<Fr>>>, CoordinatorError> {
-            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_masked_inputs(self.get_timestamp()).await.unwrap();
+            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_masked_inputs(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
             let mut map = HashMap::new();
 
             for _ in 0..n_clients {
-                let MaskedInputEvent { client, masked_input, reserved_index } = sub.next().await.unwrap().unwrap();
-                let masked_input = masked_input.value;
-                let i = reserved_index as usize;
-                let mask_share = &mask_shares[i];
-                let input = RobustShare::new(
-                    masked_input - mask_share.share[0],
-                    mask_share.id,
-                    mask_share.degree
-                );
+                if let Some(Ok(MaskedInputEvent { client, masked_input, reserved_index })) = sub.next().await {
+                    let masked_input = masked_input.value;
+                    let i = reserved_index as usize;
+                    let mask_share = &mask_shares[i];
+                    let input = RobustShare::new(
+                        masked_input - mask_share.share[0],
+                        mask_share.id,
+                        mask_share.degree
+                    );
 
-                map.insert(client, vec![input]);
+                    map.insert(client, vec![input]);
+                } else {
+                    return Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()));
+                }
             }
 
             Ok(map)
         }
 
         async fn trigger_input(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(Round::InputCollection).await.unwrap();
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::InputCollection).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
             Ok(())
         }
 
         async fn wait_for_input(&self) -> Result<(), CoordinatorError> {
-            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_collect_inputs(self.get_timestamp()).await.unwrap();
-            let event = sub.next().await.unwrap().unwrap();
+            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_collect_inputs(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
-            Ok(())
+            if let Some(Ok(_)) = sub.next().await {
+                Ok(())
+            } else {
+                Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+            }
         }
 
         async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(Round::Preprocessing).await.unwrap();
-
-            Ok(())
+            match self.rpc_coord.as_ref().expect("client not started").transition(Round::Preprocessing).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
+            }
         }
 
         async fn wait_for_pp(&self) -> Result<(), CoordinatorError> {
-            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_start_pp(self.get_timestamp()).await.unwrap();
-            let event = sub.next().await.unwrap().unwrap();
+            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_start_pp(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
-            Ok(())
+            if let Some(Ok(_)) = sub.next().await {
+                Ok(())
+            } else {
+                Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+            }
         }
 
         async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(Round::InputMaskReservation).await.unwrap();
-
-            Ok(())
+            match self.rpc_coord.as_ref().expect("client not started").transition(Round::InputMaskReservation).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
+            }
         }
 
         async fn wait_for_input_mask_init(&self) -> Result<(), CoordinatorError> {
-            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_reserve_input_masks(self.get_timestamp()).await.unwrap();
-            let event = sub.next().await.unwrap().unwrap();
+            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_reserve_input_masks(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
-            Ok(())
+            if let Some(Ok(_)) = sub.next().await {
+                Ok(())
+            } else {
+                Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+            }
         }
 
         async fn send_masked_input(&self, masked_input: Fr, i: u64) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").submit_masked_input(FieldElement { value: masked_input }, i).await.unwrap();
-
-            Ok(())
+            match self.rpc_coord.as_ref().expect("client not started").submit_masked_input(FieldElement { value: masked_input }, i).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
+            }
         }
 
 
         async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(Round::MPC).await.unwrap();
-
-            Ok(())
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::MPC).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
         }
 
         async fn wait_for_mpc(&self) -> Result<(), CoordinatorError> {
-            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_start_mpc(self.get_timestamp()).await.unwrap();
-            let event = sub.next().await.unwrap().unwrap();
+            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_start_mpc(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
-            Ok(())
+            if let Some(Ok(_)) = sub.next().await {
+                Ok(())
+            } else {
+                Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+            }
         }
 
         async fn trigger_outputs(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(Round::Output).await.unwrap();
-
-            Ok(())
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::Output).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
         }
 
         async fn wait_for_outputs(&self) -> Result<(), CoordinatorError> {
-            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_send_outputs(self.get_timestamp()).await.unwrap();
-            let event = sub.next().await.unwrap().unwrap();
+            let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_send_outputs(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
-            Ok(())
+            if let Some(Ok(_)) = sub.next().await {
+                Ok(())
+            } else {
+                Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+            }
         }
 
         async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
-            let indices = self.rpc_coord.as_ref().expect("client not started").obtain_mask_indices(n_indices).await.unwrap();
+            let indices = self.rpc_coord.as_ref().expect("client not started").obtain_mask_indices(n_indices).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
             Ok(indices)
         }
 
         async fn finalize(&self) -> Result<(), CoordinatorError> {
-            self.rpc_coord.as_ref().expect("client not started").transition(Round::Idle).await.unwrap();
-
-            Ok(())
+            self.rpc_coord.as_ref().expect("client not started").transition(Round::Idle).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
         }
 
         async fn obtain_outputs(&self) -> Result<Vec<Fr>, CoordinatorError> {
-            let mut sub = self.rpc_coord.as_ref().expect("client not started").obtain_output_shares().await.unwrap();
+            let mut sub = match self.rpc_coord.as_ref().expect("client not started").obtain_output_shares().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    return Err(CoordinatorError::JSONError(e.to_string()));
+                }
+            };
 
             let client_sk = {
                 let der_bytes = self.key_der.clone().unwrap();
-                let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes)
-                    .expect("Failed to parse the DER envelope as PKCS#8");
+                let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes).map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
                 let raw_sk = parsed_secret_key.to_bytes();
 
-                <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).unwrap()
+                <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).map_err(|_| CoordinatorError::ParsingPrivateKeyFailed)?
             };
 
-            loop {
-                let enc_output_shares = sub.next().await.unwrap().unwrap();
-
+            while let Some(Ok(enc_output_shares)) = sub.next().await {
                 if (enc_output_shares.len() as u64) < 2 * self.t + 1 {
-                    println!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
-                    panic!();
+                    panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
                 }
 
-                let output_shares = enc_output_shares.iter().filter_map(|(encapped_key_bytes, c)| {
-                    let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes).unwrap();
+                let mut output_shares = Vec::new();
+                for (encapped_key_bytes, c) in enc_output_shares.iter() {
+                    let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes).map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
                     let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
                         &OpModeR::Base, &client_sk, &encapped_key, ENC_INFO, c, b"",
-                    ).unwrap();
-                    let shares: Vec<RobustShare<Fr>> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).unwrap();
+                    ).map_err(|_| CoordinatorError::DecryptionError)?;
+                    let shares: Vec<RobustShare<Fr>> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
 
                     if shares.len() as u64 != self.n_outputs.unwrap() {
                         println!("Some node sent an invalid number of output shares, ignoring.");
-                        return None;
+                        continue;
                     }
 
-                    Some(shares)
-                }).collect::<Vec<_>>();
+                    output_shares.push(shares);
+                }
 
                 let outputs: Vec<_> = (0..self.n_outputs.unwrap() as usize).filter_map(|i| {
                     // shares for the ith output
@@ -2807,12 +2834,14 @@ pub mod off_chain {
                     return Ok(outputs);
                 }
             }
+
+            Err(CoordinatorError::JSONError("Output shares subscription ended before enough output shares could be obtained".to_string()))
         }
 
         async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> Result<(), CoordinatorError> {
-            let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key).unwrap();
+            let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key).map_err(|_| CoordinatorError::ParsingPublicKeyFailed)?;
             let mut output_shares_bytes = Vec::new();
-            output_shares.serialize_compressed(&mut output_shares_bytes).unwrap();
+            output_shares.serialize_compressed(&mut output_shares_bytes).map_err(|_| CoordinatorError::SerializationError)?;
 
             let mut rng = StdRng::from_os_rng();
             let (encapsulated_key, ciphertext) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
@@ -2822,10 +2851,12 @@ pub mod off_chain {
                 &output_shares_bytes,
                 b"",
                 &mut rng,
-            ).unwrap();
+            ).map_err(|_| CoordinatorError::EncryptionError)?;
             let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
 
-            self.rpc_coord.as_ref().expect("client not started").send_output_shares(client_id, c).await.unwrap();
+            if let Err(e) = self.rpc_coord.as_ref().expect("client not started").send_output_shares(client_id, c).await {
+                return Err(CoordinatorError::JSONError(e.to_string()));
+            }
 
             Ok(())
         }
