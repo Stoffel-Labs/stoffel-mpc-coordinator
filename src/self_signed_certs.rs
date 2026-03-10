@@ -1,0 +1,167 @@
+use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::UnixTime;
+use rustls::pki_types::ServerName;
+use rustls::server::danger::{ClientCertVerifier, ClientCertVerified};
+use rustls::client::danger::{ServerCertVerifier, ServerCertVerified};
+use rustls::DistinguishedName;
+use std::sync::Arc;
+use jsonrpsee::client_transport::ws::WsTransportClientBuilder;
+use jsonrpsee::core::client::ClientBuilder;
+use url::Url;
+use jsonrpsee::async_client::Client;
+use rustls::ClientConfig;
+use tokio_rustls::TlsConnector;
+use tokio::net::TcpStream;
+
+#[derive(Debug)]
+pub struct SelfSignedClientVerifier;
+
+#[derive(Debug)]
+pub struct SelfSignedServerVerifier;
+
+impl ClientCertVerifier for SelfSignedClientVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+       fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+impl ServerCertVerifier for SelfSignedServerVerifier {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+       fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+pub fn server_cert() -> Arc<rcgen::CertifiedKey<rcgen::KeyPair>> {
+    let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+
+    Arc::new(rcgen::generate_simple_self_signed(subject_alt_names).unwrap())
+}
+
+pub fn client_cert() -> Arc<rcgen::CertifiedKey<rcgen::KeyPair>> {
+    let subject_alt_names = vec!["client".to_string()];
+
+    Arc::new(rcgen::generate_simple_self_signed(subject_alt_names).unwrap())
+}
+
+pub fn server_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> rustls::ServerConfig {
+    let certs = vec![CertificateDer::from(cert_der)];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(SelfSignedClientVerifier {}))
+        .with_single_cert(certs, key).unwrap()
+}
+
+fn client_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> ClientConfig {
+    let certs = vec![CertificateDer::from(cert_der)];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+
+    ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_client_auth_cert(certs, key).unwrap()
+}
+
+pub async fn setup_client(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Client {
+    let full_addr = format!("{}:{}", addr, port);
+    let url = format!("wss://{}/", full_addr);
+    let mut tls_config = client_tls_config(cert_der, key_der);
+    tls_config.dangerous().set_certificate_verifier(Arc::new(SelfSignedServerVerifier {}));
+
+    let tls_connector = TlsConnector::from(Arc::new(tls_config));
+    let tcp_stream = TcpStream::connect(full_addr).await.unwrap();
+    let domain = ServerName::try_from(addr).unwrap().to_owned();
+    let tls_stream = tls_connector.connect(domain, tcp_stream).await.unwrap();
+    
+    let (sender, receiver) = WsTransportClientBuilder::default()
+        .build_with_stream(Url::parse(&url).unwrap(), tls_stream)
+        .await.unwrap();
+
+    ClientBuilder::default()
+        .build_with_tokio(sender, receiver)
+}
