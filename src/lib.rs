@@ -558,14 +558,12 @@ pub mod on_chain {
                 d.auth_status.insert(addr, true);
 
                 if let Some(i) = d.client_to_index.get(&addr) {
-                    if d.auth_status.contains_key(&addr) {
-                        if let Some(share) = d.mask_shares.get(i) {
-                            if let Some(sink) = d.sinks.get(&addr) {
-                                let mut share_bytes = Vec::new();
-                                share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
-                                let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                                sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
-                            }
+                    if let Some(share) = d.mask_shares.get(i) {
+                        if let Some(sink) = d.sinks.get(&addr) {
+                           let mut share_bytes = Vec::new();
+                           share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                           let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                           sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                         }
                     }
                 }
@@ -1428,12 +1426,12 @@ pub mod on_chain {
             let designated_party = ACC[0];
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
-    
+
             let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
             assert_eq!(coord.contract_block, 1);
         }
-    
+
         #[tokio::test]
         pub async fn event_listening() {
             // event triggered BEFORE waiting for the event
@@ -1446,14 +1444,14 @@ pub mod on_chain {
                 let designated_party = ACC[0];
                 let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
                 let n_inputs = U256::from(1);
-    
+
                 let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
                 let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
-    
+
                 coord.trigger_pp().await.unwrap();
                 coord.wait_for_pp().await.unwrap();
             }
-    
+
             // event triggered AFTER waiting for the event
             {
                 let anvil = spawn_anvil();
@@ -1464,10 +1462,10 @@ pub mod on_chain {
                 let designated_party = ACC[0];
                 let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
                 let n_inputs = U256::from(1);
-    
+
                 let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
                 let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
-    
+
                 tokio::spawn({
                     let coord = coord.clone();
                     async move {
@@ -1476,7 +1474,7 @@ pub mod on_chain {
                         }
                     }
                 });
-                    
+
                 coord.trigger_pp().await.unwrap();
             }
         }
@@ -1498,9 +1496,9 @@ pub mod on_chain {
             let designated_party = ACC[0];
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
-    
+
             let contract = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-    
+
             // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
             let mut node_rpcs = Vec::new();
             for i in 0..node_rpc_addrs.len() {
@@ -1536,7 +1534,7 @@ pub mod on_chain {
             let designated_party = ACC[0];
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
-    
+
             let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
             let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(n), U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
 
@@ -1617,7 +1615,7 @@ pub mod on_chain {
                     let _ = coords[0].wait_for_mpc().await;
                     coords[0].trigger_outputs().await.unwrap();
                     let _ = coords[0].wait_for_outputs().await;
-                    
+
                     // check that all nodes have the same mapping
                     for node_rpc in node_rpcs.iter_mut() {
                         let ids_and_addrs = node_rpc.ids_and_addrs().await;
@@ -1683,6 +1681,7 @@ pub mod on_chain {
 pub mod off_chain {
     use ark_bls12_381::Fr;
     use jsonrpsee::{core::{SubscriptionResult, RpcResult, to_json_raw_value}, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
+    use jsonrpsee::types::ErrorObjectOwned;
     use serde::{Serialize, Deserialize};
     use crate::{Coordinator, CoordinatorError, rpc::{FieldElement, ClientInfo}};
     use events::*;
@@ -1707,6 +1706,7 @@ pub mod off_chain {
     use p256::{SecretKey, pkcs8::DecodePrivateKey};
     use rand::{SeedableRng, rngs::StdRng};
     use ark_serialize::CanonicalSerialize;
+    use CoordinatorRPCError::*;
 
     type KemImpl = DhP256HkdfSha256;
     type KdfImpl = HkdfSha256;
@@ -1847,7 +1847,7 @@ pub mod off_chain {
 
                 Ok(())
             }
-            
+
             // called when preprocessing has generated the mask shares
             pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) -> Result<(), NodeRPCError> {
                 let mut d = self.rpc_server.lock().await;
@@ -1922,9 +1922,9 @@ pub mod off_chain {
                 // each client can only request shares once from a node
                 if d.sinks.contains_key(&self.id) {
                     pending.reject(ErrorObjectOwned::owned(
-                        ErrorCode::InvalidParams.code(),
-                        format!("Client {:?} already requested mask share", self.id),
-                        None::<()>)
+                            ErrorCode::InvalidParams.code(),
+                            format!("Client {:?} already requested mask share", self.id),
+                            None::<()>)
                     ).await;
                     return Ok(());
                 }
@@ -1936,9 +1936,9 @@ pub mod off_chain {
                             Ok(_) => { },
                             Err(e) => {
                                 pending.reject(ErrorObjectOwned::owned(
-                                    ErrorCode::ServerError(SerializationError as i32).code(),
-                                    format!("Serializing share bytes failed: {e}"),
-                                    None::<()>)
+                                        ErrorCode::ServerError(SerializationError as i32).code(),
+                                        format!("Serializing share bytes failed: {e}"),
+                                        None::<()>)
                                 ).await;
                                 return Ok(());
                             }
@@ -1947,9 +1947,9 @@ pub mod off_chain {
                             Ok(j) => j,
                             Err(e) => {
                                 pending.reject(ErrorObjectOwned::owned(
-                                    ErrorCode::ServerError(SerializationError as i32).code(),
-                                    format!("Converting serialized shares to JSON failed: {e}"),
-                                    None::<()>)
+                                        ErrorCode::ServerError(SerializationError as i32).code(),
+                                        format!("Converting serialized shares to JSON failed: {e}"),
+                                        None::<()>)
                                 ).await;
                                 return Ok(());
                             }
@@ -1977,86 +1977,86 @@ pub mod off_chain {
         use super::{ClientIdentity, FieldElement};
         use downcast_rs::{Downcast, impl_downcast};
         use dyn_clone::{DynClone, clone_trait_object};
-    //    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
-    //    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
-    //    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
-    //    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    //    event CoordinatorInitialized(address coordinator, uint256 timeofInitialization, uint256 creationBlock, address designatedParty);
-    //    event InitializeStoffelAccessControl(uint256 nParties, uint256 t, address initializer);
+        //    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+        //    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+        //    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+        //    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+        //    event CoordinatorInitialized(address coordinator, uint256 timeofInitialization, uint256 creationBlock, address designatedParty);
+        //    event InitializeStoffelAccessControl(uint256 nParties, uint256 t, address initializer);
 
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct ExecutionDone {
             //address executor
             //uint256 timeOfExecution
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct IndexBufferEvent {
             pub total_indices: u64,
             pub designated_party: ClientIdentity
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct InputCollectionStarted {
             //address executor
             //uint256 timeOfExecution
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct InputMaskReservationStarted {
             //address executor
             //uint256 timeOfExecution
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct MPCStarted {
             //address executor
             //uint256 timeOfExecution
         }
-   
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct MaskedInputEvent {
             pub client: ClientIdentity,
             pub masked_input: FieldElement<Fr>,
             pub reserved_index: u64
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct OutputSendingStarted {
             //address executor
             //uint256 timeOfExecution
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct OutputsPublished {
             //bytes32 stoffelProgramHash
             //uint256 timeOfExecution
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct PreprocessingStarted {
             pub designated_party: ClientIdentity,
             //uint256 timeOfExecution
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct ReservedInputEvent {
             pub client: ClientIdentity,
             pub reserved_indices: Vec<u64>
         }
-    
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct ClientInputMaskReservationEvent {
             //address executor;
             //uint256 timeOfExecution
         }
-        
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct ClientOutputCollection {
             //address executor
             //uint256 timeOfExecution
         }
-        
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct CoordinatorInitialized {
             //address coordinator
@@ -2064,7 +2064,7 @@ pub mod off_chain {
             pub creation_block: u64,
             pub designated_party: ClientIdentity
         }
-        
+
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct PreprocessingRoundExecuted {
             //address designatedParty
@@ -2074,7 +2074,7 @@ pub mod off_chain {
         pub trait TransitionEvent : Downcast + DynClone + Send { }
         impl_downcast!(TransitionEvent);
         clone_trait_object!(TransitionEvent);
-    
+
         impl TransitionEvent for ExecutionDone { }
         impl TransitionEvent for InputCollectionStarted { }
         impl TransitionEvent for InputMaskReservationStarted { }
@@ -2083,7 +2083,7 @@ pub mod off_chain {
         impl TransitionEvent for PreprocessingStarted { }
         impl TransitionEvent for CoordinatorInitialized { }
     }
-    
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub enum Round {
         Idle,
@@ -2116,58 +2116,58 @@ pub mod off_chain {
         }
     }
 
-    
+
     #[rpc(server, client)]
     pub trait CoordinatorRPC {
-    //        function DEFAULT_ADMIN_ROLE() external view returns (bytes32);
-    //        function DESIGNATED_PARTY_ROLE() external view returns (bytes32);
-    //        function PARTY_ROLE() external view returns (bytes32);
-    // function creationTime() external view returns (uint256);
-    // function getRoleAdmin(bytes32 role) external view returns (bytes32);
-    // function getRoleMember(bytes32 role, uint256 index) external view returns (address);
-    // function getRoleMemberCount(bytes32 role) external view returns (uint256);
-    // function getRoleMembers(bytes32 role) external view returns (address[] memory);
-    // function grantRole(bytes32 role, address account) external;
-    // function hasRole(bytes32 role, address account) external view returns (bool);
-    // function isDesignatedParty(address account) external view returns (bool);
-    // function isParty(address account) external view returns (bool);
-    // function owner() external view returns (address);
-    // function renounceOwnership() external;
-    // function renounceRole(bytes32 role, address account) external;
-    // function resetAccessControl(uint256 t, address[] memory initialMPCNodes) external;
-    // function resetInputManager(uint256 nIndicesToReserve) external;
-    // function revokeRole(bytes32 role, address account) external;
-    // function round() external view returns (StoffelCoordinator.Round);
-    // function setPublicOutputs(bytes memory publicOutputs) external;
-    // function shareReceived(address from, address to) external;
-    // function supportsInterface(bytes4 interfaceId) external view returns (bool);
-    // function transferOwnership(address newOwner) external;
-    // constructor(bytes32 stoffelProgramHash, uint256 n, uint256 t, address designatedParty, address[] initialMPCNodes, uint256 nInputs);
-    
+        //        function DEFAULT_ADMIN_ROLE() external view returns (bytes32);
+        //        function DESIGNATED_PARTY_ROLE() external view returns (bytes32);
+        //        function PARTY_ROLE() external view returns (bytes32);
+        // function creationTime() external view returns (uint256);
+        // function getRoleAdmin(bytes32 role) external view returns (bytes32);
+        // function getRoleMember(bytes32 role, uint256 index) external view returns (address);
+        // function getRoleMemberCount(bytes32 role) external view returns (uint256);
+        // function getRoleMembers(bytes32 role) external view returns (address[] memory);
+        // function grantRole(bytes32 role, address account) external;
+        // function hasRole(bytes32 role, address account) external view returns (bool);
+        // function isDesignatedParty(address account) external view returns (bool);
+        // function isParty(address account) external view returns (bool);
+        // function owner() external view returns (address);
+        // function renounceOwnership() external;
+        // function renounceRole(bytes32 role, address account) external;
+        // function resetAccessControl(uint256 t, address[] memory initialMPCNodes) external;
+        // function resetInputManager(uint256 nIndicesToReserve) external;
+        // function revokeRole(bytes32 role, address account) external;
+        // function round() external view returns (StoffelCoordinator.Round);
+        // function setPublicOutputs(bytes memory publicOutputs) external;
+        // function shareReceived(address from, address to) external;
+        // function supportsInterface(bytes4 interfaceId) external view returns (bool);
+        // function transferOwnership(address newOwner) external;
+        // constructor(bytes32 stoffelProgramHash, uint256 n, uint256 t, address designatedParty, address[] initialMPCNodes, uint256 nInputs);
+
         #[subscription(name = "sub_collect_input", unsubscribe = "unsub_collect_inputs", item = InputCollectionStarted)]
         async fn sub_collect_inputs(&self, timestamp: u64) -> SubscriptionResult;
-    
+
         #[method(name = "available_input_masks")]
         async fn available_input_masks(&self) -> RpcResult<u64>;
-    
+
         #[method(name = "obtain_input_masks")]
         async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>>;
 
         #[subscription(name = "sub_reserve_input_masks", unsubscribe = "unsub_reserve_input_masks", item = InputMaskReservationStarted)]
         async fn sub_reserve_input_masks(&self, timestamp: u64) -> SubscriptionResult;
-    
+
         #[method(name = "reset")]
-        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64);
-    
+        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()>;
+
         #[subscription(name = "sub_send_outputs", unsubscribe = "unsub_send_outputs", item = OutputSendingStarted)]
         async fn sub_send_outputs(&self, timestamp: u64) -> SubscriptionResult;
-    
+
         #[subscription(name = "sub_start_mpc", unsubscribe = "unsub_start_mpc", item = MPCStarted)]
         async fn sub_start_mpc(&self, timestamp: u64) -> SubscriptionResult;
-    
+
         #[subscription(name = "sub_start_pp", unsubscribe = "unsub_start_pp", item = PreprocessingStarted)]
         async fn sub_start_pp(&self, timestamp: u64) -> SubscriptionResult;
-    
+
         #[method(name = "submit_masked_input")]
         async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: u64) -> RpcResult<()>;
 
@@ -2202,7 +2202,7 @@ pub mod off_chain {
         masked_input_sinks: Vec<SubscriptionSink>,
         next_i: u64,
         reserved_indices: Vec<Option<ClientIdentity>>,
-        input_masks: Vec<Option<Fr>>,
+        masked_inputs: Vec<Option<Fr>>,
         round: Round,
         prog_hash: [u8; 32],
         n: u64,
@@ -2217,12 +2217,12 @@ pub mod off_chain {
         pub fn new(prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> Self {
             Self {
                 sinks: HashMap::from([
-                    (Round::Idle, vec![]),
-                    (Round::Preprocessing, vec![]),
-                    (Round::InputMaskReservation, vec![]),
-                    (Round::InputCollection, vec![]),
-                    (Round::MPC, vec![]),
-                    (Round::Output, vec![])
+                           (Round::Idle, vec![]),
+                           (Round::Preprocessing, vec![]),
+                           (Round::InputMaskReservation, vec![]),
+                           (Round::InputCollection, vec![]),
+                           (Round::MPC, vec![]),
+                           (Round::Output, vec![])
                 ]),
                 trans_events: HashMap::from([
                     (Round::Idle, vec![]),
@@ -2238,7 +2238,7 @@ pub mod off_chain {
                 masked_input_sinks: vec![],
                 next_i: 0,
                 reserved_indices: vec![None; n_inputs as usize],
-                input_masks: vec![None; n_inputs as usize],
+                masked_inputs: vec![None; n_inputs as usize],
                 round: Round::Idle,
                 prog_hash,
                 n,
@@ -2371,6 +2371,17 @@ pub mod off_chain {
         }
     }
 
+    pub enum CoordinatorRPCError {
+        NotDesignatedParty = 1,
+        WrongRound = 2,
+        IndexOutOfBounds = 3,
+        BadID = 4,
+        MaskedInputAlreadySubmitted = 5,
+        IndexNotReserved = 6,
+        OutOfIndices = 7,
+        OutputSharesAlreadySent = 8,
+        OutputSharesAlreadyRequested = 9
+    }
 
     #[async_trait]
     impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
@@ -2383,7 +2394,7 @@ pub mod off_chain {
         async fn available_input_masks(&self) -> RpcResult<u64> {
             let d = self.d.lock().await;
 
-            Ok(d.input_masks.len() as u64 - d.next_i)
+            Ok(d.masked_inputs.len() as u64 - d.next_i)
         }
 
         async fn sub_reserve_input_masks(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
@@ -2392,21 +2403,36 @@ pub mod off_chain {
             d.subscribe_oneshot::<InputMaskReservationStarted>(pending, timestamp, Round::InputMaskReservation).await
         }
 
-        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) {
+        async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()> {
             let mut d = self.d.lock().await;
 
+            let designated_party = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0].clone();
+            if self.id != designated_party {
+                return Err(ErrorObjectOwned::owned(
+                        NotDesignatedParty as i32,
+                        format!("Only designated party {:?} can reset the coordinator.", designated_party),
+                        None::<()>
+                ));
+            }
+
             if d.round != Round::Idle {
-                panic!();
+                return Err(ErrorObjectOwned::owned(
+                        WrongRound as i32,
+                        format!("Need round {:?}, current round is {:?}", Round::Idle, d.round),
+                        None::<()>
+                ));
             }
 
             d.round = Round::Idle;
             d.next_i = 0;
-            d.input_masks = vec![None; n_inputs as usize];
+            d.masked_inputs = vec![None; n_inputs as usize];
             d.reserved_indices = vec![None; n_inputs as usize];
             d.prog_hash = prog_hash;
             d.n = n;
             d.t = t;
             d.mpc_nodes = Some(initial_mpc_nodes);
+
+            Ok(())
         }
 
         async fn sub_send_outputs(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
@@ -2431,24 +2457,40 @@ pub mod off_chain {
             let mut d = self.d.lock().await;
 
             if d.round != Round::InputCollection {
-                panic!();
+                return Err(ErrorObjectOwned::owned(
+                        WrongRound as i32,
+                        format!("Need round {:?}, current round is {:?}", Round::InputCollection, d.round),
+                        None::<()>
+                ));
             }
 
             let reserved_index = raw_reserved_index as usize;
 
-            if reserved_index >= d.input_masks.len(){
-                panic!();
+            if reserved_index >= d.masked_inputs.len(){
+                return Err(ErrorObjectOwned::owned(
+                        IndexOutOfBounds as i32,
+                        format!("The index {} is out of bounds, there are only {} input masks.", reserved_index, d.masked_inputs.len()),
+                        None::<()>
+                ));
             }
 
             match &d.reserved_indices[reserved_index] {
                 Some(public_key) => {
                     if *public_key != self.id {
-                        panic!();
+                        return Err(ErrorObjectOwned::owned(
+                                BadID as i32,
+                                format!("Client {:?} cannot submit a masked input for index {}, since this index has been reserved by {:?}", self.id, reserved_index, *public_key),
+                                None::<()>
+                        ));
                     }
-                    if d.input_masks[reserved_index].is_some() {
-                        panic!();
+                    if d.masked_inputs[reserved_index].is_some() {
+                        return Err(ErrorObjectOwned::owned(
+                                MaskedInputAlreadySubmitted as i32,
+                                format!("Client {:?} has already submitted a masked input for index {}", self.id, reserved_index),
+                                None::<()>
+                        ));
                     }
-                    d.input_masks[reserved_index] = Some(masked_input.value);
+                    d.masked_inputs[reserved_index] = Some(masked_input.value);
 
                     let event = MaskedInputEvent { client: self.id.clone(), masked_input, reserved_index: raw_reserved_index };
                     for sink in &d.masked_input_sinks {
@@ -2458,7 +2500,11 @@ pub mod off_chain {
                     d.masked_input_events.push((SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), event));
                 }
                 None => {
-                    panic!();
+                    return Err(ErrorObjectOwned::owned(
+                            IndexNotReserved as i32,
+                            format!("Cannot submit a masked input for index {}, since it has not been reserved", reserved_index),
+                            None::<()>
+                    ));
                 }
             }
 
@@ -2481,11 +2527,19 @@ pub mod off_chain {
             let mut d = self.d.lock().await;
 
             if d.round != Round::InputMaskReservation {
-                panic!();
+                return Err(ErrorObjectOwned::owned(
+                        WrongRound as i32,
+                        format!("Need round {:?}, current round is {:?}", Round::InputMaskReservation, d.round),
+                        None::<()>
+                ));
             }
 
-            if d.next_i + n_indices > d.input_masks.len() as u64 {
-                panic!();
+            if d.next_i + n_indices > d.masked_inputs.len() as u64 {
+                return Err(ErrorObjectOwned::owned(
+                        OutOfIndices as i32,
+                        format!("Cannot return {} indices, only have {} left.", n_indices, d.masked_inputs.len() as u64 - d.next_i),
+                        None::<()>
+                ));
             }
 
             for i in d.next_i..d.next_i + n_indices {
@@ -2511,8 +2565,13 @@ pub mod off_chain {
         async fn transition(&self, next_round: Round) -> RpcResult<()> {
             let mut d = self.d.lock().await;
 
-            if self.id != d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0] {
-                panic!();
+            let designated_party = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0].clone();
+            if self.id != designated_party {
+                return Err(ErrorObjectOwned::owned(
+                        NotDesignatedParty as i32,
+                        format!("Only designated party {:?} can reset the coordinator.", designated_party),
+                        None::<()>
+                ));
             }
 
             match next_round {
@@ -2530,9 +2589,13 @@ pub mod off_chain {
         async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()> {
             let mut d = self.d.lock().await;
 
+            // a node cannot send output shares for a client twice
             if d.output_shares.contains_key(&(client_id.clone(), self.id.clone())) {
-                // a node cannot send output shares for a client twice
-                panic!();
+                return Err(ErrorObjectOwned::owned(
+                    OutputSharesAlreadySent as i32,
+                    format!("Client {:?} already has submitted their output shares.", client_id),
+                    None::<()>
+                ));
             }
 
             // output shares for `client_id` from `self.id`
@@ -2550,13 +2613,18 @@ pub mod off_chain {
         }
 
         async fn obtain_output_shares(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
-            let sink = pending.accept().await?;
-
             let mut d = self.d.lock().await;
 
             if d.output_sinks.contains_key(&self.id) {
-                panic!();
+                pending.reject(ErrorObjectOwned::owned(
+                    OutputSharesAlreadyRequested as i32,
+                    format!("Client {:?} already has requested their output shares.", self.id),
+                    None::<()>
+                )).await;
+                return Ok(());
             }
+
+            let sink = pending.accept().await?;
             d.output_sinks.insert(self.id.clone(), sink);
 
             let output_shares: Vec<_> = d.output_shares.iter().filter(|((client_id, _), _)| *client_id == self.id).map(|(_, shares)| shares.clone()).collect();
