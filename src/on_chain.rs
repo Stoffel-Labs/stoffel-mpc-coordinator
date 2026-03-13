@@ -30,6 +30,7 @@ use hpke::{
 use p256::{SecretKey, pkcs8::DecodePrivateKey};
 use rand::{SeedableRng, rngs::StdRng};
 use ark_serialize::CanonicalSerialize;
+use alloy::providers::WalletProvider;
 
 type KemImpl = DhP256HkdfSha256;
 type KdfImpl = HkdfSha256;
@@ -529,13 +530,12 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 
-        use alloy::providers::WalletProvider;
 impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P> {
     type ClientIdentity = Address;
 
     async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
         let mut addr_to_i: HashMap<Address, u64> = HashMap::new();
-        
+
         // spawn thread to receive all ReservedInputEvents
         let mut events = self.coord
             .ReservedInputEvent_filter()

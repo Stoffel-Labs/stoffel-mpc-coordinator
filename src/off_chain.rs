@@ -699,7 +699,8 @@ pub enum CoordinatorRPCError {
     IndexNotReserved = 6,
     OutOfIndices = 7,
     OutputSharesAlreadySent = 8,
-    OutputSharesAlreadyRequested = 9
+    OutputSharesAlreadyRequested = 9,
+    NotParty = 10,
 }
 
 #[async_trait]
@@ -907,6 +908,15 @@ impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
 
     async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()> {
         let mut d = self.d.lock().await;
+
+        let mpc_nodes = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!");
+        if !mpc_nodes.contains(&self.id) {
+            return Err(ErrorObjectOwned::owned(
+                    NotParty as i32,
+                    "Only parties can send output shares.",
+                    None::<()>
+            ));
+        }
 
         // a node cannot send output shares for a client twice
         if d.output_shares.contains_key(&(client_id.clone(), self.id.clone())) {

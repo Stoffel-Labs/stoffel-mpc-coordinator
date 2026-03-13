@@ -79,7 +79,7 @@ pub async fn start_coord<T: RPCServerImpl>(addr: &str, port: u16, cert_der: Vec<
         
             let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
-                Err(e) => { eprintln!("Handshake failed: {}", e); return; }
+                Err(e) => { eprintln!("Handshake failed: {}", e); continue; }
             };
         
             let (stop_rx, stop_tx) = jsonrpsee::server::stop_channel();
