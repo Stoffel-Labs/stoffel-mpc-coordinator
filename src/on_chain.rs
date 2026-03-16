@@ -955,6 +955,20 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
+
+    async fn submit_program(&mut self, program_bytes: Vec<u8>) -> Result<[u8; 32], CoordinatorError> {
+        if program_bytes.len() > crate::MAX_PROGRAM_SIZE {
+            return Err(CoordinatorError::ProgramTooLarge(program_bytes.len()));
+        }
+
+        let prog_hash = crate::compute_prog_hash(&program_bytes);
+
+        // On-chain: prog_hash would be stored on the smart contract.
+        // Program bytes are distributed to nodes via Node RPC (too large for on-chain).
+        // Full implementation requires contract interaction + Node RPC distribution.
+
+        Ok(prog_hash)
+    }
 }
 
 #[cfg(test)]

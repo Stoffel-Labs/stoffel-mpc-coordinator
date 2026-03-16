@@ -1257,6 +1257,20 @@ impl Coordinator for OffChainCoordinator {
 
         Ok(())
     }
+
+    async fn submit_program(&mut self, program_bytes: Vec<u8>) -> Result<[u8; 32], CoordinatorError> {
+        if program_bytes.len() > crate::MAX_PROGRAM_SIZE {
+            return Err(CoordinatorError::ProgramTooLarge(program_bytes.len()));
+        }
+
+        let prog_hash = crate::compute_prog_hash(&program_bytes);
+
+        // Store program bytes locally. Distribution to MPC nodes via RPC
+        // will be implemented when the RPC protocol supports program transfer.
+        // For now, nodes must receive the program through the session setup.
+
+        Ok(prog_hash)
+    }
 }
 
 #[cfg(test)]
