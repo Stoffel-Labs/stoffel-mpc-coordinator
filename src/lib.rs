@@ -31,6 +31,14 @@ pub trait Coordinator {
     fn finalize(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn obtain_outputs(&self) -> impl Future<Output = Result<Vec<Fr>, CoordinatorError>>;
     fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> impl Future<Output = Result<(), CoordinatorError>>;
+
+    /// Submit a compiled program to the coordinator for distribution to the MPC network.
+    ///
+    /// The coordinator stores the program bytes, computes the SHA-256 hash (`prog_hash`),
+    /// and distributes the program to all registered MPC nodes.
+    ///
+    /// Returns the 32-byte `prog_hash` on success.
+    fn submit_program(&mut self, program_bytes: Vec<u8>) -> impl Future<Output = Result<[u8; 32], CoordinatorError>>;
 }
 
 #[derive(Error, Clone, Debug, Serialize, Deserialize)]
@@ -68,7 +76,13 @@ pub enum CoordinatorError {
     #[error("Subscription error: {0}")]
     SubscriptionError(String),
     #[error("Parsing an encapsulated key failed")]
-    ParsingEncapsulatedKeyFailed
+    ParsingEncapsulatedKeyFailed,
+    #[error("Program too large: {0} bytes (max 10MB)")]
+    ProgramTooLarge(usize),
+    #[error("Program distribution failed: {0}")]
+    ProgramDistributionFailed(String),
+    #[error("Program hash mismatch")]
+    ProgramHashMismatch,
 }
 
 #[derive(Error, Clone, Debug)]
@@ -79,6 +93,18 @@ pub enum NodeRPCError {
     JSONError,
     #[error("Serialization error")]
     SerializationError,
+}
+
+/// Maximum allowed program size (10 MB).
+pub const MAX_PROGRAM_SIZE: usize = 10 * 1024 * 1024;
+
+/// Compute the SHA-256 hash of program bytecode.
+pub fn compute_prog_hash(program_bytes: &[u8]) -> [u8; 32] {
+    use ring::digest;
+    let hash = digest::digest(&digest::SHA256, program_bytes);
+    let mut result = [0u8; 32];
+    result.copy_from_slice(hash.as_ref());
+    result
 }
 
 static INIT: Once = Once::new();
