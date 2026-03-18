@@ -346,13 +346,20 @@ pub mod node_rpc {
                                     ).await;
                                     return Ok(());
                                 }
-                            };  
+                            };
+
                             let sink = pending.accept().await?;
                             sink.send(json).await?;
+
+                            return Ok(());
                         }
                     }
 
+                    let sink = pending.accept().await?;
+                    d.sinks.insert(addr, sink);
                     d.ids_and_addrs.push((self.id.clone(), addr));
+
+                    Ok(())
                 }
                 None => {
                     // client not authenticated yet, send signature to coordinator
@@ -365,6 +372,8 @@ pub mod node_rpc {
                             let sink = pending.accept().await?;
                             d.sinks.insert(addr, sink);
                             d.ids_and_addrs.push((self.id.clone(), addr));
+
+                            Ok(())
                         }
                         Err(e) => {
                             let msg = {
@@ -392,13 +401,11 @@ pub mod node_rpc {
                                 err,
                                 None::<()>)
                             ).await;
-                            return Ok(());
+                            Ok(())
                         }
                     }
                 }
             }
-
-            Ok(())
         }
     }
 }
