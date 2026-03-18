@@ -424,18 +424,6 @@ fn round_before(current: Round) -> Round {
     }
 }
 
-fn next_round(current: Round) -> Round {
-    match current {
-        Round::Idle => Round::Preprocessing,
-        Round::Preprocessing => Round::InputMaskReservation,
-        Round::InputMaskReservation => Round::InputCollection,
-        Round::InputCollection => Round::MPC,
-        Round::MPC => Round::Output,
-        Round::Output => Round::Idle
-    }
-}
-
-
 #[rpc(server, client)]
 pub trait CoordinatorRPC {
     //        function DEFAULT_ADMIN_ROLE() external view returns (bytes32);
