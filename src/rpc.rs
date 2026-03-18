@@ -96,8 +96,7 @@ pub async fn start_coord<T: RPCServerImpl>(addr: &str, port: u16, cert_der: Vec<
                 .subject_public_key.data.as_ref();
 
             let rpc_server = T::new(rpc_server_data.clone(), public_key.to_vec());
-            let mut rpc_module = RpcModule::new(());
-            rpc_module.merge(rpc_server.into_rpc()).unwrap();
+            let rpc_module = rpc_server.into_rpc();
             let rpc_service = Server::builder()
                 .to_service_builder()
                 .build(rpc_module, stop_rx);
