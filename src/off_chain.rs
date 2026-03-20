@@ -975,7 +975,7 @@ impl OffChainCoordinator {
     }
 
     pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_outputs: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-        let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), n_outputs)));
+        let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), initial_mpc_nodes.len() as u64)));
         let server_handle = crate::rpc::start_coord::<CoordinatorRPCServerImpl>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
         Self {
             rpc_server: Some(rpc_server_data),
