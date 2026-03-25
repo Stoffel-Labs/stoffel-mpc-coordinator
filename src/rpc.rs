@@ -12,11 +12,13 @@ use hyper_util::service::TowerToHyperService;
 use hyper_util::rt::TokioIo;
 use crate::self_signed_certs;
 
+/// A wrapper around a field element that is serializable and deserializable for use with JSON-RPC.
 #[derive(Clone, Debug)]
 pub struct FieldElement<T: FftField> {
     pub value: T
 }
 
+/// Deserialization implementation for a field element.
 impl<'d, T: FftField> Deserialize<'d> for FieldElement<T> {
     fn deserialize<D>(deserializer: D) -> Result<FieldElement<T>, D::Error>
     where
@@ -28,6 +30,7 @@ impl<'d, T: FftField> Deserialize<'d> for FieldElement<T> {
     }
 }
 
+/// Serialization implementation for a field element.
 impl<T: FftField> Serialize for FieldElement<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -41,22 +44,29 @@ impl<T: FftField> Serialize for FieldElement<T> {
     }
 }
 
+/// Information stored by an RPC server about a connected client.
 pub struct ClientInfo {
     pub cert: Vec<u8>,
     pub thread: JoinHandle<()>,
     pub stop_tx: ServerHandle
 }
 
+/// The internal state of a JSON-RPC server. This is shared state across all client connections.
 pub trait RPCServerInternal {
     fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle);
 }
 
+/// This represents the JSON-RPC server's state for one client connection. Internally, it refers to
+/// some cross-client shared state of the server and also stores the client's public key.
+/// This allows the JSON-RPC methods that implement a `jsonrpsee` trait created using the `#rpc`
+/// attribute to access such client-specific information, in particular the client's identity.
 pub trait RPCServerImpl {
     type Internal : RPCServerInternal + 'static + Send;
     fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self;
     fn into_rpc(self) -> RpcModule<Self> where Self: Sized;
 }
 
+/// Starts a JSON-RPC server, which listens for Websocket connections over TLS.
 pub async fn start_coord<T: RPCServerImpl>(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>, rpc_server_data: Arc<Mutex<T::Internal>>) -> JoinHandle<()> {
     let full_addr = format!("{}:{}", addr, port);
     let tls_config = self_signed_certs::server_tls_config(cert_der, key_der);
