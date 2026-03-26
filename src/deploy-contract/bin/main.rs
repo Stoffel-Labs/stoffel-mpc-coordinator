@@ -53,13 +53,13 @@ async fn main() {
     let n = U256::from(args.n);
     let t = U256::from(args.t);
     let hash = FixedBytes::from_str(&args.hash).expect("invalid hash");
-    let designated_party = Address::from_str(&args.designated_party).expect("invalid designated party address");
+    let _designated_party = Address::from_str(&args.designated_party).expect("invalid designated party address");
     let initial_mpc_nodes: Vec<Address> = args.initial_mpc_nodes.iter()
         .map(|s| Address::from_str(s).expect("invalid initial MPC node address"))
         .collect();
-    let n_inputs = U256::from(args.n_inputs);
+    let _n_inputs = U256::from(args.n_inputs);
 
-    let contract = match FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes, n_inputs).await {
+    let contract = match FakeCoordinator::deploy(provider.clone(), hash, n, initial_mpc_nodes, t).await {
         Ok(contract) => contract,
         Err(e) => {
             eprintln!("Failed to deploy contract: {}", e);

@@ -537,7 +537,7 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 
-impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P> {
+impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinator<P> {
     type ClientIdentity = Address;
 
     async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
@@ -1048,7 +1048,7 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, initial_mpc_nodes.clone(), U256::from(t)).await.expect("deployment failed");
         let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
         assert_eq!(coord.contract_block, 1);
     }
@@ -1066,7 +1066,7 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, initial_mpc_nodes.clone(), U256::from(t)).await.expect("deployment failed");
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             coord.trigger_pp().await.unwrap();
@@ -1084,7 +1084,7 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, initial_mpc_nodes.clone(), U256::from(t)).await.expect("deployment failed");
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             tokio::spawn({
@@ -1118,7 +1118,7 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, n, initial_mpc_nodes.clone(), U256::from(t)).await.expect("deployment failed");
 
         // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
         let mut node_rpcs = Vec::new();
@@ -1157,7 +1157,7 @@ mod tests {
         let n_inputs = U256::from(1);
 
         let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(n), U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(n), initial_mpc_nodes.clone(), U256::from(t)).await.expect("deployment failed");
 
         let barrier = Arc::new(Barrier::new(3));
 

@@ -58,7 +58,7 @@ async fn main() {
     
     let addr = "127.0.0.1";
     let port = 31415;
-    let coord = OffChainCoordinator::start_coord(addr, port, hash.try_into().unwrap(), n, t, public_keys, 2, server_cert_der, server_key_der).await;
+    let coord: OffChainCoordinator<ark_bls12_381::Fr> = OffChainCoordinator::start_coord(addr, port, hash.try_into().unwrap(), n, t, public_keys, 2, server_cert_der, server_key_der).await;
     let timestamp = coord.get_timestamp();
 
     println!("Listening on {}:{}", addr, port);
