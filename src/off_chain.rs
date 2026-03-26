@@ -177,8 +177,9 @@ pub mod node_rpc {
             let mut d = self.rpc_server.lock().await;
 
             assert!(!d.mask_shares.contains_key(&i));
+            d.mask_shares.insert(i, share.clone());
 
-            // if client already registered and has a sink, send the share now
+            // if reserved index has been added and client has requested the share already, send the share now
             if let Some(id) = d.index_to_client.get(&i) {
                 if let Some(sink) = d.sinks.get(id) {
                     let mut share_bytes = Vec::new();
@@ -187,8 +188,6 @@ pub mod node_rpc {
                     sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
             }
-
-            d.mask_shares.insert(i, share.clone());
 
             Ok(())
         }
@@ -1030,7 +1029,7 @@ impl<F: FftField> OffChainCoordinator<F> {
     }
 
     fn rpc(&self) -> &Client {
-        self.rpc_coord.as_ref().expect("client not started")
+        self.rpc()
     }
 }
 
