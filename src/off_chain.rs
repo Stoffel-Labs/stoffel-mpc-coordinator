@@ -2,10 +2,9 @@ use ark_ff::FftField;
 use jsonrpsee::{core::{SubscriptionResult, RpcResult, to_json_raw_value}, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde::{Serialize, Deserialize};
-use crate::{Coordinator, CoordinatorError, rpc::ClientInfo};
+use crate::{Coordinator, CoordinatorError, rpc::{ClientInfo, FieldElement}};
 use events::*;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -63,8 +62,8 @@ pub mod node_rpc {
         async fn receive_mask_share(&self) -> SubscriptionResult;
     }
 
-    pub struct NodeRPCServer {
-        rpc_server: Arc<Mutex<NodeRPCServerInternal>>,
+    pub struct NodeRPCServer<F: FftField> {
+        rpc_server: Arc<Mutex<NodeRPCServerInternal<F>>>,
         addr: String,
         port: u16,
         server_handle: JoinHandle<()>,
@@ -129,14 +128,14 @@ pub mod node_rpc {
         }
     }
 
-    impl NodeRPCServer {
+    impl<F: FftField> NodeRPCServer<F> {
         pub async fn start_from_cert(addr: &str, port: u16, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
             Self::start(addr, port, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
         }
 
         pub async fn start(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::new()));
-            let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F>::new()));
+            let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl<F>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
@@ -161,9 +160,11 @@ pub mod node_rpc {
             d.client_to_index.insert(id.clone(), i);
 
             // if mask share is there and share has been requested, send it
-            if let Some(share_bytes) = d.mask_shares.get(&i) {
+            if let Some(share) = d.mask_shares.get(&i) {
                 if let Some(sink) = d.sinks.get(&id) {
-                    let json = to_json_raw_value(share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                    let mut share_bytes = Vec::new();
+                    share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                    let json = to_json_raw_value(&share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
                     sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
             }
@@ -172,34 +173,34 @@ pub mod node_rpc {
         }
 
         // called when preprocessing has generated the mask shares
-        pub async fn add_mask_share<F: FftField>(&mut self, i: u64, share: &RobustShare<F>) -> Result<(), NodeRPCError> {
-            let mut share_bytes = Vec::new();
-            share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
-
+        pub async fn add_mask_share(&mut self, i: u64, share: &RobustShare<F>) -> Result<(), NodeRPCError> {
             let mut d = self.rpc_server.lock().await;
 
             assert!(!d.mask_shares.contains_key(&i));
-            d.mask_shares.insert(i, share_bytes.clone());
 
-            // if mask share is there and share has been requested, send it
+            // if client already registered and has a sink, send the share now
             if let Some(id) = d.index_to_client.get(&i) {
                 if let Some(sink) = d.sinks.get(id) {
+                    let mut share_bytes = Vec::new();
+                    share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
                     let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
                     sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
             }
 
+            d.mask_shares.insert(i, share.clone());
+
             Ok(())
         }
     }
 
-    pub struct NodeRPCServerImpl {
-        d: Arc<Mutex<NodeRPCServerInternal>>,
+    pub struct NodeRPCServerImpl<F: FftField> {
+        d: Arc<Mutex<NodeRPCServerInternal<F>>>,
         id: Vec<u8>
     }
 
-    impl crate::rpc::RPCServerImpl for NodeRPCServerImpl {
-        type Internal = NodeRPCServerInternal;
+    impl<F: FftField> crate::rpc::RPCServerImpl for NodeRPCServerImpl<F> {
+        type Internal = NodeRPCServerInternal<F>;
 
         fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self {
             Self { d: internal, id }
@@ -210,21 +211,21 @@ pub mod node_rpc {
         }
     }
 
-    pub struct NodeRPCServerInternal {
+    pub struct NodeRPCServerInternal<F: FftField> {
         index_to_client: HashMap<u64, ClientIdentity>,
         client_to_index: HashMap<ClientIdentity, u64>,
         sinks: HashMap<ClientIdentity, SubscriptionSink>,
-        mask_shares: HashMap<u64, Vec<u8>>,
+        mask_shares: HashMap<u64, RobustShare<F>>,
         clients: HashMap<Vec<u8>, ClientInfo>,
     }
 
-    impl crate::rpc::RPCServerInternal for NodeRPCServerInternal {
+    impl<F: FftField> crate::rpc::RPCServerInternal for NodeRPCServerInternal<F> {
         fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
             self.clients.insert(cert_der.clone(), ClientInfo { cert: cert_der, thread: client_handle, stop_tx });
         }
     }
 
-    impl NodeRPCServerInternal {
+    impl<F: FftField> NodeRPCServerInternal<F> {
         pub fn new() -> Self {
             Self {
                 index_to_client: HashMap::new(),
@@ -237,7 +238,7 @@ pub mod node_rpc {
     }
 
     #[async_trait]
-    impl OffChainNodeRPCServer for NodeRPCServerImpl {
+    impl<F: FftField> OffChainNodeRPCServer for NodeRPCServerImpl<F> {
         async fn receive_mask_share(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
             use OffChainNodeRPCServerError::*;
 
@@ -254,8 +255,20 @@ pub mod node_rpc {
             }
 
             if let Some(i) = d.client_to_index.get(&self.id) {
-                if let Some(share_bytes) = d.mask_shares.get(i) {
-                    let json = match to_json_raw_value(share_bytes) {
+                if let Some(share) = d.mask_shares.get(i) {
+                    let mut share_bytes = Vec::new();
+                    match share.serialize_compressed(&mut share_bytes) {
+                        Ok(_) => { },
+                        Err(e) => {
+                            pending.reject(ErrorObjectOwned::owned(
+                                    ErrorCode::ServerError(SerializationError as i32).code(),
+                                    format!("Serializing share bytes failed: {e}"),
+                                    None::<()>)
+                            ).await;
+                            return Ok(());
+                        }
+                    };
+                    let json = match to_json_raw_value(&share_bytes) {
                         Ok(j) => j,
                         Err(e) => {
                             pending.reject(ErrorObjectOwned::owned(
@@ -284,8 +297,10 @@ pub mod node_rpc {
 
 
 pub mod events {
+    use ark_ff::FftField;
     use serde::{Serialize, Deserialize};
     use super::ClientIdentity;
+    use crate::rpc::FieldElement;
     use downcast_rs::{Downcast, impl_downcast};
     use dyn_clone::{DynClone, clone_trait_object};
     //    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
@@ -326,9 +341,10 @@ pub mod events {
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub struct MaskedInputEvent {
+    #[serde(bound = "")]
+    pub struct MaskedInputEvent<F: FftField> {
         pub client: ClientIdentity,
-        pub masked_input: Vec<u8>,
+        pub masked_input: FieldElement<F>,
         pub reserved_index: u64
     }
 
@@ -416,8 +432,11 @@ fn round_before(current: Round) -> Round {
     }
 }
 
-#[rpc(server, client)]
-pub trait CoordinatorRPC {
+#[rpc(server, client,
+    server_bounds(F: FftField),
+    client_bounds(F: FftField)
+)]
+pub trait CoordinatorRPC<F: FftField> {
     //        function DEFAULT_ADMIN_ROLE() external view returns (bytes32);
     //        function DESIGNATED_PARTY_ROLE() external view returns (bytes32);
     //        function PARTY_ROLE() external view returns (bytes32);
@@ -468,12 +487,12 @@ pub trait CoordinatorRPC {
     async fn sub_start_pp(&self, timestamp: u64) -> SubscriptionResult;
 
     #[method(name = "submit_masked_input")]
-    async fn submit_masked_input(&self, masked_input: Vec<u8>, reserved_index: u64) -> RpcResult<()>;
+    async fn submit_masked_input(&self, masked_input: FieldElement<F>, reserved_index: u64) -> RpcResult<()>;
 
     #[subscription(name = "sub_reserved_indices", unsubscribe = "unsub_reserved_indices", item = ReservedInputEvent)]
     async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
 
-    #[subscription(name = "sub_masked_inputs", unsubscribe = "unsub_masked_inputs", item = MaskedInputEvent)]
+    #[subscription(name = "sub_masked_inputs", unsubscribe = "unsub_masked_inputs", item = MaskedInputEvent<F>)]
     async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
 
     #[method(name = "transition")]
@@ -486,22 +505,22 @@ pub trait CoordinatorRPC {
     async fn obtain_output_shares(&self) -> SubscriptionResult;
 }
 
-struct CoordinatorRPCServerImpl {
-    d: Arc<Mutex<CoordinatorRPCServerImplInternal>>,
+struct CoordinatorRPCServerImpl<F: FftField> {
+    d: Arc<Mutex<CoordinatorRPCServerImplInternal<F>>>,
     id: ClientIdentity
 }
 
-struct CoordinatorRPCServerImplInternal {
+struct CoordinatorRPCServerImplInternal<F: FftField> {
     // contains the sinks of clients, which subscribed to the transition to the given round
     sinks: HashMap<Round, Vec<SubscriptionSink>>,
     trans_events: HashMap<Round, Vec<(u64, Box<dyn TransitionEvent>)>>,
     reserved_index_events: Vec<(u64, ReservedInputEvent)>,
     reserved_index_sinks: Vec<SubscriptionSink>,
-    masked_input_events: Vec<(u64, MaskedInputEvent)>,
+    masked_input_events: Vec<(u64, MaskedInputEvent<F>)>,
     masked_input_sinks: Vec<SubscriptionSink>,
     next_i: u64,
     reserved_indices: Vec<Option<ClientIdentity>>,
-    masked_inputs: Vec<Option<Vec<u8>>>,
+    masked_inputs: Vec<Option<F>>,
     round: Round,
     prog_hash: [u8; 32],
     n: u64,
@@ -512,7 +531,7 @@ struct CoordinatorRPCServerImplInternal {
     output_sinks: HashMap<ClientIdentity, SubscriptionSink>,
 }
 
-impl CoordinatorRPCServerImplInternal {
+impl<F: FftField> CoordinatorRPCServerImplInternal<F> {
     pub fn new(prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> Self {
         Self {
             sinks: HashMap::from([
@@ -652,14 +671,14 @@ impl CoordinatorRPCServerImplInternal {
     }
 }
 
-impl crate::rpc::RPCServerInternal for CoordinatorRPCServerImplInternal {
+impl<F: FftField> crate::rpc::RPCServerInternal for CoordinatorRPCServerImplInternal<F> {
     fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
         self.add_client(cert_der, client_handle, stop_tx);
     }
 }
 
-impl crate::rpc::RPCServerImpl for CoordinatorRPCServerImpl {
-    type Internal = CoordinatorRPCServerImplInternal;
+impl<F: FftField> crate::rpc::RPCServerImpl for CoordinatorRPCServerImpl<F> {
+    type Internal = CoordinatorRPCServerImplInternal<F>;
 
     fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
         Self { d: internal, id }
@@ -684,7 +703,7 @@ pub enum CoordinatorRPCError {
 }
 
 #[async_trait]
-impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
+impl<F: FftField> CoordinatorRPCServer<F> for CoordinatorRPCServerImpl<F> {
     async fn sub_collect_inputs(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
@@ -753,7 +772,7 @@ impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
         d.subscribe_oneshot::<PreprocessingStarted>(pending, timestamp, Round::Preprocessing).await
     }
 
-    async fn submit_masked_input(&self, masked_input: Vec<u8>, raw_reserved_index: u64) -> RpcResult<()> {
+    async fn submit_masked_input(&self, masked_input: FieldElement<F>, raw_reserved_index: u64) -> RpcResult<()> {
         let mut d = self.d.lock().await;
 
         if d.round != Round::InputCollection {
@@ -790,7 +809,7 @@ impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
                             None::<()>
                     ));
                 }
-                d.masked_inputs[reserved_index] = Some(masked_input.clone());
+                d.masked_inputs[reserved_index] = Some(masked_input.value);
 
                 let event = MaskedInputEvent { client: self.id.clone(), masked_input, reserved_index: raw_reserved_index };
                 for sink in &d.masked_input_sinks {
@@ -950,7 +969,7 @@ impl CoordinatorRPCServer for CoordinatorRPCServerImpl {
 }
 
 pub struct OffChainCoordinator<F: FftField> {
-    rpc_server: Option<Arc<Mutex<CoordinatorRPCServerImplInternal>>>,
+    rpc_server: Option<Arc<Mutex<CoordinatorRPCServerImplInternal<F>>>>,
     rpc_coord: Option<Client>,
     addr: Option<String>,
     port: Option<u16>,
@@ -959,7 +978,6 @@ pub struct OffChainCoordinator<F: FftField> {
     t: u64,
     n_outputs: Option<u64>,
     key_der: Option<Vec<u8>>,
-    _phantom: PhantomData<F>,
 }
 
 impl<F: FftField> OffChainCoordinator<F> {
@@ -968,8 +986,8 @@ impl<F: FftField> OffChainCoordinator<F> {
     }
 
     pub async fn start_coord(addr: &str, port: u16, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_outputs: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-        let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::new(prog_hash, n, t, initial_mpc_nodes.clone(), initial_mpc_nodes.len() as u64)));
-        let server_handle = crate::rpc::start_coord::<CoordinatorRPCServerImpl>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+        let rpc_server_data = Arc::new(Mutex::new(CoordinatorRPCServerImplInternal::<F>::new(prog_hash, n, t, initial_mpc_nodes.clone(), initial_mpc_nodes.len() as u64)));
+        let server_handle = crate::rpc::start_coord::<CoordinatorRPCServerImpl<F>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
         Self {
             rpc_server: Some(rpc_server_data),
             rpc_coord: None,
@@ -980,7 +998,6 @@ impl<F: FftField> OffChainCoordinator<F> {
             t,
             n_outputs: None,
             key_der: None,
-            _phantom: PhantomData,
         }
     }
 
@@ -1001,8 +1018,7 @@ impl<F: FftField> OffChainCoordinator<F> {
             t,
             n_outputs: Some(n_outputs),
             key_der: Some(key_der),
-            _phantom: PhantomData,
-         }
+        }
     }
 
     pub fn get_addr(&self) -> String {
@@ -1012,6 +1028,10 @@ impl<F: FftField> OffChainCoordinator<F> {
     pub fn get_timestamp(&self) -> u64 {
         self.timestamp.expect("Coordinator server not started")
     }
+
+    fn rpc(&self) -> &Client {
+        self.rpc_coord.as_ref().expect("client not started")
+    }
 }
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
@@ -1019,8 +1039,123 @@ static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 impl<F: FftField> Coordinator<F> for OffChainCoordinator<F> {
     type ClientIdentity = ClientIdentity;
 
+    async fn trigger_input(&self) -> Result<(), CoordinatorError> {
+        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::InputCollection).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
+        match CoordinatorRPCClient::<F>::transition(self.rpc(), Round::Preprocessing).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
+        }
+    }
+
+    async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
+        match CoordinatorRPCClient::<F>::transition(self.rpc(), Round::InputMaskReservation).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
+        }
+    }
+
+    async fn wait_for_input(&self) -> Result<(), CoordinatorError> {
+        let mut sub = CoordinatorRPCClient::<F>::sub_collect_inputs(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        if let Some(Ok(_)) = sub.next().await {
+            Ok(())
+        } else {
+            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+        }
+    }
+
+    async fn wait_for_pp(&self) -> Result<(), CoordinatorError> {
+        let mut sub = CoordinatorRPCClient::<F>::sub_start_pp(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        if let Some(Ok(_)) = sub.next().await {
+            Ok(())
+        } else {
+            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+        }
+    }
+
+    async fn wait_for_input_mask_init(&self) -> Result<(), CoordinatorError> {
+        let mut sub = CoordinatorRPCClient::<F>::sub_reserve_input_masks(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        if let Some(Ok(_)) = sub.next().await {
+            Ok(())
+        } else {
+            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+        }
+    }
+
+    async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
+        let indices = CoordinatorRPCClient::<F>::obtain_mask_indices(self.rpc(), n_indices).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        Ok(indices)
+    }
+
+    async fn send_masked_input(&self, masked_input: F, i: u64) -> Result<(), CoordinatorError> {
+        match CoordinatorRPCClient::<F>::submit_masked_input(self.rpc(), FieldElement { value: masked_input }, i).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
+        }
+    }
+
+    async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<F>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<F>>>, CoordinatorError> {
+        let mut sub = CoordinatorRPCClient::<F>::sub_masked_inputs(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        let mut map = HashMap::new();
+
+        for _ in 0..n_clients {
+            if let Some(Ok(MaskedInputEvent { client, masked_input, reserved_index })) = sub.next().await {
+                let i = reserved_index as usize;
+                let mask_share = &mask_shares[i];
+                let input = RobustShare::new(
+                    masked_input.value - mask_share.share[0],
+                    mask_share.id,
+                    mask_share.degree
+                );
+
+                map.insert(client, vec![input]);
+            } else {
+                return Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()));
+            }
+        }
+
+        Ok(map)
+    }
+
+    async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
+        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::MPC).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
+
+    async fn wait_for_mpc(&self) -> Result<(), CoordinatorError> {
+        let mut sub = CoordinatorRPCClient::<F>::sub_start_mpc(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        if let Some(Ok(_)) = sub.next().await {
+            Ok(())
+        } else {
+            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+        }
+    }
+
+    async fn trigger_outputs(&self) -> Result<(), CoordinatorError> {
+        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::Output).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
+
+    async fn wait_for_outputs(&self) -> Result<(), CoordinatorError> {
+        let mut sub = CoordinatorRPCClient::<F>::sub_send_outputs(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        if let Some(Ok(_)) = sub.next().await {
+            Ok(())
+        } else {
+            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
+        }
+    }
+
     async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_reserved_indices(self.get_timestamp()).await.unwrap();
+        let mut sub = CoordinatorRPCClient::<F>::sub_reserved_indices(self.rpc(), self.get_timestamp()).await.unwrap();
 
         let mut map = HashMap::new();
 
@@ -1036,134 +1171,12 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinator<F> {
         Ok(map)
     }
 
-    async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<F>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<F>>>, CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_masked_inputs(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        let mut map = HashMap::new();
-
-        for _ in 0..n_clients {
-            if let Some(Ok(MaskedInputEvent { client, masked_input, reserved_index })) = sub.next().await {
-                let masked_value: F = CanonicalDeserialize::deserialize_compressed(
-                    masked_input.as_slice(),
-                ).map_err(|_| CoordinatorError::DeserializationError)?;
-                let i = reserved_index as usize;
-                let mask_share = &mask_shares[i];
-                let input = RobustShare::new(
-                    masked_value - mask_share.share[0],
-                    mask_share.id,
-                    mask_share.degree
-                );
-
-                map.insert(client, vec![input]);
-            } else {
-                return Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()));
-            }
-        }
-
-        Ok(map)
-    }
-
-    async fn trigger_input(&self) -> Result<(), CoordinatorError> {
-        self.rpc_coord.as_ref().expect("client not started").transition(Round::InputCollection).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        Ok(())
-    }
-
-    async fn wait_for_input(&self) -> Result<(), CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_collect_inputs(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        if let Some(Ok(_)) = sub.next().await {
-            Ok(())
-        } else {
-            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
-        }
-    }
-
-    async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
-        match self.rpc_coord.as_ref().expect("client not started").transition(Round::Preprocessing).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
-        }
-    }
-
-    async fn wait_for_pp(&self) -> Result<(), CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_start_pp(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        if let Some(Ok(_)) = sub.next().await {
-            Ok(())
-        } else {
-            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
-        }
-    }
-
-    async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
-        match self.rpc_coord.as_ref().expect("client not started").transition(Round::InputMaskReservation).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
-        }
-    }
-
-    async fn wait_for_input_mask_init(&self) -> Result<(), CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_reserve_input_masks(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        if let Some(Ok(_)) = sub.next().await {
-            Ok(())
-        } else {
-            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
-        }
-    }
-
-    async fn send_masked_input(&self, masked_input: F, i: u64) -> Result<(), CoordinatorError> {
-        let mut bytes = Vec::new();
-        masked_input.serialize_compressed(&mut bytes)
-            .map_err(|_| CoordinatorError::SerializationError)?;
-        match self.rpc_coord.as_ref().expect("client not started").submit_masked_input(bytes, i).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
-        }
-    }
-
-
-    async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
-        self.rpc_coord.as_ref().expect("client not started").transition(Round::MPC).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
-    }
-
-    async fn wait_for_mpc(&self) -> Result<(), CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_start_mpc(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        if let Some(Ok(_)) = sub.next().await {
-            Ok(())
-        } else {
-            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
-        }
-    }
-
-    async fn trigger_outputs(&self) -> Result<(), CoordinatorError> {
-        self.rpc_coord.as_ref().expect("client not started").transition(Round::Output).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
-    }
-
-    async fn wait_for_outputs(&self) -> Result<(), CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_send_outputs(self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        if let Some(Ok(_)) = sub.next().await {
-            Ok(())
-        } else {
-            Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()))
-        }
-    }
-
-    async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
-        let indices = self.rpc_coord.as_ref().expect("client not started").obtain_mask_indices(n_indices).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        Ok(indices)
-    }
-
     async fn finalize(&self) -> Result<(), CoordinatorError> {
-        self.rpc_coord.as_ref().expect("client not started").transition(Round::Idle).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
+        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::Idle).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn obtain_outputs(&self) -> Result<Vec<F>, CoordinatorError> {
-        let mut sub = match self.rpc_coord.as_ref().expect("client not started").obtain_output_shares().await {
+        let mut sub = match CoordinatorRPCClient::<F>::obtain_output_shares(self.rpc()).await {
             Ok(sub) => sub,
             Err(e) => {
                 return Err(CoordinatorError::JSONError(e.to_string()));
@@ -1241,7 +1254,7 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinator<F> {
         ).map_err(|_| CoordinatorError::EncryptionError)?;
         let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
 
-        if let Err(e) = self.rpc_coord.as_ref().expect("client not started").send_output_shares(client_id, c).await {
+        if let Err(e) = CoordinatorRPCClient::<F>::send_output_shares(self.rpc(), client_id, c).await {
             return Err(CoordinatorError::JSONError(e.to_string()));
         }
 
