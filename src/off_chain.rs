@@ -113,7 +113,7 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= 2 * self.t + 1 {
-                    match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
+                    match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
                         Ok((_, mask)) => {
                             return Ok(mask);
                         }
@@ -1219,7 +1219,7 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinator<F> {
                 let shares_i: Vec<_> = output_shares.iter().map(|shares| shares[i].clone()).collect();
 
                 // at least 2t+1 shares available as checked previously by the coordinator
-                match RobustShare::recover_secret(&shares_i, (4 * self.t + 1) as usize) {
+                match RobustShare::recover_secret(&shares_i, (4 * self.t + 1) as usize, self.t as usize) {
                     Ok((_, output_i)) => {
                         Some(output_i)
                     }
