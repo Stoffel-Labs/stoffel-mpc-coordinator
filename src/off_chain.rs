@@ -1029,7 +1029,7 @@ impl<F: FftField> OffChainCoordinator<F> {
     }
 
     fn rpc(&self) -> &Client {
-        self.rpc()
+        self.rpc_coord.as_ref().expect("client not started")
     }
 }
 
