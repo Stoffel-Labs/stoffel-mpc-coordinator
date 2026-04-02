@@ -20,7 +20,7 @@ pub trait Coordinator<F: FftField> {
     fn wait_for_input(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_pp(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_input_mask_init(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn obtain_mask_indices(&mut self, n_indices: u64) -> impl Future<Output = Result<Vec<u64>, CoordinatorError>>;
+    fn reserve_mask_index(&mut self, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn send_masked_input(&self, masked_input: F, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<F>>) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<RobustShare<F>>>, CoordinatorError>>;
     fn trigger_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;

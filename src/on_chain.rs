@@ -549,12 +549,11 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             .from_block(self.contract_block)
             .watch()
             .await.unwrap().into_stream();
-
-        while let Some(Ok((ReservedInputEvent { client, reservedIndices }, _))) = events.next().await {
-            assert_eq!(reservedIndices.len(), 1);
-            addr_to_i.insert(client, u256_to_u64(reservedIndices[0]).expect("conversion from U256 to u64 failed"));
+        
+        while let Some(Ok((ReservedInputEvent { client, reservedIndex }, _))) = events.next().await {
+            addr_to_i.insert(client, u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"));
             eprintln!("[party] Recorded reserved mask index {} for client address {:?}",
-                     reservedIndices[0], client);
+                     reservedIndex, client);
             if addr_to_i.len() as u64 == n_clients {
                 break;
             }
@@ -717,8 +716,8 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         }
     }
 
-    async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
-        let builder = self.coord.obtainInputMasks(U256::from(n_indices));
+    async fn reserve_mask_index(&mut self, i: u64) -> Result<(), CoordinatorError> {
+        let builder = self.coord.reserveMaskIndex(U256::from(i));
         let tx = builder.send().await.expect("failed to send TX");
         let receipt = tx.get_receipt().await.expect("failed to get receipt");
 
@@ -726,26 +725,9 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             panic!();
         }
 
-        let mut indices = None;
+        // TODO: check if reservation successful
 
-        for log in receipt.inner.logs() {
-            if let Ok(e) = log.log_decode::<FakeCoordinator::ReservedInputEvent>() {
-                indices = Some(e.inner.reservedIndices.clone());
-                break;
-            }
-        }
-
-        if let Some(indices_u256) = indices {
-            let mut indices = Vec::new();
-            for i_u256 in indices_u256.iter() {
-                let i = u256_to_u64(*i_u256).ok_or(CoordinatorError::U256ToU64Error)?;
-                indices.push(i);
-            }
-
-            Ok(indices)
-        } else {
-            panic!("BUG: no ReservedInputEvent found in transaction logs, coordinator should emit such an event!!!");
-        }
+        Ok(())
     }
 
     async fn send_masked_input(&self, masked_input: Fr, i: u64) -> Result<(), CoordinatorError> {
@@ -766,7 +748,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
     }
 
     async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
-        let builder = self.coord.startMPC();
+        let builder = self.coord.startMpc();
         match builder.send().await {
             Ok(r) => {
                 match r.watch().await {
@@ -1041,10 +1023,8 @@ mod tests {
     pub async fn coord_creation_block() {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
-        let n = U256::from(5);
         let t = 1;
         let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
-        let designated_party = ACC[0];
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
@@ -1059,10 +1039,8 @@ mod tests {
         {
             let anvil = spawn_anvil();
             let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
-            let n = U256::from(5);
             let t = 1;
             let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
-            let designated_party = ACC[0];
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
@@ -1077,10 +1055,8 @@ mod tests {
         {
             let anvil = spawn_anvil();
             let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
-            let n = U256::from(5);
             let t = 1;
             let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
-            let designated_party = ACC[0];
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
@@ -1111,10 +1087,8 @@ mod tests {
         ];
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
-        let n = U256::from(5);
         let t = 1;
         let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
-        let designated_party = ACC[0];
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
@@ -1152,7 +1126,6 @@ mod tests {
         let n = 5;
         let t = 1;
         let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
-        let designated_party = ACC[0];
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
@@ -1268,20 +1241,19 @@ mod tests {
                 let _ = coord.wait_for_pp().await;
                 let _ = coord.wait_for_input_mask_init().await;
 
-                let indices = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
-                assert_eq!(indices.len(), 1);
-                println!("CLIENT: obtained index {}", indices[0]);
+                coord.reserve_mask_index(0).await.expect("obtaining mask indices failed");
+                println!("CLIENT: obtained index 0");
 
                 let base_nonce = coord.base_nonce().await;
                 let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
-                let sig = generate_client_sig(base_nonce, indices[0], signer.clone()).await;
+                let sig = generate_client_sig(base_nonce, 0, signer.clone()).await;
                 let mask = rpc_client.receive_mask(sig.into(), ACC[5]).await.unwrap();
                 assert_eq!(mask, correct_mask);
 
                 let _ = coord.wait_for_input().await;
 
                 let masked_input = mask + Fr::from(1337);
-                coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
+                coord.send_masked_input(Fr::from(masked_input), 0).await.unwrap();
 
                 let _ = coord.wait_for_mpc().await;
                 let _ = coord.wait_for_outputs().await;
