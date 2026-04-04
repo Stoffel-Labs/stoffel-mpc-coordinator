@@ -4,14 +4,14 @@ pub mod on_chain;
 pub mod off_chain;
 
 use std::future::Future;
-use ark_bls12_381::Fr;
+use ark_ff::FftField;
 use thiserror::Error;
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use std::sync::Once;
 
-pub trait Coordinator {
+pub trait Coordinator<F: FftField> {
     type ClientIdentity;
 
     fn trigger_input(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
@@ -21,16 +21,16 @@ pub trait Coordinator {
     fn wait_for_pp(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_input_mask_init(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn obtain_mask_indices(&mut self, n_indices: u64) -> impl Future<Output = Result<Vec<u64>, CoordinatorError>>;
-    fn send_masked_input(&self, masked_input: Fr, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<Fr>>) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<RobustShare<Fr>>>, CoordinatorError>>;
+    fn send_masked_input(&self, masked_input: F, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
+    fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<F>>) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<RobustShare<F>>>, CoordinatorError>>;
     fn trigger_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn trigger_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_outputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
     fn wait_for_indices(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, u64>, CoordinatorError>>;
     fn finalize(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-    fn obtain_outputs(&self) -> impl Future<Output = Result<Vec<Fr>, CoordinatorError>>;
-    fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> impl Future<Output = Result<(), CoordinatorError>>;
+    fn obtain_outputs(&self) -> impl Future<Output = Result<Vec<F>, CoordinatorError>>;
+    fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<F>>) -> impl Future<Output = Result<(), CoordinatorError>>;
 }
 
 #[derive(Error, Clone, Debug, Serialize, Deserialize)]

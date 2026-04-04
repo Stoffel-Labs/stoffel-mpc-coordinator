@@ -20,10 +20,10 @@ use super::{Coordinator, CoordinatorError};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::common::SecretSharingScheme;
 use hpke::{
-    aead::AesGcm256, 
-    kdf::HkdfSha256, 
+    aead::AesGcm256,
+    kdf::HkdfSha256,
     kem::{DhP256HkdfSha256, Kem},
-    single_shot_open, single_shot_seal, 
+    single_shot_open, single_shot_seal,
     Deserializable, Serializable,
     OpModeR, OpModeS,
 };
@@ -127,7 +127,7 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= 2 * self.t + 1 {
-                    match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1) {
+                    match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
                         Ok((_, mask)) => {
                             return Ok(mask);
                         }
@@ -207,7 +207,7 @@ pub mod node_rpc {
 
             Ok(())
         }
-        
+
         // called when preprocessing has generated the mask shares
         pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) -> Result<(), NodeRPCError> {
             let mut d = self.rpc_server.lock().await;
@@ -457,7 +457,7 @@ pub async fn ws_connect(addr: &str, wallet_sk: &str) -> impl Provider + WalletPr
 }
 
 pub async fn setup_coord<T>(eth: T, contract_addr: Address, t: u64, n_outputs: u64, key_der: Option<Vec<u8>>)
-    -> OnChainCoordinator<T> 
+    -> OnChainCoordinator<T>
     where T: Provider + WalletProvider + Clone {
     let coord_instance = FakeCoordinator::new(contract_addr, eth.clone());
     OnChainCoordinator::new(coord_instance, t, n_outputs, key_der).await
@@ -494,7 +494,7 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for ClientAuthenticated events: {}", e)));
             }
        };
-    
+
         match events.next().await {
             Some(Ok((FakeCoordinator::ClientAuthenticated { client, success }, _))) => {
                 Ok(success)
@@ -507,12 +507,12 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
 
     pub async fn grant_roles(&self, nodes: Vec<Address>) -> Result<(), CoordinatorError> {
         assert_eq!(nodes.len(), 5);
-    
+
         let party_role = {
             let builder = self.coord.PARTY_ROLE();
             builder.call().await.expect("sending TX failed")
         };
-    
+
         // grant party roles
         for i in 0..nodes.len() {
             let builder = self.coord.grantRole(party_role, nodes[i]);
@@ -537,7 +537,7 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 
-impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P> {
+impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinator<P> {
     type ClientIdentity = Address;
 
     async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
@@ -549,7 +549,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             .from_block(self.contract_block)
             .watch()
             .await.unwrap().into_stream();
-        
+
         while let Some(Ok((ReservedInputEvent { client, reservedIndices }, _))) = events.next().await {
             assert_eq!(reservedIndices.len(), 1);
             addr_to_i.insert(client, u256_to_u64(reservedIndices[0]).expect("conversion from U256 to u64 failed"));
@@ -574,7 +574,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MaskedInputEvent events: {}", e)));
             }
         };
-    
+
         let mut inputs: HashMap<ClientIdentity, Vec<RobustShare<Fr>>> = HashMap::new();
         for _ in 0..n_clients {
             match events.next().await {
@@ -616,7 +616,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn wait_for_input(&self) -> Result<(), CoordinatorError> {
         let mut events = match self.coord
             .InputCollectionStarted_filter()
@@ -628,7 +628,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for InputCollectionStarted events: {}", e)));
             }
         };
-    
+
         match events.next().await {
             Some(Ok((_, _))) => {
                 Ok(())
@@ -638,7 +638,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
         let builder = self.coord.startPreprocessing();
         match builder.send().await {
@@ -655,7 +655,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn wait_for_pp(&self) -> Result<(), CoordinatorError> {
         let mut events = match self.coord
             .PreprocessingStarted_filter()
@@ -667,7 +667,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for PreprocessingStarted events: {}", e)));
             }
         };
-    
+
         match events.next().await {
             Some(Ok((_, _))) => {
                 Ok(())
@@ -677,7 +677,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
         let builder = self.coord.reserveInputMasks();
         match builder.send().await {
@@ -694,7 +694,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn wait_for_input_mask_init(&self) -> Result<(), CoordinatorError> {
         let mut events = match self.coord
             .InputMaskReservationStarted_filter()
@@ -706,7 +706,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for InputMaskReservationStarted events: {}", e)));
             }
         };
-    
+
         match events.next().await {
             Some(Ok((_, _))) => {
                 Ok(())
@@ -716,7 +716,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
         let builder = self.coord.obtainInputMasks(U256::from(n_indices));
         let tx = builder.send().await.expect("failed to send TX");
@@ -731,7 +731,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
         for log in receipt.inner.logs() {
             if let Ok(e) = log.log_decode::<FakeCoordinator::ReservedInputEvent>() {
                 indices = Some(e.inner.reservedIndices.clone());
-                break; 
+                break;
             }
         }
 
@@ -764,7 +764,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
         let builder = self.coord.startMPC();
         match builder.send().await {
@@ -781,7 +781,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn wait_for_mpc(&self) -> Result<(), CoordinatorError> {
         let mut events = match self.coord
             .MPCStarted_filter()
@@ -793,7 +793,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MPCStarted events: {}", e)));
             }
         };
-    
+
         match events.next().await {
             Some(Ok((_, _))) => {
                 Ok(())
@@ -803,7 +803,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn trigger_outputs(&self) -> Result<(), CoordinatorError> {
         let builder = self.coord.sendOutputs();
         match builder.send().await {
@@ -820,7 +820,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
             }
         }
     }
-    
+
     async fn wait_for_outputs(&self) -> Result<(), CoordinatorError> {
         let mut events = match self.coord
             .OutputSendingStarted_filter()
@@ -832,7 +832,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for OutputSendingStarted events: {}", e)));
             }
         };
-    
+
         match events.next().await {
             Some(Ok((_, _))) => {
                 Ok(())
@@ -880,7 +880,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MPCStarted events: {}", e)));
             }
         };
-    
+
         while let Some(Ok((EnoughPrivateOutputShares { client: _, shares }, _))) = events.next().await {
             if (shares.len() as u64) < 2 * self.t + 1 {
                 panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
@@ -908,7 +908,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator for OnChainCoordinator<P>
                 let shares_i: Vec<_> = output_shares.iter().map(|shares| shares[i].clone()).collect();
 
                 // at least 2t+1 shares available as checked previously by the coordinator
-                match RobustShare::recover_secret(&shares_i, (4 * self.t + 1) as usize) {
+                match RobustShare::recover_secret(&shares_i, (4 * self.t + 1) as usize, self.t as usize) {
                     Ok((_, output_i)) => {
                         Some(output_i)
                     }
@@ -1011,7 +1011,7 @@ mod tests {
     fn spawn_anvil() -> AnvilInstance {
         Anvil::new().spawn()
     }
-    
+
     #[test]
     pub fn fr_u256_conversion() {
         let mut rng = rand::rng();
@@ -1048,7 +1048,7 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
         let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
         assert_eq!(coord.contract_block, 1);
     }
@@ -1066,7 +1066,7 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             coord.trigger_pp().await.unwrap();
@@ -1084,7 +1084,7 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             tokio::spawn({
@@ -1118,7 +1118,7 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, n, U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
 
         // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
         let mut node_rpcs = Vec::new();
@@ -1157,7 +1157,7 @@ mod tests {
         let n_inputs = U256::from(1);
 
         let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(n), U256::from(t), designated_party, initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
 
         let barrier = Arc::new(Barrier::new(3));
 
