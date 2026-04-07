@@ -13,7 +13,7 @@ pub mod on_chain;
 pub mod off_chain;
 
 use std::future::Future;
-use ark_bls12_381::Fr;
+use ark_ff::FftField;
 use thiserror::Error;
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};

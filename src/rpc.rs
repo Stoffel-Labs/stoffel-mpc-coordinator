@@ -52,7 +52,7 @@ pub struct ClientInfo {
 }
 
 /// The internal state of a JSON-RPC server. This is shared state across all client connections.
-pub trait RPCServerInternal {
+pub trait RPCServerShared {
     fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle);
 }
 
@@ -60,14 +60,14 @@ pub trait RPCServerInternal {
 /// some cross-client shared state of the server and also stores the client's public key.
 /// This allows the JSON-RPC methods that implement a `jsonrpsee` trait created using the `#rpc`
 /// attribute to access such client-specific information, in particular the client's identity.
-pub trait RPCServerImpl {
-    type Internal : RPCServerInternal + 'static + Send;
+pub trait RPCServerConnection {
+    type Internal : RPCServerShared + 'static + Send;
     fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self;
     fn into_rpc(self) -> RpcModule<Self> where Self: Sized;
 }
 
 /// Starts a JSON-RPC server, which listens for Websocket connections over TLS.
-pub async fn start_coord<T: RPCServerImpl>(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>, rpc_server_data: Arc<Mutex<T::Internal>>) -> JoinHandle<()> {
+pub async fn start_coord<T: RPCServerConnection>(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>, rpc_server_data: Arc<Mutex<T::Internal>>) -> JoinHandle<()> {
     let full_addr = format!("{}:{}", addr, port);
     let tls_config = self_signed_certs::server_tls_config(cert_der, key_der);
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
