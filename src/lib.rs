@@ -61,8 +61,8 @@ pub trait Coordinator<F: FftField> {
     /// Blocking-waits for round `round` to be triggered.
     fn wait_for_round(&self, round: Round) -> impl Future<Output = Result<(), CoordinatorError>>;
 
-    /// Used by MPC clients to obtain `n_indices` mask indices.
-    fn obtain_mask_indices(&mut self, n_indices: u64) -> impl Future<Output = Result<Vec<u64>, CoordinatorError>>;
+    /// Used by MPC clients to obtain the index `i`.
+    fn reserve_mask_index(&mut self, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
 
     /// Used by MPC clients to send their masked input `masked_input` for the previously reserved index `i` via
     /// `obtain_mask_indices`.

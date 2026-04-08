@@ -1,7 +1,8 @@
 use std::fs;
 use clap::Parser;
 use x509_parser::prelude::*;
-use stoffel_mpc_coordinator::{rpc, off_chain::OffChainCoordinator};
+use stoffel_mpc_coordinator::off_chain::{OffChainCoordinatorServer, FakeCoordinatorConnection, CoordinatorRPCServerSharedBase};
+use ark_bls12_381::Fr;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -39,11 +40,10 @@ async fn main() {
 
     let n = args.n;
     let t = args.t;
-    let hash = hex::decode(args.hash).expect("invalid hash");
-    if hash.len() != 32 {
-        println!("hash must be 32 bytes");
-        panic!();
-    }
+    let hash: [u8; 32] = {
+        let h = hex::decode(args.hash).expect("invalid hash");
+        h.try_into().expect("hash should be 32 bytes")
+    };
 
     let public_keys = args.initial_mpc_nodes.iter().map(|cert_file| {
         let cert_der = fs::read(cert_file).expect("could not read certificate file");
@@ -58,11 +58,8 @@ async fn main() {
     
     let addr = "127.0.0.1";
     let port = 31415;
-<<<<<<< HEAD
-    let coord = OffChainCoordinator::start_coord(addr, port, hash.try_into().unwrap(), n, t, public_keys, server_cert_der, server_key_der).await;
-=======
-    let coord: OffChainCoordinator<ark_bls12_381::Fr> = OffChainCoordinator::start_coord(addr, port, hash.try_into().unwrap(), n, t, public_keys, 2, server_cert_der, server_key_der).await;
->>>>>>> feature/generic-fields
+    let server_state = CoordinatorRPCServerSharedBase::<Fr>::new(hash, n, t, public_keys, args.n_inputs);
+    let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord(server_state, addr, port, t, server_cert_der, server_key_der).await;
     let timestamp = coord.get_timestamp();
 
     println!("Listening on {}:{}", addr, port);

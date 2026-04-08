@@ -795,41 +795,18 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         }
     }
 
-    async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
-        let builder = self.coord.obtainInputMasks(U256::from(n_indices));
-        match builder.send().await {
-            Ok(tx) => {
-                let receipt = tx.get_receipt().await.expect("failed to get receipt");
+    async fn reserve_mask_index(&mut self, i: u64) -> Result<(), CoordinatorError> {
+        let builder = self.coord.reserveMaskIndex(U256::from(i));
+        let tx = builder.send().await.expect("failed to send TX");
+        let receipt = tx.get_receipt().await.expect("failed to get receipt");
 
-                if !receipt.status() {
-                    return Err(CoordinatorError::EthereumError("invalid receipt sending transaction to obtain input mask indices".to_string()));
-                }
-
-                let mut indices = None;
-
-                for log in receipt.inner.logs() {
-                    if let Ok(e) = log.log_decode::<StoffelCoordinator::ReservedInputEvent>() {
-                        indices = Some(e.inner.reservedIndices.clone());
-                        break; 
-                    }
-                }
-
-                if let Some(indices_u256) = indices {
-                    let mut indices = Vec::new();
-                    for i_u256 in indices_u256.iter() {
-                        let i = u256_to_u64(*i_u256).ok_or(CoordinatorError::U256ToU64Error)?;
-                        indices.push(i);
-                    }
-
-                    Ok(indices)
-                } else {
-                    panic!("BUG: no ReservedInputEvent found in transaction logs, coordinator should emit such an event!!!");
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to obtain input mask indices: {}", e)))
-            }
+        if !receipt.status() {
+            return Err(CoordinatorError::EthereumError("invalid receipt sending transaction to obtain input mask indices".to_string()));
         }
+
+        // TODO: check if reservation successful
+
+        Ok(())
     }
 
     async fn send_masked_input(&self, masked_input: Fr, i: u64) -> Result<(), CoordinatorError> {
@@ -860,7 +837,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                         }
                     }
                 } else {
-                    e.to_string()
+                    "Unknown error".to_string()
                 };
                 Err(CoordinatorError::EthereumError(format!("error sending transaction to submit masked inputs: {}", msg)))
             }
@@ -1269,20 +1246,19 @@ mod tests {
                 let _ = coord.wait_for_round(Round::Preprocessing).await;
                 let _ = coord.wait_for_round(Round::InputMaskReservation).await;
 
-                let indices = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
-                assert_eq!(indices.len(), 1);
-                println!("CLIENT: obtained index {}", indices[0]);
+                coord.reserve_mask_index(0).await.expect("obtaining mask indices failed");
+                println!("CLIENT: obtained index 0");
 
                 let base_nonce = coord.base_nonce().await;
                 let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
-                let sig = generate_client_sig(base_nonce, indices[0], signer.clone()).await;
+                let sig = generate_client_sig(base_nonce, 0, signer.clone()).await;
                 let mask = rpc_client.receive_mask(sig.into(), ACC[5]).await.unwrap();
                 assert_eq!(mask, correct_mask);
 
                 let _ = coord.wait_for_round(Round::InputCollection).await;
 
                 let masked_input = mask + Fr::from(1337);
-                coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
+                coord.send_masked_input(Fr::from(masked_input), 0).await.unwrap();
 
                 let _ = coord.wait_for_round(Round::MPCExecution).await;
                 let _ = coord.wait_for_round(Round::OutputDistribution).await;

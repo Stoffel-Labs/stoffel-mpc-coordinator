@@ -360,7 +360,7 @@ pub enum Event<F: FftField> {
     },
     ReservedInputEvent {
         client: ClientIdentity,
-        reserved_indices: Vec<u64>
+        reserved_index: u64
     },
     PreprocessingStarted {
         designated_party: ClientIdentity,
@@ -414,9 +414,9 @@ pub trait CoordinatorRPCBase<F: FftField> {
     #[method(name = "available_input_masks")]
     async fn available_input_masks(&self) -> RpcResult<u64>;
 
-    /// MPC clients can request `n_indices` mask indices.
-    #[method(name = "obtain_input_masks")]
-    async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>>;
+    /// MPC clients can request index `i`.
+    #[method(name = "reserve_mask_index")]
+    async fn reserve_mask_index(&self, i: u64) -> RpcResult<()>;
 
     /// The designated party can reset the coordinator with this method.
     #[method(name = "reset")]
@@ -459,7 +459,7 @@ pub enum CoordinatorRPCBaseError {
 /// The basic server-side information for one client connection to the coordinator RPC interface.
 /// Can be extended by the developer.
 #[derive(Clone)]
-struct CoordinatorRPCServerConnectionBase<F: FftField> {
+pub struct CoordinatorRPCServerConnectionBase<F: FftField> {
     /// A reference to the server's shared state.
     d: Arc<Mutex<CoordinatorRPCServerSharedBase<F>>>,
     /// The connected client's identity, which is the client's public key in DER format.
@@ -468,7 +468,7 @@ struct CoordinatorRPCServerConnectionBase<F: FftField> {
 
 /// The basic internal state of the coordinator RPC server.
 /// Can be extended by the developer.
-struct CoordinatorRPCServerSharedBase<F: FftField> {
+pub struct CoordinatorRPCServerSharedBase<F: FftField> {
     // Contains the sinks of clients, which subscribed to the transition to the given round.
     sinks: HashMap<Round, Vec<SubscriptionSink>>,
     // Stores events that some round has been triggered along with a timestamp when it was
@@ -478,8 +478,7 @@ struct CoordinatorRPCServerSharedBase<F: FftField> {
     reserved_index_sinks: Vec<SubscriptionSink>,
     masked_input_events: Vec<(u64, Event<F>)>,
     masked_input_sinks: Vec<SubscriptionSink>,
-    /// The next mask index to be returned to a client.
-    next_i: u64,
+    n_reserved: u64,
     reserved_indices: Vec<Option<ClientIdentity>>,
     masked_inputs: Vec<Option<F>>,
     /// The current round.
@@ -525,7 +524,7 @@ impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
             reserved_index_sinks: vec![],
             masked_input_events: vec![],
             masked_input_sinks: vec![],
-            next_i: 0,
+            n_reserved: 0,
             reserved_indices: vec![None; n_inputs as usize],
             masked_inputs: vec![None; n_inputs as usize],
             round: Round::Idle,
@@ -666,7 +665,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
     async fn available_input_masks(&self) -> RpcResult<u64> {
         let d = self.d.lock().await;
 
-        Ok(d.masked_inputs.len() as u64 - d.next_i)
+        Ok(d.masked_inputs.len() as u64 - d.n_reserved)
     }
 
     async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()> {
@@ -690,8 +689,8 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         }
 
         d.round = Round::Idle;
-        d.next_i = 0;
         d.masked_inputs = vec![None; n_inputs as usize];
+        d.n_reserved = 0;
         d.reserved_indices = vec![None; n_inputs as usize];
         d.prog_hash = prog_hash;
         d.n = n;
@@ -771,7 +770,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         d.subscribe_masked_inputs(pending, timestamp).await
     }
 
-    async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>> {
+    async fn reserve_mask_index(&self, i: u64) -> RpcResult<()> {
         let mut d = self.d.lock().await;
 
         if d.round != Round::InputMaskReservation {
@@ -782,32 +781,36 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
             ));
         }
 
-        if d.next_i + n_indices > d.masked_inputs.len() as u64 {
+        if i as usize >= d.reserved_indices.len() {
             return Err(ErrorObjectOwned::owned(
-                    OutOfIndices as i32,
-                    format!("Cannot return {} indices, only have {} left.", n_indices, d.masked_inputs.len() as u64 - d.next_i),
+                    IndexOutOfBounds as i32,
+                    format!("The index {} is out of bounds, there are only {} input masks.", i, d.reserved_indices.len()),
                     None::<()>
             ));
         }
 
-        for i in d.next_i..d.next_i + n_indices {
-            d.reserved_indices[i as usize] = Some(self.id.clone());
-
-            let event = Event::ReservedInputEvent { client: self.id.clone(), reserved_indices: vec![i] };
-
-            // broadcast reserved index to all subscribed RPC clients
-            for sink in &d.reserved_index_sinks {
-                let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                sink.send(json).await.unwrap();
-            }
-
-            d.reserved_index_events.push((SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), event));
+        if d.reserved_indices[i as usize].is_some() {
+            return Err(ErrorObjectOwned::owned(
+                    OutOfIndices as i32,
+                    "No indices left.",
+                    None::<()>
+            ));
         }
 
-        let indices = (d.next_i..(d.next_i + n_indices)).collect();
-        d.next_i += n_indices;
+        d.reserved_indices[i as usize] = Some(self.id.clone());
 
-        Ok(indices)
+        let event = Event::<F>::ReservedInputEvent { client: self.id.clone(), reserved_index: i };
+
+        // broadcast reserved index to all subscribed RPC clients
+        for sink in &d.reserved_index_sinks {
+            let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            sink.send(json).await.unwrap();
+        }
+
+        d.n_reserved += 1;
+        d.reserved_index_events.push((SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), event));
+
+        Ok(())
     }
 
     async fn transition(&self, next_round: Round) -> RpcResult<()> {
@@ -1012,23 +1015,22 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
     type ClientIdentity = ClientIdentity;
 
     async fn start_preprocessing(&self) -> Result<(), CoordinatorError> {
-        //StoffelCoordinatorRPCClient::start_preprocessing(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
-        Ok(())
+        StoffelCoordinatorRPCClient::start_preprocessing(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn reserve_input_masks(&self) -> Result<(), CoordinatorError> {
-        Ok(())
+        StoffelCoordinatorRPCClient::reserve_input_masks(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn collect_inputs(&self) -> Result<(), CoordinatorError> {
-        Ok(())
+        StoffelCoordinatorRPCClient::collect_inputs(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn start_mpc(&self) -> Result<(), CoordinatorError> {
-        Ok(())
+        StoffelCoordinatorRPCClient::start_mpc(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn send_output(&self) -> Result<(), CoordinatorError> {
-        Ok(())
+        StoffelCoordinatorRPCClient::send_output(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn finalize(&self) -> Result<(), CoordinatorError> {
-        Ok(())
+        StoffelCoordinatorRPCClient::finalize(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn reset_coord(&self, prog_hash: [u8; 32], t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> Result<(), CoordinatorError> {
@@ -1043,9 +1045,8 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
 
         // Parse reserved index events one after the other.
         for _ in 0..n_clients {
-            if let Some(Ok(Event::ReservedInputEvent { client, reserved_indices })) = sub.next().await {
-                assert_eq!(reserved_indices.len(), 1);
-                map.insert(client, reserved_indices);
+            if let Some(Ok(Event::ReservedInputEvent { client, reserved_index })) = sub.next().await {
+                map.insert(client, vec![reserved_index]);
             } else {
                 return Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()));
             }
@@ -1097,10 +1098,8 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
         }
     }
 
-    async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
-        let indices = CoordinatorRPCBaseClient::<F>::obtain_mask_indices(self.rpc(), n_indices).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        Ok(indices)
+    async fn reserve_mask_index(&mut self, i: u64) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::<F>::reserve_mask_index(self.rpc(), i).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn obtain_outputs(&self) -> Result<Vec<F>, CoordinatorError> {
@@ -1198,8 +1197,7 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
 }
 
 #[derive(Clone)]
-struct FakeCoordinatorConnection {
-    d: Arc<Mutex<CoordinatorRPCServerSharedBase<Fr>>>,
+pub struct FakeCoordinatorConnection {
     base: CoordinatorRPCServerConnectionBase<Fr>,
 }
 
@@ -1207,7 +1205,7 @@ impl crate::rpc::RPCServerConnection for FakeCoordinatorConnection {
     type Internal = CoordinatorRPCServerSharedBase<Fr>;
 
     fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
-        Self { d: internal.clone(), base: CoordinatorRPCServerConnectionBase { d: internal, id } }
+        Self { base: CoordinatorRPCServerConnectionBase { d: internal, id } }
     }
 
     fn into_rpc(self) -> RpcModule<Self> {
@@ -1222,60 +1220,29 @@ impl crate::rpc::RPCServerConnection for FakeCoordinatorConnection {
 #[async_trait]
 impl StoffelCoordinatorRPCServer for FakeCoordinatorConnection {
     async fn start_preprocessing(&self) -> RpcResult<()> {
-        Ok(())
+        self.base.transition(Round::Preprocessing).await
     }
+
     async fn reserve_input_masks(&self) -> RpcResult<()> {
-        Ok(())
+        self.base.transition(Round::InputMaskReservation).await
     }
+
     async fn collect_inputs(&self) -> RpcResult<()> {
-        Ok(())
+        self.base.transition(Round::InputCollection).await
     }
+
     async fn start_mpc(&self) -> RpcResult<()> {
-        Ok(())
+        self.base.transition(Round::MPCExecution).await
     }
+
     async fn send_output(&self) -> RpcResult<()> {
-        Ok(())
+        self.base.transition(Round::OutputDistribution).await
     }
+
     async fn finalize(&self) -> RpcResult<()> {
-        Ok(())
+        self.base.transition(Round::ProgramFinished).await
     }
 }
-
-//{
-//    async fn start_preprocessing(&self) -> Result<(), CoordinatorError> {
-//        match CoordinatorRPCClient::<F>::transition(self.rpc(), Round::Preprocessing).await {
-//            Ok(_) => Ok(()),
-//            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
-//        }
-//    }
-//    async fn reserve_input_masks(&self) -> Result<(), CoordinatorError> {
-//        match CoordinatorRPCClient::<F>::transition(self.rpc(), Round::InputMaskReservation).await {
-//            Ok(_) => Ok(()),
-//            Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
-//        }
-//    }
-//    async fn collect_inputs(&self) -> Result<(), CoordinatorError> {
-//        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::InputCollection).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-//
-//        Ok(())
-//    }
-//    async fn start_mpc(&self) -> Result<(), CoordinatorError> {
-//        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::MPC).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
-//    }
-//    async fn send_output(&self) -> Result<(), CoordinatorError> {
-//        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::Output).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
-//    }
-//    async fn finalize(&self) -> Result<(), CoordinatorError> {
-//        CoordinatorRPCClient::<F>::transition(self.rpc(), Round::Idle).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
-//    }
-//    fn coord_mut(&mut self) -> Result<&mut Self::CoordinatorBase, CoordinatorError> {
-//        Ok(&mut self.coord)
-//    }
-//    fn coord(&self) -> Result<&Self::CoordinatorBase, CoordinatorError> {
-//        Ok(&self.coord)
-//    }
-//}
-
 
 #[cfg(test)]
 mod tests {
@@ -1463,9 +1430,8 @@ mod tests {
                 coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 coord.wait_for_round(Round::InputMaskReservation).await.unwrap();
 
-                let indices = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
-                assert_eq!(indices.len(), 1);
-                println!("CLIENT: obtained index {}", indices[0]);
+                coord.reserve_mask_index(0).await.expect("obtaining mask indices failed");
+                println!("CLIENT: obtained index 0");
 
                 let mask = rpc_client.receive_mask().await.unwrap();
                 assert_eq!(mask, correct_mask);
@@ -1473,7 +1439,7 @@ mod tests {
                 coord.wait_for_round(Round::InputCollection).await.unwrap();
 
                 let masked_input = mask + Fr::from(1337);
-                coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
+                coord.send_masked_input(Fr::from(masked_input), 0).await.unwrap();
 
                 coord.wait_for_round(Round::MPCExecution).await.unwrap();
                 coord.wait_for_round(Round::OutputDistribution).await.unwrap();
@@ -1494,9 +1460,9 @@ mod tests {
         crate::setup_test();
 
         let node_rpc_addrs = vec![
-            ("127.0.0.1".to_string(), 12349),
-            ("127.0.0.1".to_string(), 12350),
-            ("127.0.0.1".to_string(), 12351)
+            ("127.0.0.1".to_string(), 12353),
+            ("127.0.0.1".to_string(), 12354),
+            ("127.0.0.1".to_string(), 12355)
         ];
 
         let certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
@@ -1507,7 +1473,7 @@ mod tests {
 
         let n: usize = 5;
         let coord_addr = "127.0.0.1";
-        let coord_port = 12348;
+        let coord_port = 12352;
         let t = 1;
         let server_state = CoordinatorRPCServerSharedBase::<Fr>::new([0u8; 32], 5, t, public_keys.clone(), 1);
         let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(server_state, coord_addr, coord_port, t, server_cert()).await;
@@ -1541,9 +1507,9 @@ mod tests {
             }
 
             async move {
-                coords[0].trigger_round(Round::Preprocessing).await.unwrap();
+                coords[0].start_preprocessing().await.unwrap();
                 coords[0].wait_for_round(Round::Preprocessing).await.unwrap();
-                coords[0].trigger_round(Round::InputMaskReservation).await.unwrap();
+                coords[0].reserve_input_masks().await.unwrap();
                 coords[0].wait_for_round(Round::InputMaskReservation).await.unwrap();
                 let client_to_indices = coords[0].wait_for_indices(1).await.unwrap();  // called by node
                 for (c, indices) in &client_to_indices {
@@ -1557,7 +1523,7 @@ mod tests {
                     }
                 }
 
-                coords[0].trigger_round(Round::InputCollection).await.unwrap();
+                coords[0].collect_inputs().await.unwrap();
                 coords[0].wait_for_round(Round::InputCollection).await.unwrap();
                 let client_to_masked_input = coords[0].wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
                 for (c, masked_inputs) in client_to_masked_input {
@@ -1565,14 +1531,14 @@ mod tests {
                         println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
                     }
                 }
-                coords[0].trigger_round(Round::MPCExecution).await.unwrap();
+                coords[0].start_mpc().await.unwrap();
                 coords[0].wait_for_round(Round::MPCExecution).await.unwrap();
-                coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
+                coords[0].send_output().await.unwrap();
                 coords[0].wait_for_round(Round::OutputDistribution).await.unwrap();
                 for (i, coord) in coords.iter_mut().enumerate() {
                     coord.send_output_shares(public_keys[5].clone(), public_keys[5].clone(), vec![output_shares[i].clone()]).await.unwrap();
                 }
-                coords[0].trigger_round(Round::ProgramFinished).await.unwrap();
+                coords[0].finalize().await.unwrap();
 
                 barrier.wait().await;
             }
@@ -1589,9 +1555,8 @@ mod tests {
                 coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 coord.wait_for_round(Round::InputMaskReservation).await.unwrap();
 
-                let indices = coord.obtain_mask_indices(1).await.expect("obtaining mask indices failed");
-                assert_eq!(indices.len(), 1);
-                println!("CLIENT: obtained index {}", indices[0]);
+                coord.reserve_mask_index(0).await.expect("obtaining mask indices failed");
+                println!("CLIENT: obtained index 0");
 
                 let mask = rpc_client.receive_mask().await.unwrap();
                 assert_eq!(mask, correct_mask);
@@ -1599,7 +1564,7 @@ mod tests {
                 coord.wait_for_round(Round::InputCollection).await.unwrap();
 
                 let masked_input = mask + Fr::from(1337);
-                coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
+                coord.send_masked_input(Fr::from(masked_input), 0).await.unwrap();
 
                 coord.wait_for_round(Round::MPCExecution).await.unwrap();
                 coord.wait_for_round(Round::OutputDistribution).await.unwrap();
