@@ -1,4 +1,5 @@
 use ark_ff::FftField;
+use ark_bls12_381::Fr;
 use jsonrpsee::{core::{SubscriptionResult, RpcResult, to_json_raw_value}, proc_macros::rpc, PendingSubscriptionSink, SubscriptionSink, server::ServerHandle};
 use jsonrpsee::types::{error::ErrorCode, ErrorObjectOwned};
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,6 @@ use crate::{Round, round_before, Coordinator, CoordinatorError, rpc::{FieldEleme
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::future::Future;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ use hpke::{
 use p256::{SecretKey, pkcs8::DecodePrivateKey};
 use rand::{SeedableRng, rngs::StdRng};
 use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
-use CoordinatorRPCError::*;
+use CoordinatorRPCBaseError::*;
 
 /// KEM, KDF, and AEAD instantiations are needed to encrypt the output shares for an MPC client
 /// before sending them to the coordinator.
@@ -340,6 +340,10 @@ pub mod node_rpc {
 
 /// Events that mimic those used for the on-chain coordinator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "FieldElement<F>: Serialize",
+    deserialize = "FieldElement<F>: Deserialize<'de>"
+))]
 pub enum Event<F: FftField> {
     CoordinatorInitialized {
         creation_block: u64,
@@ -373,6 +377,7 @@ pub enum Event<F: FftField> {
 }
 
 /// RPC interface implemented by the developer.
+#[rpc(server, client)]
 pub trait StoffelCoordinatorRPC {
     #[method(name = "start_preprocessing")]
     async fn start_preprocessing(&self) -> RpcResult<()>;
@@ -451,65 +456,12 @@ pub enum CoordinatorRPCBaseError {
     NotParty = 10,
 }
 
-//<<<<<<< HEAD
-//pub trait OffChainStoffelCoordinator {
-//    type CoordinatorBase : OffChainCoordinatorBase;
-//
-//    fn start_preprocessing(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn reserve_input_masks(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn collect_inputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn start_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn send_output(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn finalize(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn coord_mut(&mut self) -> Result<&mut Self::CoordinatorBase, CoordinatorError>;
-//    fn coord(&self) -> Result<&Self::CoordinatorBase, CoordinatorError>;
-//}
-//
-//pub trait OffChainCoordinatorBase {
-//    type ClientIdentity;
-//
-//    async fn sub_round(&self, round: Round, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn available_input_masks(&self) -> RpcResult<u64>;
-//    async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>>;
-//    async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()>;
-//    async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: u64) -> RpcResult<()>;
-//    async fn transition(&self, next_round: Round) -> RpcResult<()>;
-//    async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()>;
-//    async fn obtain_output_shares(&self) -> SubscriptionResult;
-//}
-//
-//impl<T: OffChainStoffelCoordinator> CoordinatorRPC for T {
-//    type ClientIdentity = <T::CoordinatorBase as OffChainCoordinatorBase>::ClientIdentity;
-//
-//    async fn start_preprocessing(&self) -> RpcResult<()>;
-//    async fn reserve_input_masks(&self) -> RpcResult<()>;
-//    async fn collect_inputs(&self) -> RpcResult<()>;
-//    async fn start_mpc(&self) -> RpcResult<()>;
-//    async fn send_output(&self) -> RpcResult<()>;
-//    async fn finalize(&self) -> RpcResult<()>;
-//
-//    async fn sub_round(&self, round: Round, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn available_input_masks(&self) -> RpcResult<u64>;
-//    async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>>;
-//    async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()>;
-//    async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: u64) -> RpcResult<()>;
-//    async fn transition(&self, next_round: Round) -> RpcResult<()>;
-//    async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()>;
-//
-//    async fn obtain_output_shares(&self) -> SubscriptionResult;
-//}
-
-
 /// The basic server-side information for one client connection to the coordinator RPC interface.
 /// Can be extended by the developer.
 #[derive(Clone)]
-struct CoordinatorRPCServerConnectionBase {
+struct CoordinatorRPCServerConnectionBase<F: FftField> {
     /// A reference to the server's shared state.
-    d: Arc<Mutex<CoordinatorRPCServerShared>>,
+    d: Arc<Mutex<CoordinatorRPCServerSharedBase<F>>>,
     /// The connected client's identity, which is the client's public key in DER format.
     id: ClientIdentity
 }
@@ -662,7 +614,7 @@ impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
         Ok(())
     }
 
-    async fn transition(&mut self, event: Event, round: Round) -> Result<(), CoordinatorError> {
+    async fn transition(&mut self, event: Event<F>, round: Round) -> Result<(), CoordinatorError> {
         let round_before = match round_before(round) {
             Some(r) => r,
             None => return Err(CoordinatorError::CannotTransitionToIdle)
@@ -701,58 +653,6 @@ impl<F: FftField> crate::rpc::RPCServerShared for CoordinatorRPCServerSharedBase
         self.add_client(cert_der, client_handle, stop_tx);
     }
 }
-
-//impl<T: StoffelCoordinatorRPCServer> CoordinatorRPCServer for T {
-//    type ClientIdentity = <T::CoordinatorBase as CoordinatorRPCServerBase>::ClientIdentity;
-//
-//    async fn start_preprocessing(&self) -> RpcResult<()>;
-//    async fn reserve_input_masks(&self) -> RpcResult<()>;
-//    async fn collect_inputs(&self) -> RpcResult<()>;
-//    async fn start_mpc(&self) -> RpcResult<()>;
-//    async fn send_output(&self) -> RpcResult<()>;
-//    async fn finalize(&self) -> RpcResult<()>;
-//
-//    async fn sub_round(&self, round: Round, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn available_input_masks(&self) -> RpcResult<u64>;
-//    async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>>;
-//    async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()>;
-//    async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: u64) -> RpcResult<()>;
-//    async fn transition(&self, next_round: Round) -> RpcResult<()>;
-//    async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()>;
-//
-//    async fn obtain_output_shares(&self) -> SubscriptionResult;
-//}
-//
-//
-//pub trait StoffelCoordinatorRPCServer {
-//    type CoordinatorBase : CoordinatorRPCServerBase;
-//
-//    fn start_preprocessing(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn reserve_input_masks(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn collect_inputs(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn start_mpc(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn send_output(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn finalize(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
-//    fn coord_mut(&mut self) -> Result<&mut Self::CoordinatorBase, CoordinatorError>;
-//    fn coord(&self) -> Result<&Self::CoordinatorBase, CoordinatorError>;
-//}
-//
-//pub trait CoordinatorRPCServerBase {
-//    type ClientIdentity;
-//
-//    async fn sub_round(&self, round: Round, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
-//    async fn available_input_masks(&self) -> RpcResult<u64>;
-//    async fn obtain_mask_indices(&self, n_indices: u64) -> RpcResult<Vec<u64>>;
-//    async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()>;
-//    async fn submit_masked_input(&self, masked_input: FieldElement<Fr>, reserved_index: u64) -> RpcResult<()>;
-//    async fn transition(&self, next_round: Round) -> RpcResult<()>;
-//    async fn send_output_shares(&self, client_id: ClientIdentity, enc_shares: (Vec<u8>, Vec<u8>)) -> RpcResult<()>;
-//    async fn obtain_output_shares(&self) -> SubscriptionResult;
-//}
 
 /// Pre-implemented RPC methods.
 #[async_trait]
@@ -800,24 +700,6 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         Ok(())
     }
-
-    //async fn sub_send_outputs(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-    //    let mut d = self.d.lock().await;
-
-    //    d.subscribe_oneshot::<OutputSendingStarted>(pending, timestamp, Round::Output).await
-    //}
-
-    //async fn sub_start_mpc(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-    //    let mut d = self.d.lock().await;
-
-    //    d.subscribe_oneshot::<MPCStarted>(pending, timestamp, Round::MPC).await
-    //}
-
-    //async fn sub_start_pp(&self, pending: PendingSubscriptionSink, timestamp: u64) -> SubscriptionResult {
-    //    let mut d = self.d.lock().await;
-
-    //    d.subscribe_oneshot::<PreprocessingStarted>(pending, timestamp, Round::Preprocessing).await
-    //}
 
     async fn submit_masked_input(&self, masked_input: FieldElement<F>, raw_reserved_index: u64) -> RpcResult<()> {
         let mut d = self.d.lock().await;
@@ -1024,7 +906,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
 /// The pre-implemented RPC server-side connection can be used as a full-fledged RPC server
 /// connection.
-impl<F: FftField> crate::rpc::RPCServerConnection for CoordinatorRPCServerConnectionBase {
+impl<F: FftField> crate::rpc::RPCServerConnection for CoordinatorRPCServerConnectionBase<F> {
     type Internal = CoordinatorRPCServerSharedBase<F>;
 
     fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
@@ -1032,8 +914,7 @@ impl<F: FftField> crate::rpc::RPCServerConnection for CoordinatorRPCServerConnec
     }
 
     fn into_rpc(self) -> RpcModule<Self> {
-        let mut rpc = crate::off_chain::CoordinatorRPCServerSharedBase::into_rpc(self);
-        rpc
+        crate::off_chain::CoordinatorRPCBaseServer::into_rpc(self)
     }
 }
 
@@ -1053,22 +934,23 @@ pub struct OffChainCoordinatorServer<C: crate::rpc::RPCServerConnection> {
 /// The exterior wrapper of the coordinator, which implements the `Coordinator` trait.
 /// Can be used by either an RPC client (MPC node or MPC client) or the RPC server (the
 /// coordinator). Therefore, some values are optional.
-pub struct OffChainCoordinatorClient {
+pub struct OffChainCoordinatorClient<F: FftField> {
     rpc_coord: Option<Client>,
     timestamp: Option<u64>,
-    t: Option<u64>,
+    t: u64,
     n_outputs: Option<u64>,
     key_der: Option<Vec<u8>>,
+    _phantom: std::marker::PhantomData<F>,
 }
 
 impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
-    pub async fn start_coord_from_cert(shared: C::Internal, addr: &str, port: u16, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
+    pub async fn start_coord_from_cert(shared: C::Internal, addr: &str, port: u16, t: u64, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
         Self::start_coord(shared, addr, port, t, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
     }
 
     pub async fn start_coord(shared: C::Internal, addr: &str, port: u16, t: u64, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
         let rpc_server_data = Arc::new(Mutex::new(shared));
-        let server_handle = crate::rpc::start_coord<C::Internal>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+        let server_handle = crate::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
         Self {
             rpc_server: Some(rpc_server_data),
             rpc_coord: None,
@@ -1081,9 +963,17 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
             key_der: None,
         }
     }
+
+    pub fn get_addr(&self) -> String {
+        self.addr.clone().expect("Coordinator server not started")
+    }
+
+    pub fn get_timestamp(&self) -> u64 {
+        self.timestamp.expect("Coordinator server not started")
+    }
 }
 
-impl OffChainCoordinatorClient {
+impl<F: FftField> OffChainCoordinatorClient<F> {
     pub async fn start_rpc_client_from_cert(addr: &str, port: u16, timestamp: u64, t: u64, n_outputs: u64, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
         Self::start_rpc_client(addr, port, timestamp, t, n_outputs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
     }
@@ -1097,21 +987,18 @@ impl OffChainCoordinatorClient {
             t,
             n_outputs: Some(n_outputs),
             key_der: Some(key_der),
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    pub fn get_addr(&self) -> String {
-        self.addr.clone().expect("Coordinator server not started")
+    pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::<F>::transition(self.rpc(), round).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        Ok(())
     }
 
     pub fn get_timestamp(&self) -> u64 {
         self.timestamp.expect("Coordinator server not started")
-    }
-
-    pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
-        self.rpc_coord.as_ref().expect("client not started").transition(round).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-
-        Ok(())
     }
 
     fn rpc(&self) -> &Client {
@@ -1121,8 +1008,8 @@ impl OffChainCoordinatorClient {
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 
-impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient {
-    type ClientIdentity = super::ClientIdentity;
+impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
+    type ClientIdentity = ClientIdentity;
 
     async fn start_preprocessing(&self) -> Result<(), CoordinatorError> {
         //StoffelCoordinatorRPCClient::start_preprocessing(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
@@ -1145,12 +1032,12 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient {
     }
 
     async fn reset_coord(&self, prog_hash: [u8; 32], t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> Result<(), CoordinatorError> {
-        self.rpc().reset(prog_hash, 3 * t + 1, t, initial_mpc_nodes, n_inputs).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
+        CoordinatorRPCBaseClient::<F>::reset(self.rpc(), prog_hash, 3 * t + 1, t, initial_mpc_nodes, n_inputs).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
         // Wait for reserved index events.
-        let mut sub = CoordinatorRPCClient::<F>::sub_reserved_indices(self.rpc(), self.get_timestamp()).await.unwrap();
+        let mut sub = CoordinatorRPCBaseClient::<F>::sub_reserved_indices(self.rpc(), self.get_timestamp()).await.unwrap();
 
         let mut map = HashMap::new();
 
@@ -1169,13 +1056,13 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient {
 
     async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<F>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<F>>>, CoordinatorError> {
         // Wait for masked input events.
-        let mut sub = CoordinatorRPCClient::<F>::sub_masked_inputs(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        let mut sub = CoordinatorRPCBaseClient::<F>::sub_masked_inputs(self.rpc(), self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         let mut map = HashMap::new();
 
         // Parse masked input events one after the other.
         for _ in 0..n_clients {
-            if let Some(Ok(MaskedInputEvent { client, masked_input, reserved_index })) = sub.next().await {
+            if let Some(Ok(Event::MaskedInputEvent { client, masked_input, reserved_index })) = sub.next().await {
                 let i = reserved_index as usize;
                 let mask_share = &mask_shares[i];
                 let input = RobustShare::new(
@@ -1194,7 +1081,7 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient {
     }
 
     async fn wait_for_round(&self, round: Round) -> Result<(), CoordinatorError> {
-        let mut sub = self.rpc_coord.as_ref().expect("client not started").sub_round(round, self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        let mut sub = CoordinatorRPCBaseClient::<F>::sub_round(self.rpc(), round, self.get_timestamp()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         if let Some(Ok(_)) = sub.next().await {
             Ok(())
@@ -1204,21 +1091,21 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient {
     }
 
     async fn send_masked_input(&self, masked_input: F, i: u64) -> Result<(), CoordinatorError> {
-        match CoordinatorRPCClient::<F>::submit_masked_input(self.rpc(), FieldElement { value: masked_input }, i).await {
+        match CoordinatorRPCBaseClient::<F>::submit_masked_input(self.rpc(), FieldElement { value: masked_input }, i).await {
             Ok(_) => Ok(()),
             Err(e) => Err(CoordinatorError::JSONError(e.to_string()))
         }
     }
 
     async fn obtain_mask_indices(&mut self, n_indices: u64) -> Result<Vec<u64>, CoordinatorError> {
-        let indices = CoordinatorRPCClient::<F>::obtain_mask_indices(self.rpc(), n_indices).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        let indices = CoordinatorRPCBaseClient::<F>::obtain_mask_indices(self.rpc(), n_indices).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         Ok(indices)
     }
 
     async fn obtain_outputs(&self) -> Result<Vec<F>, CoordinatorError> {
         // Wait for output shares.
-        let mut sub = match CoordinatorRPCClient::<F>::obtain_output_shares(self.rpc()).await {
+        let mut sub = match CoordinatorRPCBaseClient::<F>::obtain_output_shares(self.rpc()).await {
             Ok(sub) => sub,
             Err(e) => {
                 return Err(CoordinatorError::JSONError(e.to_string()));
@@ -1302,10 +1189,54 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient {
         let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
 
         // Send the encrypted shares.
-        if let Err(e) = CoordinatorRPCClient::<F>::send_output_shares(self.rpc(), client_id, c).await {
+        if let Err(e) = CoordinatorRPCBaseClient::<F>::send_output_shares(self.rpc(), client_id, c).await {
             return Err(CoordinatorError::JSONError(e.to_string()));
         }
 
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct FakeCoordinatorConnection {
+    d: Arc<Mutex<CoordinatorRPCServerSharedBase<Fr>>>,
+    base: CoordinatorRPCServerConnectionBase<Fr>,
+}
+
+impl crate::rpc::RPCServerConnection for FakeCoordinatorConnection {
+    type Internal = CoordinatorRPCServerSharedBase<Fr>;
+
+    fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
+        Self { d: internal.clone(), base: CoordinatorRPCServerConnectionBase { d: internal, id } }
+    }
+
+    fn into_rpc(self) -> RpcModule<Self> {
+        let mut rpc = StoffelCoordinatorRPCServer::into_rpc(self.clone());
+        let base_rpc = crate::off_chain::CoordinatorRPCBaseServer::into_rpc(self.base);
+
+        rpc.merge(base_rpc).unwrap();
+        rpc
+    }
+}
+
+#[async_trait]
+impl StoffelCoordinatorRPCServer for FakeCoordinatorConnection {
+    async fn start_preprocessing(&self) -> RpcResult<()> {
+        Ok(())
+    }
+    async fn reserve_input_masks(&self) -> RpcResult<()> {
+        Ok(())
+    }
+    async fn collect_inputs(&self) -> RpcResult<()> {
+        Ok(())
+    }
+    async fn start_mpc(&self) -> RpcResult<()> {
+        Ok(())
+    }
+    async fn send_output(&self) -> RpcResult<()> {
+        Ok(())
+    }
+    async fn finalize(&self) -> RpcResult<()> {
         Ok(())
     }
 }
@@ -1345,23 +1276,6 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient {
 //    }
 //}
 
-struct FakeCoordinatorConnection {
-    d: Arc<Mutex<CoordinatorRPCServerSharedBase<Fr>>>,
-    base: CoordinatorRPCServerConnectionBase,
-}
-
-impl crate::rpc::RPCServerConnection for FakeCoordinatorConnection {
-    type Internal = FakeCoordinatorShared;
-
-    fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
-        Self { d: internal, base: CoordinatorRPCServerConnectionBase { d: internal, id } }
-    }
-
-    fn into_rpc(self) -> RpcModule<Self> {
-        let mut rpc = crate::off_chain::CoordinatorRPCServerBase::into_rpc(self.base);
-        rpc
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1382,10 +1296,12 @@ mod tests {
 
         let addr = "127.0.0.1";
         let port = 12345;
-        let coord = OffChainCoordinator::<Fr>::start_coord_from_cert(addr, port, [0u8; 32], 5, 1, public_keys, server_cert()).await;
+        let t = 1;
+        let server_state = CoordinatorRPCServerSharedBase::<Fr>::new([0u8; 32], 5, t, public_keys, 1);
+        let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(server_state, addr, port, t, server_cert()).await;
         let timestamp = coord.get_timestamp();
 
-        let _: OffChainCoordinator<Fr> = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, client_cert()).await;
+        let _ = OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, client_cert()).await;
     }
 
     // Tests event triggering.
@@ -1400,11 +1316,13 @@ mod tests {
 
             let addr = "127.0.0.1";
             let port = 12346;
-            let coord = OffChainCoordinator::<Fr>::start_coord_from_cert(addr, port, [0u8; 32], 5, 1, public_keys, server_cert()).await;
+            let t = 1;
+            let server_state = CoordinatorRPCServerSharedBase::<Fr>::new([0u8; 32], 5, t, public_keys, 1);
+            let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(server_state, addr, port, t, server_cert()).await;
             let timestamp = coord.get_timestamp();
 
-            let node0: OffChainCoordinator<Fr> = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
-            let node1: OffChainCoordinator<Fr> = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
+            let node0 = OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
+            let node1 = OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
 
             node0.trigger_round(Round::Preprocessing).await.unwrap();
 
@@ -1420,12 +1338,14 @@ mod tests {
 
             let addr = "127.0.0.1";
             let port = 12347;
-            let coord = OffChainCoordinator::<Fr>::start_coord_from_cert(addr, port, [0u8; 32], 5, 1, public_keys, server_cert()).await;
+            let t = 1;
+            let server_state = CoordinatorRPCServerSharedBase::<Fr>::new([0u8; 32], 5, t, public_keys, 1);
+            let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(server_state, addr, port, t, server_cert()).await;
             let timestamp = coord.get_timestamp();
             let barrier = Arc::new(Barrier::new(2));
 
-            let node0: OffChainCoordinator<Fr> = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
-            let node1: OffChainCoordinator<Fr> = OffChainCoordinator::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
+            let node0 = OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
+            let node1 = OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(addr, port, timestamp, 1, 1, certs.remove(0)).await;
 
             tokio::spawn({
                 let barrier = barrier.clone();
@@ -1459,11 +1379,12 @@ mod tests {
         let correct_mask = Fr::from(42);
         let correct_output = Fr::from(31415);
 
-        let n: usize = 5;
-        let t: usize = 1;
+        let n = 5;
+        let t = 1;
         let coord_addr = "127.0.0.1";
         let coord_port = 12348;
-        let coord = OffChainCoordinator::<Fr>::start_coord_from_cert(coord_addr, coord_port, [0u8; 32], n as u64, t as u64, public_keys[..5].to_vec().clone(), server_cert()).await;
+        let server_state = CoordinatorRPCServerSharedBase::<Fr>::new([0u8; 32], n, t, public_keys.clone(), 1);
+        let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(server_state, coord_addr, coord_port, t, server_cert()).await;
         let timestamp = coord.get_timestamp();
         let barrier = Arc::new(Barrier::new(3));
 
@@ -1471,18 +1392,18 @@ mod tests {
         tokio::spawn({
             let barrier = barrier.clone();
 
-            let mut coords: Vec<OffChainCoordinator<Fr>> = Vec::new();
+            let mut coords: Vec<OffChainCoordinatorClient<Fr>> = Vec::new();
             for i in 0..3 {
-                let coord: OffChainCoordinator<Fr> =
-                    OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, certs[i].clone()).await;
+                let coord =
+                    OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, certs[i].clone()).await;
                 coords.push(coord);
             }
 
             // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
             // node here, but we use 3 RPC nodes to make the process work
             let mut rng = test_rng();
-            let mask_shares = RobustShare::compute_shares(correct_mask, n, t, None, &mut rng).unwrap();
-            let output_shares = RobustShare::compute_shares(correct_output, n, t, None, &mut rng).unwrap();
+            let mask_shares = RobustShare::compute_shares(correct_mask, n as usize, t as usize, None, &mut rng).unwrap();
+            let output_shares = RobustShare::compute_shares(correct_output, n as usize, t as usize, None, &mut rng).unwrap();
 
             let mut node_rpcs = Vec::new();
             for i in 0..3 {
@@ -1535,9 +1456,9 @@ mod tests {
         tokio::spawn({
             let barrier = barrier.clone();
             let cert = certs[5].clone();
-            let mut coord: OffChainCoordinator<Fr> =
-                OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, cert.clone()).await;
-            let rpc_client: super::node_rpc::NodeRPCClient<Fr> = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), cert.clone()).await;
+            let mut coord =
+                OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, cert.clone()).await;
+            let rpc_client: super::node_rpc::NodeRPCClient<Fr> = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), cert.clone()).await;
             async move {
                 coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 coord.wait_for_round(Round::InputMaskReservation).await.unwrap();
@@ -1585,10 +1506,11 @@ mod tests {
         let correct_output = Fr::from(31415);
 
         let n: usize = 5;
-        let t: usize = 1;
         let coord_addr = "127.0.0.1";
         let coord_port = 12348;
-        let coord = OffChainCoordinator::start_coord_from_cert(coord_addr, coord_port, [0u8; 32], n as u64, t as u64, public_keys[..5].to_vec().clone(), server_cert()).await;
+        let t = 1;
+        let server_state = CoordinatorRPCServerSharedBase::<Fr>::new([0u8; 32], 5, t, public_keys.clone(), 1);
+        let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(server_state, coord_addr, coord_port, t, server_cert()).await;
         let timestamp = coord.get_timestamp();
         let barrier = Arc::new(Barrier::new(3));
 
@@ -1599,22 +1521,22 @@ mod tests {
             let mut coords = Vec::new();
             for i in 0..3 {
                 let coord =
-                    OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, certs[i].clone()).await;
+                    OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, certs[i].clone()).await;
                 coords.push(coord);
             }
 
             // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
             // node here, but we use 3 RPC nodes to make the process work
             let mut rng = test_rng();
-            let mask_shares = RobustShare::compute_shares(correct_mask, n, t, None, &mut rng).unwrap();
-            let output_shares = RobustShare::compute_shares(correct_output, n, t, None, &mut rng).unwrap();
+            let mask_shares = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
+            let output_shares = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
 
             let mut node_rpcs = Vec::new();
             for i in 0..3 {
                 let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
                     node_rpc_addrs[i].1, certs[i].clone()).await;
 
-                node_rpc.add_mask_share(0, mask_shares[i].clone()).await.unwrap();
+                node_rpc.add_mask_share(0, &mask_shares[i].clone()).await.unwrap();
                 node_rpcs.push(node_rpc);
             }
 
@@ -1661,8 +1583,8 @@ mod tests {
             let barrier = barrier.clone();
             let cert = certs[5].clone();
             let mut coord =
-                OffChainCoordinator::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, cert.clone()).await;
-            let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), cert.clone()).await;
+                OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(coord_addr, coord_port, timestamp, 1, 1, cert.clone()).await;
+            let rpc_client = super::node_rpc::NodeRPCClient::<Fr>::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), cert.clone()).await;
             async move {
                 coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 coord.wait_for_round(Round::InputMaskReservation).await.unwrap();

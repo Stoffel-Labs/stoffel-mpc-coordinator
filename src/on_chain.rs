@@ -35,7 +35,7 @@ type KemImpl = DhP256HkdfSha256;
 type KdfImpl = HkdfSha256;
 type AeadImpl = AesGcm256;
 
-type ClientIdentity = Address;
+pub type ClientIdentity = Address;
 
 #[derive(Clone)]
 pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone> {
@@ -79,7 +79,7 @@ pub mod node_rpc {
 
     /// Exterior representation of the node-side RPC interface.
     pub struct NodeRPCServer<P: Provider + WalletProvider + Clone> {
-        rpc_server: Arc<Mutex<NodeRPCServerInternal<P>>>,
+        rpc_server: Arc<Mutex<NodeRPCServerShared<P>>>,
         addr: String,
         port: u16,
         server_handle: JoinHandle<()>,
@@ -158,8 +158,8 @@ pub mod node_rpc {
         }
 
         pub async fn start(addr: &str, port: u16, coord: StoffelCoordinatorInstance<P>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::new(coord)));
-            let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl<P>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord)));
+            let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
@@ -237,15 +237,15 @@ pub mod node_rpc {
     }
 
     /// Represents a connection with a client on the node-side RPC server.
-    pub struct NodeRPCServerImpl<P: Provider + WalletProvider + Clone> {
+    pub struct NodeRPCServerConnection<P: Provider + WalletProvider + Clone> {
         /// Reference to the server's shared state
-        d: Arc<Mutex<NodeRPCServerInternal<P>>>,
+        d: Arc<Mutex<NodeRPCServerShared<P>>>,
         /// The MPC client's node-facing identity
         id: Vec<u8>
     }
 
-    impl<P: Provider + WalletProvider + Clone + 'static> crate::rpc::RPCServerImpl for NodeRPCServerImpl<P> {
-        type Internal = NodeRPCServerInternal<P>;
+    impl<P: Provider + WalletProvider + Clone + 'static> crate::rpc::RPCServerConnection for NodeRPCServerConnection<P> {
+        type Internal = NodeRPCServerShared<P>;
 
         fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self {
             Self { d: internal, id }
@@ -256,7 +256,7 @@ pub mod node_rpc {
         }
     }
 
-    pub struct NodeRPCServerInternal<P: Provider + WalletProvider + Clone> {
+    pub struct NodeRPCServerShared<P: Provider + WalletProvider + Clone> {
         index_to_client: HashMap<u64, ClientIdentity>,
         client_to_index: HashMap<ClientIdentity, u64>,
         auth_status: HashMap<ClientIdentity, bool>,
@@ -270,7 +270,7 @@ pub mod node_rpc {
         coord: StoffelCoordinatorInstance<P>
     }
 
-    impl<P: Provider + WalletProvider + Clone> NodeRPCServerInternal<P> {
+    impl<P: Provider + WalletProvider + Clone> NodeRPCServerShared<P> {
         pub fn new(coord: StoffelCoordinatorInstance<P>) -> Self {
             Self {
                 index_to_client: HashMap::new(),
@@ -285,7 +285,7 @@ pub mod node_rpc {
         }
     }
 
-    impl<P: Provider + WalletProvider + Clone> crate::rpc::RPCServerInternal for NodeRPCServerInternal<P> {
+    impl<P: Provider + WalletProvider + Clone> crate::rpc::RPCServerShared for NodeRPCServerShared<P> {
         fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
             self.clients.insert(cert_der.clone(), ClientInfo { cert: cert_der, thread: client_handle, stop_tx });
         }
@@ -304,7 +304,7 @@ pub mod node_rpc {
     }
 
     #[async_trait]
-    impl<P: Provider + WalletProvider + Clone + 'static> OnChainNodeRPCServer for NodeRPCServerImpl<P> {
+    impl<P: Provider + WalletProvider + Clone + 'static> OnChainNodeRPCServer for NodeRPCServerConnection<P> {
         async fn receive_mask_share(&self, pending: PendingSubscriptionSink, sig: Vec<u8>, addr: Address) -> SubscriptionResult {
             use OnChainNodeRPCServerError::*;
 
@@ -453,7 +453,7 @@ pub async fn generate_client_sig(base_nonce: u64, i: u64, signer: PrivateKeySign
     signer.sign_message(hash.as_slice()).await.expect("signing failed")
 }
 
-pub async fn ws_connect(addr: &str, wallet_sk: &str) -> impl Provider + WalletProvider + Clone {
+pub async fn ws_connect(addr: &str, wallet_sk: &str) -> impl Provider + WalletProvider + Clone + 'static {
     let ws = WsConnect::new(addr);
     let wallet = EthereumWallet::from(PrivateKeySigner::from_str(wallet_sk).expect("invalid private key"));
 
@@ -549,7 +549,7 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
             Round::Preprocessing => self.coord.startPreprocessing().send().await,
             Round::InputMaskReservation => self.coord.reserveInputMasks().send().await,
             Round::InputCollection => self.coord.collectInputs().send().await,
-            Round::MPCExecution => self.coord.startMPC().send().await,
+            Round::MPCExecution => self.coord.startMpc().send().await,
             Round::OutputDistribution => self.coord.sendOutputs().send().await,
             Round::ProgramFinished => self.coord.finalize().send().await
         };
@@ -632,7 +632,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
     }
 
     async fn start_mpc(&self) -> Result<(), CoordinatorError> {
-        let builder = self.coord.startMPC();
+        let builder = self.coord.startMpc();
         let result = builder.send().await;
 
         match result {
@@ -716,17 +716,11 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             .from_block(self.contract_block)
             .watch()
             .await.unwrap().into_stream();
-<<<<<<< HEAD
         
-        while let Some(Ok((StoffelCoordinator::ReservedInputEvent { client, reservedIndices }, _))) = events.next().await {
-=======
-
-        while let Some(Ok((ReservedInputEvent { client, reservedIndices }, _))) = events.next().await {
->>>>>>> feature/generic-fields
-            assert_eq!(reservedIndices.len(), 1);
-            addr_to_i.insert(client, vec![u256_to_u64(reservedIndices[0]).expect("conversion from U256 to u64 failed")]);
+        while let Some(Ok((StoffelCoordinator::ReservedInputEvent { client, reservedIndex }, _))) = events.next().await {
+            addr_to_i.insert(client, vec![u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed")]);
             eprintln!("[party] Recorded reserved mask index {} for client address {:?}",
-                     reservedIndices[0], client);
+                     reservedIndex, client);
             if addr_to_i.len() as u64 == n_clients {
                 break;
             }
@@ -789,7 +783,6 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                 }
             }};
         }
-<<<<<<< HEAD
 
         match round {
             Round::Idle => panic!(),
@@ -799,107 +792,6 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             Round::MPCExecution => wait_for_event!(self.coord.MPCStarted_filter(), "MPCStarted"),
             Round::OutputDistribution => wait_for_event!(self.coord.OutputSendingStarted_filter(), "OutputSendingStarted"),
             Round::ProgramFinished => wait_for_event!(self.coord.ExecutionDone_filter(), "ExecutionDone"),
-=======
-    }
-
-    async fn wait_for_input(&self) -> Result<(), CoordinatorError> {
-        let mut events = match self.coord
-            .InputCollectionStarted_filter()
-            .from_block(self.contract_block)
-            .watch()
-            .await {
-            Ok(e) => e.into_stream(),
-            Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for InputCollectionStarted events: {}", e)));
-            }
-        };
-
-        match events.next().await {
-            Some(Ok((_, _))) => {
-                Ok(())
-            }
-            _ => {
-                Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for InputCollectionStarted events".to_string()))
-            }
-        }
-    }
-
-    async fn trigger_pp(&self) -> Result<(), CoordinatorError> {
-        let builder = self.coord.startPreprocessing();
-        match builder.send().await {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to start preprocessing to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to start preprocessing: {}", e)))
-            }
-        }
-    }
-
-    async fn wait_for_pp(&self) -> Result<(), CoordinatorError> {
-        let mut events = match self.coord
-            .PreprocessingStarted_filter()
-            .from_block(self.contract_block)
-            .watch()
-            .await {
-            Ok(e) => e.into_stream(),
-            Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for PreprocessingStarted events: {}", e)));
-            }
-        };
-
-        match events.next().await {
-            Some(Ok((_, _))) => {
-                Ok(())
-            }
-            _ => {
-                Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for PreprocessingStarted events".to_string()))
-            }
-        }
-    }
-
-    async fn init_input_masks(&mut self) -> Result<(), CoordinatorError> {
-        let builder = self.coord.reserveInputMasks();
-        match builder.send().await {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to start reservation of mask indices be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to start reservation of mask indices: {}", e)))
-            }
-        }
-    }
-
-    async fn wait_for_input_mask_init(&self) -> Result<(), CoordinatorError> {
-        let mut events = match self.coord
-            .InputMaskReservationStarted_filter()
-            .from_block(self.contract_block)
-            .watch()
-            .await {
-            Ok(e) => e.into_stream(),
-            Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for InputMaskReservationStarted events: {}", e)));
-            }
-        };
-
-        match events.next().await {
-            Some(Ok((_, _))) => {
-                Ok(())
-            }
-            _ => {
-                Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for InputMaskReservationStarted events".to_string()))
-            }
->>>>>>> feature/generic-fields
         }
     }
 
@@ -915,7 +807,6 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
 
                 let mut indices = None;
 
-<<<<<<< HEAD
                 for log in receipt.inner.logs() {
                     if let Ok(e) = log.log_decode::<StoffelCoordinator::ReservedInputEvent>() {
                         indices = Some(e.inner.reservedIndices.clone());
@@ -934,12 +825,6 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                 } else {
                     panic!("BUG: no ReservedInputEvent found in transaction logs, coordinator should emit such an event!!!");
                 }
-=======
-        for log in receipt.inner.logs() {
-            if let Ok(e) = log.log_decode::<FakeCoordinator::ReservedInputEvent>() {
-                indices = Some(e.inner.reservedIndices.clone());
-                break;
->>>>>>> feature/generic-fields
             }
             Err(e) => {
                 Err(CoordinatorError::EthereumError(format!("error sending transaction to obtain input mask indices: {}", e)))
@@ -959,7 +844,6 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                 }
             }
             Err(e) => {
-<<<<<<< HEAD
                 let msg = if let Some(decoded_error) = e.as_decoded_interface_error::<StoffelCoordinatorErrors>() {
                     match decoded_error {
                         StoffelCoordinatorErrors::IndexNotReserved(StoffelCoordinator::IndexNotReserved { client, index }) => {
@@ -978,96 +862,11 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                 } else {
                     e.to_string()
                 };
-=======
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to submit masked inputs: {}", e)))
-            }
-        }
-    }
-
-    async fn trigger_mpc(&self) -> Result<(), CoordinatorError> {
-        let builder = self.coord.startMPC();
-        match builder.send().await {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to trigger MPC to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to trigger MPC: {}", e)))
-            }
-        }
-    }
-
-    async fn wait_for_mpc(&self) -> Result<(), CoordinatorError> {
-        let mut events = match self.coord
-            .MPCStarted_filter()
-            .from_block(self.contract_block)
-            .watch()
-            .await {
-            Ok(e) => e.into_stream(),
-            Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MPCStarted events: {}", e)));
-            }
-        };
-
-        match events.next().await {
-            Some(Ok((_, _))) => {
-                Ok(())
-            }
-            _ => {
-                Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for MPCStarted events".to_string()))
-            }
-        }
-    }
-
-    async fn trigger_outputs(&self) -> Result<(), CoordinatorError> {
-        let builder = self.coord.sendOutputs();
-        match builder.send().await {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to trigger output phase to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to trigger output phase: {}", e)))
-            }
-        }
-    }
-
-    async fn wait_for_outputs(&self) -> Result<(), CoordinatorError> {
-        let mut events = match self.coord
-            .OutputSendingStarted_filter()
-            .from_block(self.contract_block)
-            .watch()
-            .await {
-            Ok(e) => e.into_stream(),
-            Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for OutputSendingStarted events: {}", e)));
-            }
-        };
-
-        match events.next().await {
-            Some(Ok((_, _))) => {
-                Ok(())
-            }
-            _ => {
-                Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for OutputSendingStarted events".to_string()))
-            }
-        }
-    }
->>>>>>> feature/generic-fields
-
                 Err(CoordinatorError::EthereumError(format!("error sending transaction to submit masked inputs: {}", msg)))
             }
         }
     }
-    
+
     async fn obtain_outputs(&self) -> Result<Vec<Fr>, CoordinatorError> {
         let client_sk = {
             let der_bytes = self.key_der.clone().unwrap();
@@ -1088,13 +887,8 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                 return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MPCStarted events: {}", e)));
             }
         };
-<<<<<<< HEAD
     
         while let Some(Ok((StoffelCoordinator::EnoughPrivateOutputShares { client: _, shares }, _))) = events.next().await {
-=======
-
-        while let Some(Ok((EnoughPrivateOutputShares { client: _, shares }, _))) = events.next().await {
->>>>>>> feature/generic-fields
             if (shares.len() as u64) < 2 * self.t + 1 {
                 panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
             }
@@ -1257,12 +1051,8 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-<<<<<<< HEAD
-        let fake_coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-        let coord_instance = StoffelCoordinator::new(*fake_coord_instance.address(), provider.clone());
-=======
-        let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
->>>>>>> feature/generic-fields
+        let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
         let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
         assert_eq!(coord.contract_block, 1);
     }
@@ -1278,12 +1068,8 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-<<<<<<< HEAD
-            let fake_coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-            let coord_instance = StoffelCoordinator::new(*fake_coord_instance.address(), provider.clone());
-=======
-            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
->>>>>>> feature/generic-fields
+            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             coord.trigger_round(Round::Preprocessing).await.unwrap();
@@ -1299,12 +1085,8 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-<<<<<<< HEAD
-            let fake_coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-            let coord_instance = StoffelCoordinator::new(*fake_coord_instance.address(), provider.clone());
-=======
-            let coord_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
->>>>>>> feature/generic-fields
+            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             tokio::spawn({
@@ -1336,12 +1118,7 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-<<<<<<< HEAD
-        let fake_contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
-        let contract = StoffelCoordinator::new(*fake_contract.address(), provider.clone());
-=======
         let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
->>>>>>> feature/generic-fields
 
         // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
         let mut node_rpcs = Vec::new();
