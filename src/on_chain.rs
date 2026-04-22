@@ -8,7 +8,7 @@ use alloy::{
     signers::Signer
 };
 use alloy::providers::WalletProvider;
-use alloy_primitives::{FixedBytes, U256, Address, Signature, Bytes, Keccak256};
+use alloy_primitives::{FixedBytes, U256, Address, Signature, Bytes, Keccak256 };
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorErrors;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
@@ -49,9 +49,9 @@ pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone> {
 /// RPC interface on the node.
 pub mod node_rpc {
     use ark_bls12_381::Fr;
-    use alloy::providers::{WalletProvider, Provider};
-    use alloy_primitives::{Address, Bytes};
-    use std::collections::HashMap;
+    use alloy::{sol_types::SolValue, providers::{WalletProvider, Provider}};
+    use alloy_primitives::{Address, Signature, SignatureError, Keccak256};
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use jsonrpsee::{
@@ -77,9 +77,23 @@ pub mod node_rpc {
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorErrors;
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
 
+    async fn verify_client_sig(base_nonce: u64, i: u64, addr: Address, sig_bytes: Vec<u8>) -> Result<bool, SignatureError> {
+        let sig = Signature::from_raw(&sig_bytes)?;
+    
+        let hash = {
+            let mut hasher = Keccak256::new();
+            hasher.update((base_nonce + i).abi_encode());
+            hasher.finalize()
+        };
+    
+        let sig_addr = sig.recover_address_from_msg(hash)?;
+    
+        Ok(sig_addr == addr)
+    }
+
     /// Exterior representation of the node-side RPC interface.
     pub struct NodeRPCServer<P: Provider + WalletProvider + Clone> {
-        rpc_server: Arc<Mutex<NodeRPCServerShared<P>>>,
+        pub(super) rpc_server: Arc<Mutex<NodeRPCServerShared<P>>>,
         addr: String,
         port: u16,
         server_handle: JoinHandle<()>,
@@ -153,12 +167,10 @@ pub mod node_rpc {
             Self::start(addr, port, coord, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
         }
 
-        pub async fn ids_and_addrs(&self) -> Vec<(Vec<u8>, ClientIdentity)> {
-            self.rpc_server.lock().await.ids_and_addrs.clone()
-        }
-
         pub async fn start(addr: &str, port: u16, coord: StoffelCoordinatorInstance<P>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord)));
+            let base_nonce = super::u256_to_u64(coord.baseNonce().call().await.expect("failed to fetch base nonce"))
+                .expect("base nonce does not fit in u64");
+            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord, base_nonce)));
             let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
             Self {
                 rpc_server: rpc_server_data,
@@ -172,24 +184,17 @@ pub mod node_rpc {
             self.addr.clone()
         }
 
-        pub async fn add_auth_status(&mut self, addr: Address) -> Result<(), NodeRPCError> {
+        pub async fn reset(&mut self) {
             let mut d = self.rpc_server.lock().await;
-
-            assert!(!d.auth_status.contains_key(&addr));
-            d.auth_status.insert(addr, true);
-
-            if let Some(i) = d.client_to_index.get(&addr) {
-                if let Some(share) = d.mask_shares.get(i) {
-                    if let Some(sink) = d.sinks.get(&addr) {
-                       let mut share_bytes = Vec::new();
-                       share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
-                       let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
-                       sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
-                    }
-                }
-            }
-
-            Ok(())
+            let base_nonce = super::u256_to_u64(d.coord.baseNonce().call().await.expect("failed to fetch base nonce"))
+                .expect("base nonce does not fit in u64");
+            d.index_to_client.clear();
+            d.client_to_index.clear();
+            d.authenticated.clear();
+            d.sinks.clear();
+            d.mask_shares.clear();
+            d.ids_and_addrs.clear();
+            d.base_nonce = base_nonce;
         }
 
         // called when the client has reserved indices at the coordinator
@@ -200,7 +205,20 @@ pub mod node_rpc {
             d.index_to_client.insert(i, addr);
             d.client_to_index.insert(addr, i);
 
-            if d.auth_status.contains_key(&addr) {
+            if let Some(entry) = d.ids_and_addrs.iter_mut().find(|(_, a, _)| *a == addr) {
+                assert!(entry.2.is_some(), "client entry for addr must be pending when add_reserved_index is called before authentication");
+                let sig_bytes = entry.2.take().unwrap();
+                let tls_id = entry.0.clone();
+
+                let authenticated = verify_client_sig(d.base_nonce, i, addr, sig_bytes).await
+                    .unwrap_or(false);
+
+                if !authenticated {
+                    return Err(NodeRPCError::AuthenticationFailed(tls_id));
+                }
+
+                d.authenticated.insert(addr);
+
                 if let Some(share) = d.mask_shares.get(&i) {
                     if let Some(sink) = d.sinks.get(&addr) {
                         let mut share_bytes = Vec::new();
@@ -222,7 +240,7 @@ pub mod node_rpc {
             d.mask_shares.insert(i, share.clone());
 
             if let Some(addr) = d.index_to_client.get(&i) {
-                if d.auth_status.contains_key(addr) {
+                if d.authenticated.contains(addr) {
                     if let Some(sink) = d.sinks.get(addr) {
                         let mut share_bytes = Vec::new();
                         share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
@@ -259,27 +277,31 @@ pub mod node_rpc {
     pub struct NodeRPCServerShared<P: Provider + WalletProvider + Clone> {
         index_to_client: HashMap<u64, ClientIdentity>,
         client_to_index: HashMap<ClientIdentity, u64>,
-        auth_status: HashMap<ClientIdentity, bool>,
+        authenticated: HashSet<ClientIdentity>,
 
         // sinks stored if some info to send shares to clients is still missing, but client has
         // already sent the RPC request
         sinks: HashMap<ClientIdentity, SubscriptionSink>,
         mask_shares: HashMap<u64, RobustShare<Fr>>,
-        ids_and_addrs: Vec<(Vec<u8>, ClientIdentity)>,
+        // (tls_id, addr, pending_sig): pending_sig is Some while awaiting index reservation,
+        // None once authenticated
+        pub(super) ids_and_addrs: Vec<(Vec<u8>, ClientIdentity, Option<Vec<u8>>)>,
         clients: HashMap<Vec<u8>, ClientInfo>,
+        base_nonce: u64,
         coord: StoffelCoordinatorInstance<P>
     }
 
     impl<P: Provider + WalletProvider + Clone> NodeRPCServerShared<P> {
-        pub fn new(coord: StoffelCoordinatorInstance<P>) -> Self {
+        pub fn new(coord: StoffelCoordinatorInstance<P>, base_nonce: u64) -> Self {
             Self {
                 index_to_client: HashMap::new(),
                 client_to_index: HashMap::new(),
-                auth_status: HashMap::new(),
+                authenticated: HashSet::new(),
                 sinks: HashMap::new(),
                 mask_shares: HashMap::new(),
                 ids_and_addrs: Vec::new(),
                 clients: HashMap::new(),
+                base_nonce,
                 coord
             }
         }
@@ -305,14 +327,14 @@ pub mod node_rpc {
 
     #[async_trait]
     impl<P: Provider + WalletProvider + Clone + 'static> OnChainNodeRPCServer for NodeRPCServerConnection<P> {
-        async fn receive_mask_share(&self, pending: PendingSubscriptionSink, sig: Vec<u8>, addr: Address) -> SubscriptionResult {
+        async fn receive_mask_share(&self, pending: PendingSubscriptionSink, sig_bytes: Vec<u8>, addr: Address) -> SubscriptionResult {
             use OnChainNodeRPCServerError::*;
 
             let mut d = self.d.lock().await;
 
             // each client can only authenticate one address and each address can only be
             // authenticated once
-            if d.ids_and_addrs.iter().any(|(id, prev_addr)| {
+            if d.ids_and_addrs.iter().any(|(id, prev_addr, _)| {
                 self.id == *id || addr == *prev_addr
             }) {
                 pending.reject(ErrorObjectOwned::owned(
@@ -323,98 +345,66 @@ pub mod node_rpc {
                 return Ok(());
             }
 
-            // address needs to reserve index before requesting shares, so the contract knows
-            // what message the signature signs, since the signed nonce is index-dependent
-            match d.auth_status.get(&addr) {
-                Some(false) => { panic!("BUG: only true values inserted"); }
-                Some(true) => {
-                    // enough signatures were sent to authenticate the client, no need to send more;
-                    // can send the share immediately if available
-                    if let Some(i) = d.client_to_index.get(&addr) {
-                        if let Some(share) = d.mask_shares.get(i) {
-                            let mut share_bytes = Vec::new();
-                            match share.serialize_compressed(&mut share_bytes) {
-                                Ok(_) => { },
-                                Err(e) => {
-                                    pending.reject(ErrorObjectOwned::owned(
-                                        ErrorCode::ServerError(SerializationError as i32).code(),
-                                        format!("Serializing share bytes failed: {e}"),
-                                        None::<()>)
-                                    ).await;
-                                    return Ok(());
-                                }
-                            };
+            // pending_sig is None if verified immediately, Some if deferred until index arrives
+            let pending_sig: Option<Vec<u8>>;
 
-                            let json = match to_json_raw_value(&share_bytes) {
-                                Ok(j) => j,
-                                Err(e) => {
-                                    pending.reject(ErrorObjectOwned::owned(
-                                        ErrorCode::ServerError(SerializationError as i32).code(),
-                                        format!("Converting serialized shares to JSON failed: {e}"),
-                                        None::<()>)
-                                    ).await;
-                                    return Ok(());
-                                }
-                            };
+            if let Some(&i) = d.client_to_index.get(&addr) {
+                // reservation already known: verify immediately
+                let authenticated = verify_client_sig(d.base_nonce, i, addr, sig_bytes).await
+                    .unwrap_or(false);
 
-                            let sink = pending.accept().await?;
-                            sink.send(json).await?;
-
-                            return Ok(());
-                        }
-                    }
-
-                    let sink = pending.accept().await?;
-                    d.sinks.insert(addr, sink);
-                    d.ids_and_addrs.push((self.id.clone(), addr));
-
-                    Ok(())
+                if !authenticated {
+                    pending.reject(ErrorObjectOwned::owned(
+                        ErrorCode::InvalidParams.code(),
+                        format!("Authentication failed for address {}", addr),
+                        None::<()>)
+                    ).await;
+                    return Ok(());
                 }
-                None => {
-                    // client not authenticated yet, send signature to coordinator
-                    let builder = d.coord.authenticateClient(addr, Bytes::from(sig));
-                    let result = builder.send().await;
-                    match result {
-                        Ok(r) => {
-                            r.watch().await?;
 
-                            let sink = pending.accept().await?;
-                            d.sinks.insert(addr, sink);
-                            d.ids_and_addrs.push((self.id.clone(), addr));
+                d.authenticated.insert(addr);
 
-                            Ok(())
-                        }
+                if let Some(share) = d.mask_shares.get(&i) {
+                    let mut share_bytes = Vec::new();
+                    match share.serialize_compressed(&mut share_bytes) {
+                        Ok(_) => {},
                         Err(e) => {
-                            let msg = {
-                                if let Some(decoded_error) = e.as_decoded_interface_error::<StoffelCoordinatorErrors>() {
-                                    match decoded_error {
-                                        StoffelCoordinatorErrors::NoIndicesReserved(StoffelCoordinator::NoIndicesReserved { client }) => {
-                                            format!("No indices reserved by address {}", client)
-                                        }
-                                        StoffelCoordinatorErrors::AccessControlUnauthorizedAccount(_) => {
-                                            "Unauthorized account".to_string()
-                                        }
-                                        _ => {
-                                            "Unexpected error".to_string()
-                                        }
-                                    }
-                                } else {
-                                    "Unknown error".to_string()
-                                }
-                            };
-                            let err = format!("Authenticating client via smart contract failed: {e}: {msg}");
-
-                            println!("{}", err);
                             pending.reject(ErrorObjectOwned::owned(
-                                ErrorCode::ServerError(EthereumError as i32).code(),
-                                err,
+                                ErrorCode::ServerError(SerializationError as i32).code(),
+                                format!("Serializing share bytes failed: {e}"),
                                 None::<()>)
                             ).await;
-                            Ok(())
+                            return Ok(());
                         }
-                    }
+                    };
+                    let json = match to_json_raw_value(&share_bytes) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            pending.reject(ErrorObjectOwned::owned(
+                                ErrorCode::ServerError(SerializationError as i32).code(),
+                                format!("Converting serialized shares to JSON failed: {e}"),
+                                None::<()>)
+                            ).await;
+                            return Ok(());
+                        }
+                    };
+                    let sink = pending.accept().await?;
+                    sink.send(json).await?;
+                    d.ids_and_addrs.push((self.id.clone(), addr, None));
+                    return Ok(());
                 }
+                // share not yet available: fall through to store sink
+                pending_sig = None;
+            } else {
+                // reservation not yet known: store sig for verification once index arrives
+                pending_sig = Some(sig_bytes);
             }
+
+            let sink = pending.accept().await?;
+            d.sinks.insert(addr, sink);
+            d.ids_and_addrs.push((self.id.clone(), addr, pending_sig));
+
+            Ok(())
         }
     }
 }
@@ -444,13 +434,15 @@ fn u256_to_fr(x: U256) -> Option<Fr> {
     Some(Fr::from_le_bytes_mod_order(&bytes))
 }
 
-pub async fn generate_client_sig(base_nonce: u64, i: u64, signer: PrivateKeySigner) -> Signature {
+pub async fn generate_client_sig(base_nonce: u64, i: u64, signer: PrivateKeySigner) -> Result<Signature, alloy::signers::Error> {
     let hash = {
         let mut hasher = Keccak256::new();
         hasher.update((base_nonce + i).abi_encode());
         hasher.finalize()
     };
-    signer.sign_message(hash.as_slice()).await.expect("signing failed")
+    let sig = signer.sign_message(hash.as_slice()).await?;
+
+    Ok(sig)
 }
 
 pub async fn ws_connect(addr: &str, wallet_sk: &str) -> impl Provider + WalletProvider + Clone + 'static {
@@ -490,28 +482,6 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
     pub async fn base_nonce(&self) -> u64 {
         let base_nonce = self.coord.baseNonce().call().await.expect("sending TX failed");
         u256_to_u64(base_nonce).expect("impossible bug: block number does not fit into u64")
-    }
-
-    pub async fn wait_for_client_auth(&self, addr: Address) -> Result<bool, CoordinatorError> {
-        let mut events = match self.coord
-            .ClientAuthenticated_filter()
-            .from_block(self.contract_block)
-            .topic1(addr)
-            .watch().await {
-            Ok(e) => e.into_stream(),
-            Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for ClientAuthenticated events: {}", e)));
-            }
-       };
-
-        match events.next().await {
-            Some(Ok((StoffelCoordinator::ClientAuthenticated { client, success }, _))) => {
-                Ok(success)
-            }
-            _ => {
-                Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for ClientAuthenticated event".to_string()))
-            }
-        }
     }
 
     pub async fn grant_roles(&self, nodes: Vec<Address>) -> Result<(), CoordinatorError> {
@@ -1193,15 +1163,6 @@ mod tests {
                     }
                 }
 
-                // just received by one node here, but in reality would be received by
-                // all nodes, so we simulate it for more nodes
-                if !coords[0].wait_for_client_auth(ACC[5]).await.unwrap() {
-                    panic!();
-                }
-                for node_rpc in node_rpcs.iter_mut() {
-                    node_rpc.add_auth_status(ACC[5]).await.unwrap();
-                }
-
                 coords[0].trigger_round(Round::InputCollection).await.unwrap();
                 let _ = coords[0].wait_for_round(Round::InputCollection).await;
                 let client_to_masked_input = coords[0].wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
@@ -1217,9 +1178,12 @@ mod tests {
 
                 // check that all nodes have the same mapping
                 for node_rpc in node_rpcs.iter_mut() {
-                    let ids_and_addrs = node_rpc.ids_and_addrs().await;
-                    assert_eq!(ids_and_addrs.len(), 1);
-                    let client_public_key = &ids_and_addrs.iter().find(|(_, addr)| *addr == ACC[5]).expect("client address not found").0;
+                    let d = node_rpc.rpc_server.lock().await;
+                    let authenticated: Vec<_> = d.ids_and_addrs.iter()
+                        .filter(|(_, _, sig)| sig.is_none())
+                        .collect();
+                    assert_eq!(authenticated.len(), 1);
+                    let client_public_key = &authenticated.iter().find(|(_, addr, _)| *addr == ACC[5]).expect("client address not found").0;
                     assert_eq!(public_keys[5], *client_public_key);
                 }
 
@@ -1251,7 +1215,7 @@ mod tests {
 
                 let base_nonce = coord.base_nonce().await;
                 let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
-                let sig = generate_client_sig(base_nonce, 0, signer.clone()).await;
+                let sig = generate_client_sig(base_nonce, 0, signer.clone()).await.expect("generating client signature failed");
                 let mask = rpc_client.receive_mask(sig.into(), ACC[5]).await.unwrap();
                 assert_eq!(mask, correct_mask);
 

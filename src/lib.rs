@@ -144,6 +144,10 @@ pub enum NodeRPCError {
     JSONError,
     #[error("Serialization error")]
     SerializationError,
+    #[error("Ethereum error: {0}")]
+    EthereumError(String),
+    #[error("Authentication failed for client with TLS identity {0:?}")]
+    AuthenticationFailed(Vec<u8>),
 }
 
 static INIT: Once = Once::new();
