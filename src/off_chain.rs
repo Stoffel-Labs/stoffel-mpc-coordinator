@@ -454,6 +454,7 @@ pub enum CoordinatorRPCBaseError {
     OutputSharesAlreadySent = 8,
     OutputSharesAlreadyRequested = 9,
     NotParty = 10,
+    SendingFailed = 11,
 }
 
 /// The basic server-side information for one client connection to the coordinator RPC interface.
@@ -558,7 +559,7 @@ impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
             if index != events.len() {
                 let event = events[index].1.clone();
                 let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                sink.send(json).await.unwrap();
+                sink.send(json).await?;
 
                 return Ok(());
             }
@@ -581,7 +582,7 @@ impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
             for i in index..events.len() {
                 let event = events[i].1.clone();
                 let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                sink.send(json).await.unwrap();
+                sink.send(json).await?;
             }
 
             return Ok(());
@@ -603,7 +604,7 @@ impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
             for i in index..events.len() {
                 let event = events[i].1.clone();
                 let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                sink.send(json).await.unwrap();
+                sink.send(json).await?;
             }
 
             return Ok(());
@@ -628,7 +629,7 @@ impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
         // broadcast event to all subscribed RPC clients
         for sink in sinks.iter() {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            sink.send(json).await.unwrap();
+            sink.send(json).await.map_err(|_| CoordinatorError::JSONError("client disconnected".to_string()))?;
         }
 
         // clear all subscribed RPC clients
@@ -674,7 +675,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         let designated_party = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0].clone();
         if self.id != designated_party {
             return Err(ErrorObjectOwned::owned(
-                    NotDesignatedParty as i32,
+                    ErrorCode::ServerError(NotDesignatedParty as i32).code(),
                     format!("Only designated party {:?} can reset the coordinator.", designated_party),
                     None::<()>
             ));
@@ -682,7 +683,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if d.round != Round::Idle {
             return Err(ErrorObjectOwned::owned(
-                    WrongRound as i32,
+                    ErrorCode::ServerError(WrongRound as i32).code(),
                     format!("Need round {:?}, current round is {:?}", Round::Idle, d.round),
                     None::<()>
             ));
@@ -705,7 +706,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if d.round != Round::InputCollection {
             return Err(ErrorObjectOwned::owned(
-                    WrongRound as i32,
+                    ErrorCode::ServerError(WrongRound as i32).code(),
                     format!("Need round {:?}, current round is {:?}", Round::InputCollection, d.round),
                     None::<()>
             ));
@@ -715,7 +716,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if reserved_index >= d.masked_inputs.len(){
             return Err(ErrorObjectOwned::owned(
-                    IndexOutOfBounds as i32,
+                    ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
                     format!("The index {} is out of bounds, there are only {} input masks.", reserved_index, d.masked_inputs.len()),
                     None::<()>
             ));
@@ -725,14 +726,14 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
             Some(public_key) => {
                 if *public_key != self.id {
                     return Err(ErrorObjectOwned::owned(
-                            BadID as i32,
+                            ErrorCode::ServerError(BadID as i32).code(),
                             format!("Client {:?} cannot submit a masked input for index {}, since this index has been reserved by {:?}", self.id, reserved_index, *public_key),
                             None::<()>
                     ));
                 }
                 if d.masked_inputs[reserved_index].is_some() {
                     return Err(ErrorObjectOwned::owned(
-                            MaskedInputAlreadySubmitted as i32,
+                            ErrorCode::ServerError(MaskedInputAlreadySubmitted as i32).code(),
                             format!("Client {:?} has already submitted a masked input for index {}", self.id, reserved_index),
                             None::<()>
                     ));
@@ -742,13 +743,13 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
                 let event = Event::MaskedInputEvent { client: self.id.clone(), masked_input, reserved_index: raw_reserved_index };
                 for sink in &d.masked_input_sinks {
                     let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                    sink.send(json).await.unwrap();
+                    sink.send(json).await.map_err(|_| ErrorObjectOwned::owned(ErrorCode::ServerError(SendingFailed as i32).code(), "sending to subscriber failed", None::<()>))?;
                 }
                 d.masked_input_events.push((SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), event));
             }
             None => {
                 return Err(ErrorObjectOwned::owned(
-                        IndexNotReserved as i32,
+                        ErrorCode::ServerError(IndexNotReserved as i32).code(),
                         format!("Cannot submit a masked input for index {}, since it has not been reserved", reserved_index),
                         None::<()>
                 ));
@@ -775,7 +776,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if d.round != Round::InputMaskReservation {
             return Err(ErrorObjectOwned::owned(
-                    WrongRound as i32,
+                    ErrorCode::ServerError(WrongRound as i32).code(),
                     format!("Need round {:?}, current round is {:?}", Round::InputMaskReservation, d.round),
                     None::<()>
             ));
@@ -783,7 +784,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if i as usize >= d.reserved_indices.len() {
             return Err(ErrorObjectOwned::owned(
-                    IndexOutOfBounds as i32,
+                    ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
                     format!("The index {} is out of bounds, there are only {} input masks.", i, d.reserved_indices.len()),
                     None::<()>
             ));
@@ -791,7 +792,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if d.reserved_indices[i as usize].is_some() {
             return Err(ErrorObjectOwned::owned(
-                    OutOfIndices as i32,
+                    ErrorCode::ServerError(OutOfIndices as i32).code(),
                     "No indices left.",
                     None::<()>
             ));
@@ -804,7 +805,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         // broadcast reserved index to all subscribed RPC clients
         for sink in &d.reserved_index_sinks {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            sink.send(json).await.unwrap();
+            sink.send(json).await.map_err(|_| ErrorObjectOwned::owned(ErrorCode::ServerError(SendingFailed as i32).code(), "sending to subscriber failed", None::<()>))?;
         }
 
         d.n_reserved += 1;
@@ -819,7 +820,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         let designated_party = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0].clone();
         if self.id != designated_party {
             return Err(ErrorObjectOwned::owned(
-                    NotDesignatedParty as i32,
+                    ErrorCode::ServerError(NotDesignatedParty as i32).code(),
                     format!("Only designated party {:?} can do transitions.", designated_party),
                     None::<()>
             ));
@@ -850,7 +851,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         let mpc_nodes = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!");
         if !mpc_nodes.contains(&self.id) {
             return Err(ErrorObjectOwned::owned(
-                    NotParty as i32,
+                    ErrorCode::ServerError(NotParty as i32).code(),
                     "Only parties can send output shares.",
                     None::<()>
             ));
@@ -859,7 +860,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         // a node cannot send output shares for a client twice
         if d.output_shares.contains_key(&(client_id.clone(), self.id.clone())) {
             return Err(ErrorObjectOwned::owned(
-                OutputSharesAlreadySent as i32,
+                ErrorCode::ServerError(OutputSharesAlreadySent as i32).code(),
                 format!("Client {:?} already has submitted their output shares.", client_id),
                 None::<()>
             ));
@@ -873,7 +874,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         if output_shares.len() as u64 >= 2 * d.t + 1 {
             if let Some(sink) = d.output_sinks.get(&client_id) {
                 let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
-                sink.send(json.clone()).await.unwrap();
+                sink.send(json.clone()).await.map_err(|_| ErrorObjectOwned::owned(ErrorCode::ServerError(SendingFailed as i32).code(), "sending to subscriber failed", None::<()>))?;
             }
         }
         Ok(())
@@ -884,7 +885,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if d.output_sinks.contains_key(&self.id) {
             pending.reject(ErrorObjectOwned::owned(
-                OutputSharesAlreadyRequested as i32,
+                ErrorCode::ServerError(OutputSharesAlreadyRequested as i32).code(),
                 format!("Client {:?} already has requested their output shares.", self.id),
                 None::<()>
             )).await;
@@ -900,7 +901,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
             let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
             let sink = d.output_sinks.get(&self.id).unwrap();
 
-            sink.send(json.clone()).await.unwrap();
+            sink.send(json.clone()).await?;
         }
 
         Ok(())

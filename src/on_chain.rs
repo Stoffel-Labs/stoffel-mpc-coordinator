@@ -513,6 +513,14 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
         Ok(())
     }
 
+    /// Resets local state after the smart contract has been reset, so subsequent event listeners
+    /// do not replay events from previous rounds.
+    pub async fn reset(&mut self) -> Result<(), CoordinatorError> {
+        self.contract_block = self.coord.provider().get_block_number().await
+            .map_err(|e| CoordinatorError::EthereumError(format!("error getting current block number: {}", e)))?;
+        Ok(())
+    }
+
     async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
         let result = match round {
             Round::Idle => { panic!(); }
@@ -922,13 +930,13 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
 mod tests {
     use super::*;
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::providers::{Provider, WalletProvider};
     use ark_std::test_rng;
     use ark_bls12_381::Fr;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy_primitives::{Address, U256, FixedBytes, address};
     use stoffel_solidity_bindings::fake_coordinator::FakeCoordinator;
     use tokio::time::{timeout, Duration};
-    use tokio::sync::Barrier;
     use std::sync::Arc;
     use rand::Rng;
     use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -962,6 +970,89 @@ mod tests {
 
     fn spawn_anvil() -> AnvilInstance {
         Anvil::new().spawn()
+    }
+
+    async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
+        coords: &mut Vec<OnChainCoordinator<P>>,
+        node_rpcs: &mut Vec<super::node_rpc::NodeRPCServer<P>>,
+        mask_shares: Vec<RobustShare<Fr>>,
+        output_shares: Vec<RobustShare<Fr>>,
+        client_addr: Address,
+        public_key: Vec<u8>,
+    ) {
+        for (i, node_rpc) in node_rpcs.iter_mut().enumerate() {
+            node_rpc.add_mask_share(0, mask_shares[i].clone()).await.unwrap();
+        }
+        coords[0].trigger_round(Round::Preprocessing).await.unwrap();
+        let _ = coords[0].wait_for_round(Round::Preprocessing).await;
+        coords[0].trigger_round(Round::InputMaskReservation).await.unwrap();
+        let _ = coords[0].wait_for_round(Round::InputMaskReservation).await;
+        let client_to_index = coords[0].wait_for_indices(1).await.unwrap();
+        assert_eq!(client_to_index.len(), 1);
+        assert!(client_to_index.contains_key(&client_addr));
+        for (c, indices) in client_to_index {
+            println!("NODE: client {:?} reserved index {:?}", c, indices);
+            for node_rpc in node_rpcs.iter_mut() {
+                for &i in &indices {
+                    node_rpc.add_reserved_index(c, i).await.unwrap();
+                }
+            }
+        }
+        coords[0].trigger_round(Round::InputCollection).await.unwrap();
+        let _ = coords[0].wait_for_round(Round::InputCollection).await;
+        let client_to_masked_input = coords[0].wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
+        for (c, masked_inputs) in client_to_masked_input {
+            for masked_input in masked_inputs {
+                println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
+            }
+        }
+        coords[0].trigger_round(Round::MPCExecution).await.unwrap();
+        let _ = coords[0].wait_for_round(Round::MPCExecution).await;
+        coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
+        let _ = coords[0].wait_for_round(Round::OutputDistribution).await;
+        for node_rpc in node_rpcs.iter() {
+            let d = node_rpc.rpc_server.lock().await;
+            let authenticated: Vec<_> = d.ids_and_addrs.iter()
+                .filter(|(_, _, sig)| sig.is_none())
+                .collect();
+            assert_eq!(authenticated.len(), 1);
+            let client_public_key = &authenticated.iter()
+                .find(|(_, addr, _)| *addr == client_addr)
+                .expect("client address not found").0;
+            assert_eq!(public_key, *client_public_key);
+        }
+        for (i, coord) in coords.iter_mut().enumerate() {
+            coord.send_output_shares(client_addr, public_key.clone(), vec![output_shares[i].clone()]).await.unwrap();
+        }
+        coords[0].trigger_round(Round::ProgramFinished).await.unwrap();
+    }
+
+    async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
+        coord: &mut OnChainCoordinator<P>,
+        rpc_client: &super::node_rpc::NodeRPCClient,
+        client_addr: Address,
+        client_sk: &str,
+        correct_mask: Fr,
+        correct_output: Fr,
+    ) {
+        let _ = coord.wait_for_round(Round::Preprocessing).await;
+        let _ = coord.wait_for_round(Round::InputMaskReservation).await;
+        coord.reserve_mask_index(0).await.expect("obtaining mask indices failed");
+        println!("CLIENT: obtained index 0");
+        let base_nonce = coord.base_nonce().await;
+        let signer = PrivateKeySigner::from_str(client_sk).unwrap();
+        let sig = generate_client_sig(base_nonce, 0, signer).await.expect("generating client signature failed");
+        let mask = rpc_client.receive_mask(sig.into(), client_addr).await.unwrap();
+        assert_eq!(mask, correct_mask);
+        let _ = coord.wait_for_round(Round::InputCollection).await;
+        let masked_input = mask + Fr::from(1337);
+        coord.send_masked_input(masked_input, 0).await.unwrap();
+        let _ = coord.wait_for_round(Round::MPCExecution).await;
+        let _ = coord.wait_for_round(Round::OutputDistribution).await;
+        let outputs = coord.obtain_outputs().await.unwrap();
+        println!("CLIENT: obtained outputs {:?}", outputs);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], correct_output);
     }
 
     #[test]
@@ -1093,11 +1184,11 @@ mod tests {
         let node_rpc_addrs = vec![
             ("127.0.0.1".to_string(), 12351),
             ("127.0.0.1".to_string(), 12352),
-            ("127.0.0.1".to_string(), 12353)
+            ("127.0.0.1".to_string(), 12353),
         ];
         let anvil = spawn_anvil();
         let n = 5;
-        let t = 1;
+        let t = 1u64;
         let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
@@ -1105,136 +1196,117 @@ mod tests {
         let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
         let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
 
-        let barrier = Arc::new(Barrier::new(3));
+        let mut instances = Vec::new();
+        for i in 0..3 {
+            let p = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
+            instances.push(StoffelCoordinatorInstance::new(*contract.address(), p));
+        }
 
-        // MPC node (designated party), also RPC client
-        tokio::spawn({
-            let barrier = barrier.clone();
+        let mut coords = Vec::new();
+        for i in 0..3 {
+            coords.push(OnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
+        }
+        coords[0].grant_roles(initial_mpc_nodes.clone()).await.expect("granting roles failed");
 
-            let mut instances = Vec::new();
-            for i in 0..3 {
-                let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
-                let instance = StoffelCoordinatorInstance::new(*contract.address(), provider);
-                instances.push(instance);
-            }
+        let mut rng = test_rng();
+        let mask_shares = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
+        let output_shares = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
 
-            let mut coords = Vec::new();
-            for i in 0..3 {
-                let coord =
-                    OnChainCoordinator::new(instances[i].clone(), 1, 1, None).await;
-                coords.push(coord);
-            }
+        let mut node_rpcs = Vec::new();
+        for i in 0..3 {
+            let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(
+                &node_rpc_addrs[i].0, node_rpc_addrs[i].1, instances[i].clone(), certs[i].clone()
+            ).await;
+            node_rpcs.push(node_rpc);
+        }
 
-            // grant roles to parties
-            coords[0].grant_roles(initial_mpc_nodes.clone()).await.expect("granting roles failed");
+        let client_provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
+        let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
+        let mut client_coord = OnChainCoordinator::new(client_instance, t, 1, Some(certs[5].signing_key.serialize_der())).await;
+        let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), certs[5].clone()).await;
 
-            // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
-            // node here, but we use 3 RPC nodes to make the process work
-            let mask = Fr::from(42);
-            let mut rng = test_rng();
-            let mask_shares = RobustShare::compute_shares(mask, n, t as usize, None, &mut rng).unwrap();
-            let output_shares = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
+        tokio::join!(
+            run_node_round(&mut coords, &mut node_rpcs, mask_shares, output_shares[..3].to_vec(), ACC[5], public_keys[5].clone()),
+            run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)
+        );
+    }
 
-            let mut node_rpcs = Vec::new();
-            for i in 0..3 {
-                let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
-                    node_rpc_addrs[i].1, instances[i].clone(), certs[i].clone()).await;
+    #[tokio::test]
+    pub async fn reset_and_rerun() {
+        crate::setup_test();
 
-                node_rpc.add_mask_share(0, mask_shares[i].clone()).await.unwrap();
-                node_rpcs.push(node_rpc);
-            }
+        let certs = (0..7).map(|_| crate::self_signed_certs::client_cert()).collect::<Vec<_>>();
+        let public_keys = certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
 
-            async move {
-                coords[0].trigger_round(Round::Preprocessing).await.unwrap();
-                let _ = coords[0].wait_for_round(Round::Preprocessing).await;
-                coords[0].trigger_round(Round::InputMaskReservation).await.unwrap();
-                let _ = coords[0].wait_for_round(Round::InputMaskReservation).await;
-                let client_to_index = coords[0].wait_for_indices(1).await.unwrap();  // called by node
-                assert_eq!(client_to_index.len(), 1);
-                assert!(client_to_index.contains_key(&ACC[5]));
-                for (c, indices) in client_to_index {
-                    println!("NODE: client {:?} reserved index {:?}", c, indices);
-                    for node_rpc in node_rpcs.iter_mut() {
-                        // just received by one node here, but in reality would be received by
-                        // all nodes, so we simulate this here for more nodes
-                        for i in &indices {
-                            node_rpc.add_reserved_index(c, *i).await.unwrap();
-                        }
-                    }
-                }
+        let correct_mask = Fr::from(42);
+        let correct_output = Fr::from(31415);
 
-                coords[0].trigger_round(Round::InputCollection).await.unwrap();
-                let _ = coords[0].wait_for_round(Round::InputCollection).await;
-                let client_to_masked_input = coords[0].wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
-                for (c, masked_inputs) in client_to_masked_input {
-                    for masked_input in masked_inputs {
-                        println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
-                    }
-                }
-                coords[0].trigger_round(Round::MPCExecution).await.unwrap();
-                let _ = coords[0].wait_for_round(Round::MPCExecution).await;
-                coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
-                let _ = coords[0].wait_for_round(Round::OutputDistribution).await;
+        let node_rpc_addrs = vec![
+            ("127.0.0.1".to_string(), 12354),
+            ("127.0.0.1".to_string(), 12355),
+            ("127.0.0.1".to_string(), 12356),
+        ];
+        let anvil = spawn_anvil();
+        let n = 5;
+        let t = 1u64;
+        let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+        let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
+        let n_inputs = U256::from(1);
 
-                // check that all nodes have the same mapping
-                for node_rpc in node_rpcs.iter_mut() {
-                    let d = node_rpc.rpc_server.lock().await;
-                    let authenticated: Vec<_> = d.ids_and_addrs.iter()
-                        .filter(|(_, _, sig)| sig.is_none())
-                        .collect();
-                    assert_eq!(authenticated.len(), 1);
-                    let client_public_key = &authenticated.iter().find(|(_, addr, _)| *addr == ACC[5]).expect("client address not found").0;
-                    assert_eq!(public_keys[5], *client_public_key);
-                }
+        let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
 
-                // all nodes send output shares to the coordinator
-                for (i, coord) in coords.iter_mut().enumerate() {
-                    coord.send_output_shares(ACC[5], public_keys[5].clone(), vec![output_shares[i].clone()]).await.unwrap();
-                }
-                coords[0].trigger_round(Round::ProgramFinished).await.unwrap();
+        let mut instances = Vec::new();
+        for i in 0..3 {
+            let p = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
+            instances.push(StoffelCoordinatorInstance::new(*contract.address(), p));
+        }
 
-                barrier.wait().await;
-            }
-        });
+        let mut coords = Vec::new();
+        for i in 0..3 {
+            coords.push(OnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
+        }
+        coords[0].grant_roles(initial_mpc_nodes.clone()).await.expect("granting roles failed");
 
-        // MPC client, also RPC client
-        tokio::spawn({
-            let barrier = barrier.clone();
+        let mut rng = test_rng();
 
-            let provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
-            let instance = StoffelCoordinatorInstance::new(*contract.address(), provider.clone());
-            let mut coord = OnChainCoordinator::new(instance, t, 1, Some(certs[5].signing_key.serialize_der())).await;
+        let mut node_rpcs = Vec::new();
+        for i in 0..3 {
+            let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(
+                &node_rpc_addrs[i].0, node_rpc_addrs[i].1, instances[i].clone(), certs[i].clone()
+            ).await;
+            node_rpcs.push(node_rpc);
+        }
 
-            async move {
-                let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), certs[5].clone()).await;
-                let _ = coord.wait_for_round(Round::Preprocessing).await;
-                let _ = coord.wait_for_round(Round::InputMaskReservation).await;
+        let client_provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
+        let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
+        let mut client_coord = OnChainCoordinator::new(client_instance, t, 1, Some(certs[5].signing_key.serialize_der())).await;
+        let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), certs[5].clone()).await;
 
-                coord.reserve_mask_index(0).await.expect("obtaining mask indices failed");
-                println!("CLIENT: obtained index 0");
+        // Round 1
+        let mask_shares = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
+        let output_shares = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
+        tokio::join!(
+            run_node_round(&mut coords, &mut node_rpcs, mask_shares, output_shares[..3].to_vec(), ACC[5], public_keys[5].clone()),
+            run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)
+        );
 
-                let base_nonce = coord.base_nonce().await;
-                let signer = PrivateKeySigner::from_str(SK[5]).unwrap();
-                let sig = generate_client_sig(base_nonce, 0, signer.clone()).await.expect("generating client signature failed");
-                let mask = rpc_client.receive_mask(sig.into(), ACC[5]).await.unwrap();
-                assert_eq!(mask, correct_mask);
+        // Reset: on-chain reset, then update local state on all coordinators and node RPCs
+        coords[0].reset_coord(hash.0, t, initial_mpc_nodes.clone(), 1).await.unwrap();
+        for coord in coords.iter_mut() {
+            coord.reset().await.unwrap();
+        }
+        client_coord.reset().await.unwrap();
+        for node_rpc in node_rpcs.iter_mut() {
+            node_rpc.reset().await;
+        }
 
-                let _ = coord.wait_for_round(Round::InputCollection).await;
-
-                let masked_input = mask + Fr::from(1337);
-                coord.send_masked_input(Fr::from(masked_input), 0).await.unwrap();
-
-                let _ = coord.wait_for_round(Round::MPCExecution).await;
-                let _ = coord.wait_for_round(Round::OutputDistribution).await;
-                let outputs = coord.obtain_outputs().await.unwrap();
-                println!("CLIENT: obtained outputs {:?}", outputs);
-                assert_eq!(outputs.len(), 1);
-                assert_eq!(outputs[0], correct_output);
-
-                barrier.wait().await;
-            }
-        });
-
-        barrier.wait().await;
+        // Round 2
+        let mask_shares2 = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
+        let output_shares2 = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
+        tokio::join!(
+            run_node_round(&mut coords, &mut node_rpcs, mask_shares2, output_shares2[..3].to_vec(), ACC[5], public_keys[5].clone()),
+            run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)
+        );
     }
 }
