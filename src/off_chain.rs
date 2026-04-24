@@ -547,6 +547,19 @@ pub trait CoordinatorRPCBase<F: FftField> {
     /// reconstruct their private output.
     #[subscription(name = "sub_obtain_output_shares", unsubscribe = "unsub_obtain_output_shares", item = Vec<(Vec<u8>, Vec<u8>)>)]
     async fn obtain_output_shares(&self) -> SubscriptionResult;
+
+    /// MPC parties use this to publish a raw byte payload (e.g. the ADKG
+    /// aggregate public key) indexed by `party_id`. Only parties already
+    /// registered as MPC nodes in the coordinator state are accepted.
+    #[method(name = "submit_raw_output")]
+    async fn submit_raw_output(&self, party_id: u64, bytes: Vec<u8>) -> RpcResult<()>;
+
+    /// Returns every party's raw byte payload in `party_id` order.
+    /// Entries for parties that have not yet called `submit_raw_output`
+    /// are skipped — callers that require a full set should wait until
+    /// the returned vector's length equals `n`.
+    #[method(name = "obtain_raw_outputs")]
+    async fn obtain_raw_outputs(&self) -> RpcResult<Vec<Vec<u8>>>;
 }
 
 /// Errors returned to RPC clients by the basic coordinator RPC interface.
@@ -606,6 +619,15 @@ pub struct CoordinatorRPCServerSharedBase<F: FftField> {
     output_shares: HashMap<(ClientIdentity, ClientIdentity), (Vec<u8>, Vec<u8>)>,
     /// Sinks for MPC clients that are waiting to obtain their output shares.
     output_sinks: HashMap<ClientIdentity, SubscriptionSink>,
+    /// Raw byte payloads indexed by party_id.
+    ///
+    /// Used by protocols whose output cannot ride the scalar
+    /// `output_shares` path — notably ADKG, whose aggregate public key
+    /// is a compressed elliptic-curve point. Sized to `n` at construction
+    /// time. `submit_raw_output(i, bytes)` writes at index `i`.
+    /// `obtain_raw_outputs()` returns only filled slots in `party_id`
+    /// order.
+    raw_outputs: Vec<Option<Vec<u8>>>,
 }
 
 impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
@@ -649,6 +671,7 @@ impl<F: FftField> CoordinatorRPCServerSharedBase<F> {
             clients: HashMap::new(),
             output_shares: HashMap::new(),
             output_sinks: HashMap::new(),
+            raw_outputs: vec![None; n as usize],
         }
     }
 
@@ -1188,6 +1211,40 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         Ok(())
     }
+
+    async fn submit_raw_output(&self, party_id: u64, bytes: Vec<u8>) -> RpcResult<()> {
+        let mut d = self.d.lock().await;
+
+        // Only MPC nodes may submit raw outputs.
+        let mpc_nodes = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!");
+        if !mpc_nodes.contains(&self.id) {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(NotParty as i32).code(),
+                "Only MPC parties can submit raw outputs.",
+                None::<()>,
+            ));
+        }
+
+        let idx = party_id as usize;
+        if idx >= d.raw_outputs.len() {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
+                format!(
+                    "party_id {party_id} is out of bounds (n={})",
+                    d.raw_outputs.len()
+                ),
+                None::<()>,
+            ));
+        }
+
+        d.raw_outputs[idx] = Some(bytes);
+        Ok(())
+    }
+
+    async fn obtain_raw_outputs(&self) -> RpcResult<Vec<Vec<u8>>> {
+        let d = self.d.lock().await;
+        Ok(d.raw_outputs.iter().flatten().cloned().collect())
+    }
 }
 
 /// The pre-implemented RPC server-side connection can be used as a full-fledged RPC server
@@ -1633,6 +1690,22 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
 
         Ok(())
     }
+
+    async fn submit_raw_output(
+        &self,
+        party_id: usize,
+        bytes: Vec<u8>,
+    ) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::<F>::submit_raw_output(self.rpc(), party_id as u64, bytes)
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
+
+    async fn obtain_raw_outputs(&self) -> Result<Vec<Vec<u8>>, CoordinatorError> {
+        CoordinatorRPCBaseClient::<F>::obtain_raw_outputs(self.rpc())
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -1729,6 +1802,59 @@ mod tests {
             client_cert(),
         )
         .await;
+    }
+
+    /// Integration test for the raw-output wire format added on this
+    /// branch. 4 parties each submit a distinct byte payload tagged with
+    /// their `party_id`; any party then reads `obtain_raw_outputs` and
+    /// gets the full vector in ascending `party_id` order.
+    #[tokio::test]
+    async fn raw_outputs_roundtrip() {
+        crate::setup_test();
+
+        let mut certs = (0..4).map(|_| server_cert()).collect::<Vec<_>>();
+        let public_keys = certs
+            .iter()
+            .map(|c| c.signing_key.public_key_raw().to_vec())
+            .collect::<Vec<_>>();
+
+        let addr = "127.0.0.1";
+        let port = 12400;
+        let t = 1;
+        let server_state =
+            CoordinatorRPCServerSharedBase::<Fr>::new([0u8; 32], 4, t, public_keys, 0);
+        let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
+            server_state,
+            addr,
+            port,
+            t,
+            server_cert(),
+        )
+        .await;
+        let timestamp = coord.get_timestamp();
+
+        let mut handles = Vec::new();
+        for party_id in 0..4u64 {
+            let cert = certs.remove(0);
+            let client = OffChainCoordinatorClient::<Fr>::start_rpc_client_from_cert(
+                addr, port, timestamp, 1, 1, cert,
+            )
+            .await;
+            client
+                .submit_raw_output(party_id as usize, vec![0xA0 + party_id as u8; 4])
+                .await
+                .expect("submit_raw_output");
+            handles.push(client);
+        }
+
+        let all = handles[0]
+            .obtain_raw_outputs()
+            .await
+            .expect("obtain_raw_outputs");
+        assert_eq!(
+            all,
+            vec![vec![0xA0; 4], vec![0xA1; 4], vec![0xA2; 4], vec![0xA3; 4]]
+        );
     }
 
     // Tests event triggering.
