@@ -89,9 +89,9 @@ pub trait Coordinator<F: FftField> {
     /// public key `key`.
     fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<F>>) -> impl Future<Output = Result<(), CoordinatorError>>;
 
-    /// Called by the designated party to reset the coordinator, so another program can be
-    /// executed.
-    fn reset_coord(&self, prog_hash: [u8; 32], t: u64, initial_mpc_nodes: Vec<Self::ClientIdentity>, n_inputs: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
+    /// Called by the designated party to reset the coordinator, so the program can be
+    /// executed again again.
+    fn reset_coord(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
 }
 
 /// Errors returned by the coordinator interface. Some are specific to whether the coordinator is

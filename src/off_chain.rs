@@ -420,7 +420,7 @@ pub trait CoordinatorRPCBase<F: FftField> {
 
     /// The designated party can reset the coordinator with this method.
     #[method(name = "reset")]
-    async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()>;
+    async fn reset(&self) -> RpcResult<()>;
 
     /// An MPC client uses this to submit a masked input `masked_input`, for which it has
     /// previously reserved the index `reserved_index`.
@@ -669,7 +669,7 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
         Ok(d.masked_inputs.len() as u64 - d.n_reserved)
     }
 
-    async fn reset(&self, prog_hash: [u8; 32], n: u64, t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> RpcResult<()> {
+    async fn reset(&self) -> RpcResult<()> {
         let mut d = self.d.lock().await;
 
         let designated_party = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0].clone();
@@ -689,14 +689,12 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
             ));
         }
 
+        let n_inputs = d.masked_inputs.len();
+
         d.round = Round::Idle;
         d.masked_inputs = vec![None; n_inputs as usize];
         d.n_reserved = 0;
         d.reserved_indices = vec![None; n_inputs as usize];
-        d.prog_hash = prog_hash;
-        d.n = n;
-        d.t = t;
-        d.mpc_nodes = Some(initial_mpc_nodes);
 
         Ok(())
     }
@@ -1034,8 +1032,8 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
         StoffelCoordinatorRPCClient::finalize(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
-    async fn reset_coord(&self, prog_hash: [u8; 32], t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::<F>::reset(self.rpc(), prog_hash, 3 * t + 1, t, initial_mpc_nodes, n_inputs).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    async fn reset_coord(&self) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::<F>::reset(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {

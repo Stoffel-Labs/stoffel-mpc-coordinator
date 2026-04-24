@@ -484,35 +484,6 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
         u256_to_u64(base_nonce).expect("impossible bug: block number does not fit into u64")
     }
 
-    pub async fn grant_roles(&self, nodes: Vec<Address>) -> Result<(), CoordinatorError> {
-        assert_eq!(nodes.len(), 5);
-
-        let party_role = {
-            let builder = self.coord.PARTY_ROLE();
-            builder.call().await.expect("sending TX failed")
-        };
-
-        // grant party roles
-        for i in 0..nodes.len() {
-            let builder = self.coord.grantRole(party_role, nodes[i]);
-            match builder.send().await {
-                Ok(r) => {
-                    match r.watch().await {
-                        Ok(_) => { },
-                        Err(e) => {
-                            return Err(CoordinatorError::EthereumError(format!("error waiting for transaction to grant role to be mined: {}", e)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(CoordinatorError::EthereumError(format!("error sending transaction to grant role: {}", e)));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Resets local state after the smart contract has been reset, so subsequent event listeners
     /// do not replay events from previous rounds.
     pub async fn reset(&mut self) -> Result<(), CoordinatorError> {
@@ -666,8 +637,8 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         }
     }
 
-    async fn reset_coord(&self, prog_hash: [u8; 32], t: u64, initial_mpc_nodes: Vec<ClientIdentity>, n_inputs: u64) -> Result<(), CoordinatorError> {
-        let builder = self.coord.resetCoordinator(FixedBytes::from(prog_hash), U256::from(t), initial_mpc_nodes, U256::from(n_inputs));
+    async fn reset_coord(&self) -> Result<(), CoordinatorError> {
+        let builder = self.coord.resetCoordinator();
         let result = builder.send().await;
 
         match result {
@@ -832,7 +803,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         };
 
         let mut events = match self.coord
-            .EnoughPrivateOutputShares_filter()
+            .EnoughOutputShares_filter()
             .from_block(self.contract_block)
             .topic1(self.coord.provider().default_signer_address())
             .watch()
@@ -843,7 +814,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             }
         };
     
-        while let Some(Ok((StoffelCoordinator::EnoughPrivateOutputShares { client: _, shares }, _))) = events.next().await {
+        while let Some(Ok((StoffelCoordinator::EnoughOutputShares { client: _, shares }, _))) = events.next().await {
             if (shares.len() as u64) < 2 * self.t + 1 {
                 panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
             }
@@ -886,7 +857,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             }
         }
 
-        Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for EnoughPrivateOutputShares events".to_string()))
+        Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for EnoughOutputShares events".to_string()))
     }
 
     async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> Result<(), CoordinatorError> {
@@ -907,7 +878,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
 
         let mut bytes = Vec::new();
         c.serialize_compressed(&mut bytes).map_err(|_| CoordinatorError::SerializationError)?;
-        let builder = self.coord.sendPrivateOutputShares(client_id, Bytes::from(bytes));
+        let builder = self.coord.sendOutputShares(client_id, Bytes::from(bytes));
         let result = builder.send().await;
 
         match result {
@@ -935,9 +906,8 @@ mod tests {
     use ark_bls12_381::Fr;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy_primitives::{Address, U256, FixedBytes, address};
-    use stoffel_solidity_bindings::fake_coordinator::FakeCoordinator;
+    use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
     use tokio::time::{timeout, Duration};
-    use std::sync::Arc;
     use rand::Rng;
     use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
     use stoffelmpc_mpc::common::SecretSharingScheme;
@@ -1089,7 +1059,7 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
         let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
         let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
         assert_eq!(coord.contract_block, 1);
@@ -1106,7 +1076,7 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
             let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
@@ -1123,7 +1093,7 @@ mod tests {
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
             let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
             let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
 
@@ -1156,7 +1126,7 @@ mod tests {
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
 
         // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
         let mut node_rpcs = Vec::new();
@@ -1194,7 +1164,7 @@ mod tests {
         let n_inputs = U256::from(1);
 
         let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![ACC[5]]).await.expect("deployment failed");
 
         let mut instances = Vec::new();
         for i in 0..3 {
@@ -1206,7 +1176,6 @@ mod tests {
         for i in 0..3 {
             coords.push(OnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
         }
-        coords[0].grant_roles(initial_mpc_nodes.clone()).await.expect("granting roles failed");
 
         let mut rng = test_rng();
         let mask_shares = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
@@ -1254,7 +1223,7 @@ mod tests {
         let n_inputs = U256::from(1);
 
         let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![ACC[5]]).await.expect("deployment failed");
 
         let mut instances = Vec::new();
         for i in 0..3 {
@@ -1266,7 +1235,6 @@ mod tests {
         for i in 0..3 {
             coords.push(OnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
         }
-        coords[0].grant_roles(initial_mpc_nodes.clone()).await.expect("granting roles failed");
 
         let mut rng = test_rng();
 
@@ -1292,7 +1260,7 @@ mod tests {
         );
 
         // Reset: on-chain reset, then update local state on all coordinators and node RPCs
-        coords[0].reset_coord(hash.0, t, initial_mpc_nodes.clone(), 1).await.unwrap();
+        coords[0].reset_coord().await.unwrap();
         for coord in coords.iter_mut() {
             coord.reset().await.unwrap();
         }
