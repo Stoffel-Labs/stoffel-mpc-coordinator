@@ -6,7 +6,10 @@ pub mod self_signed_certs;
 /// TODO
 pub mod rpc;
 
-/// The on-chain coordinator.
+/// The on-chain coordinator. Gated behind the `on-chain` feature so
+/// downstream consumers that only need the off-chain surface can opt
+/// out of the Solidity + alloy dep tree.
+#[cfg(feature = "on-chain")]
 pub mod on_chain;
 
 /// The off-chain coordinator.
@@ -92,6 +95,49 @@ pub trait Coordinator<F: FftField> {
     /// Called by the designated party to reset the coordinator, so another program can be
     /// executed.
     fn reset_coord(&self, prog_hash: [u8; 32], t: u64, initial_mpc_nodes: Vec<Self::ClientIdentity>, n_inputs: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
+
+    /// Called by an MPC party to publish a raw byte output for this computation.
+    ///
+    /// Unlike [`Coordinator::send_output_shares`], which carries encrypted
+    /// shares keyed by client identity, this method carries a single
+    /// plaintext byte payload indexed by `party_id`. It exists to support
+    /// protocols (notably ADKG) whose output is a group element rather
+    /// than a vector of scalar field elements — and so does not fit
+    /// [`Coordinator::obtain_outputs`]'s `Vec<F>` shape.
+    ///
+    /// The default impl returns [`CoordinatorError::NotImplemented`]; concrete
+    /// coordinators extend it with a real RPC round-trip when they need
+    /// to support raw-byte outputs.
+    fn submit_raw_output(
+        &self,
+        _party_id: usize,
+        _bytes: Vec<u8>,
+    ) -> impl Future<Output = Result<(), CoordinatorError>> {
+        async {
+            Err(CoordinatorError::NotImplemented(
+                "submit_raw_output is not implemented for this coordinator".into(),
+            ))
+        }
+    }
+
+    /// Collect the raw byte outputs previously published via
+    /// [`Coordinator::submit_raw_output`], indexed by party.
+    ///
+    /// Returns one entry per party in ascending `party_id` order; for
+    /// protocols where every party publishes the same value (e.g. the
+    /// aggregate public key at the end of ADKG) the caller asserts that
+    /// all entries are byte-identical before consuming the first.
+    ///
+    /// The default impl returns [`CoordinatorError::NotImplemented`].
+    fn obtain_raw_outputs(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>, CoordinatorError>> {
+        async {
+            Err(CoordinatorError::NotImplemented(
+                "obtain_raw_outputs is not implemented for this coordinator".into(),
+            ))
+        }
+    }
 }
 
 /// Errors returned by the coordinator interface. Some are specific to whether the coordinator is
@@ -133,7 +179,9 @@ pub enum CoordinatorError {
     #[error("Parsing an encapsulated key failed")]
     ParsingEncapsulatedKeyFailed,
     #[error("Cannot transition to Idle round")]
-    CannotTransitionToIdle
+    CannotTransitionToIdle,
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 #[derive(Error, Clone, Debug)]
