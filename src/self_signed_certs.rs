@@ -1,19 +1,19 @@
-use rustls::pki_types::PrivateKeyDer;
-use rustls::pki_types::PrivatePkcs8KeyDer;
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::UnixTime;
-use rustls::pki_types::ServerName;
-use rustls::server::danger::{ClientCertVerifier, ClientCertVerified};
-use rustls::client::danger::{ServerCertVerifier, ServerCertVerified};
-use rustls::DistinguishedName;
-use std::sync::Arc;
+use jsonrpsee::async_client::Client;
 use jsonrpsee::client_transport::ws::WsTransportClientBuilder;
 use jsonrpsee::core::client::ClientBuilder;
-use url::Url;
-use jsonrpsee::async_client::Client;
+use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::pki_types::ServerName;
+use rustls::pki_types::UnixTime;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::ClientConfig;
-use tokio_rustls::TlsConnector;
+use rustls::DistinguishedName;
+use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use url::Url;
 
 #[derive(Debug)]
 pub struct SelfSignedClientVerifier;
@@ -35,7 +35,7 @@ impl ClientCertVerifier for SelfSignedClientVerifier {
         Ok(ClientCertVerified::assertion())
     }
 
-       fn verify_tls12_signature(
+    fn verify_tls12_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
@@ -82,7 +82,7 @@ impl ServerCertVerifier for SelfSignedServerVerifier {
         Ok(ServerCertVerified::assertion())
     }
 
-       fn verify_tls12_signature(
+    fn verify_tls12_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
@@ -135,7 +135,8 @@ pub fn server_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> rustls::ServerC
 
     rustls::ServerConfig::builder()
         .with_client_cert_verifier(Arc::new(SelfSignedClientVerifier {}))
-        .with_single_cert(certs, key).unwrap()
+        .with_single_cert(certs, key)
+        .unwrap()
 }
 
 fn client_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> ClientConfig {
@@ -144,24 +145,27 @@ fn client_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> ClientConfig {
 
     ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
-        .with_client_auth_cert(certs, key).unwrap()
+        .with_client_auth_cert(certs, key)
+        .unwrap()
 }
 
 pub async fn setup_client(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Client {
     let full_addr = format!("{}:{}", addr, port);
     let url = format!("wss://{}/", full_addr);
     let mut tls_config = client_tls_config(cert_der, key_der);
-    tls_config.dangerous().set_certificate_verifier(Arc::new(SelfSignedServerVerifier {}));
+    tls_config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(SelfSignedServerVerifier {}));
 
     let tls_connector = TlsConnector::from(Arc::new(tls_config));
     let tcp_stream = TcpStream::connect(full_addr).await.unwrap();
     let domain = ServerName::try_from(addr).unwrap().to_owned();
     let tls_stream = tls_connector.connect(domain, tcp_stream).await.unwrap();
-    
+
     let (sender, receiver) = WsTransportClientBuilder::default()
         .build_with_stream(Url::parse(&url).unwrap(), tls_stream)
-        .await.unwrap();
+        .await
+        .unwrap();
 
-    ClientBuilder::default()
-        .build_with_tokio(sender, receiver)
+    ClientBuilder::default().build_with_tokio(sender, receiver)
 }
