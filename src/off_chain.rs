@@ -450,7 +450,7 @@ pub enum CoordinatorRPCBaseError {
     BadID = 4,
     MaskedInputAlreadySubmitted = 5,
     IndexNotReserved = 6,
-    OutOfIndices = 7,
+    IndexAlreadyReserved = 7,
     OutputSharesAlreadySent = 8,
     OutputSharesAlreadyRequested = 9,
     NotParty = 10,
@@ -790,8 +790,8 @@ impl<F: FftField> CoordinatorRPCBaseServer<F> for CoordinatorRPCServerConnection
 
         if d.reserved_indices[i as usize].is_some() {
             return Err(ErrorObjectOwned::owned(
-                    ErrorCode::ServerError(OutOfIndices as i32).code(),
-                    "No indices left.",
+                    ErrorCode::ServerError(IndexAlreadyReserved as i32).code(),
+                    format!("Index {} already reserved.", i),
                     None::<()>
             ));
         }
