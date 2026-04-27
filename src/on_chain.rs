@@ -182,6 +182,15 @@ pub mod node_rpc {
             self.addr.clone()
         }
 
+        pub async fn ids_and_addrs(&self) -> Vec<(Vec<u8>, ClientIdentity)> {
+            let d = self.rpc_server.lock().await;
+
+            d.ids_and_addrs.iter()
+                .filter(|(_, _, sig)| sig.is_none())
+                .map(|(id, addr, _)| (id.clone(), *addr))
+                .collect()
+        }
+
         pub async fn reset(&mut self) {
             let mut d = self.rpc_server.lock().await;
             let base_nonce = super::u256_to_u64(d.coord.baseNonce().call().await.expect("failed to fetch base nonce"))
@@ -283,7 +292,7 @@ pub mod node_rpc {
         mask_shares: HashMap<u64, RobustShare<Fr>>,
         // (tls_id, addr, pending_sig): pending_sig is Some while awaiting index reservation,
         // None once authenticated
-        pub(super) ids_and_addrs: Vec<(Vec<u8>, ClientIdentity, Option<Vec<u8>>)>,
+        ids_and_addrs: Vec<(Vec<u8>, ClientIdentity, Option<Vec<u8>>)>,
         clients: HashMap<Vec<u8>, ClientInfo>,
         base_nonce: u64,
         coord: StoffelCoordinatorInstance<P>
@@ -977,13 +986,10 @@ mod tests {
         coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
         let _ = coords[0].wait_for_round(Round::OutputDistribution).await;
         for node_rpc in node_rpcs.iter() {
-            let d = node_rpc.rpc_server.lock().await;
-            let authenticated: Vec<_> = d.ids_and_addrs.iter()
-                .filter(|(_, _, sig)| sig.is_none())
-                .collect();
+            let authenticated = node_rpc.ids_and_addrs().await;
             assert_eq!(authenticated.len(), 1);
             let client_public_key = &authenticated.iter()
-                .find(|(_, addr, _)| *addr == client_addr)
+                .find(|(_, addr)| *addr == client_addr)
                 .expect("client address not found").0;
             assert_eq!(public_key, *client_public_key);
         }
