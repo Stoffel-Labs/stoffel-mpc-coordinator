@@ -8,7 +8,7 @@ use alloy::{
     signers::Signer
 };
 use alloy::providers::WalletProvider;
-use alloy_primitives::{FixedBytes, U256, Address, Signature, Bytes, Keccak256 };
+use alloy_primitives::{U256, Address, Signature, Bytes, Keccak256 };
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorErrors;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
@@ -74,8 +74,6 @@ pub mod node_rpc {
     use serde::{Serialize, Deserialize};
     use crate::NodeRPCError;
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
-    use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorErrors;
-    use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
 
     async fn verify_client_sig(base_nonce: u64, i: u64, addr: Address, sig_bytes: Vec<u8>) -> Result<bool, SignatureError> {
         let sig = Signature::from_raw(&sig_bytes)?;
@@ -656,7 +654,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         }
     }
 
-    async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
+    async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
         let mut addr_to_i = HashMap::new();
 
         // spawn thread to receive all ReservedInputEvents
@@ -667,7 +665,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             .await.unwrap().into_stream();
         
         while let Some(Ok((StoffelCoordinator::ReservedInputEvent { client, reservedIndex }, _))) = events.next().await {
-            addr_to_i.insert(client, vec![u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed")]);
+            addr_to_i.insert(client, u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"));
             eprintln!("[party] Recorded reserved mask index {} for client address {:?}",
                      reservedIndex, client);
             if addr_to_i.len() as u64 == n_clients {
@@ -943,8 +941,8 @@ mod tests {
     }
 
     async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
-        coords: &mut Vec<OnChainCoordinator<P>>,
-        node_rpcs: &mut Vec<super::node_rpc::NodeRPCServer<P>>,
+        coords: &mut [OnChainCoordinator<P>],
+        node_rpcs: &mut [super::node_rpc::NodeRPCServer<P>],
         mask_shares: Vec<RobustShare<Fr>>,
         output_shares: Vec<RobustShare<Fr>>,
         client_addr: Address,
@@ -960,12 +958,10 @@ mod tests {
         let client_to_index = coords[0].wait_for_indices(1).await.unwrap();
         assert_eq!(client_to_index.len(), 1);
         assert!(client_to_index.contains_key(&client_addr));
-        for (c, indices) in client_to_index {
-            println!("NODE: client {:?} reserved index {:?}", c, indices);
+        for (c, i) in client_to_index {
+            println!("NODE: client {:?} reserved index {:?}", c, i);
             for node_rpc in node_rpcs.iter_mut() {
-                for &i in &indices {
-                    node_rpc.add_reserved_index(c, i).await.unwrap();
-                }
+                node_rpc.add_reserved_index(c, i).await.unwrap();
             }
         }
         coords[0].trigger_round(Round::InputCollection).await.unwrap();

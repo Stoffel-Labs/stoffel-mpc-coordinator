@@ -1036,7 +1036,7 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
         CoordinatorRPCBaseClient::<F>::reset(self.rpc()).await.map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
-    async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
+    async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
         // Wait for reserved index events.
         let mut sub = CoordinatorRPCBaseClient::<F>::sub_reserved_indices(self.rpc(), self.get_timestamp()).await.unwrap();
 
@@ -1045,7 +1045,7 @@ impl<F: FftField> Coordinator<F> for OffChainCoordinatorClient<F> {
         // Parse reserved index events one after the other.
         for _ in 0..n_clients {
             if let Some(Ok(Event::ReservedInputEvent { client, reserved_index })) = sub.next().await {
-                map.insert(client, vec![reserved_index]);
+                map.insert(client, reserved_index);
             } else {
                 return Err(CoordinatorError::JSONError("Subscription ended before event could be received".to_string()));
             }
@@ -1386,14 +1386,12 @@ mod tests {
                 coords[0].trigger_round(Round::InputMaskReservation).await.unwrap();
                 coords[0].wait_for_round(Round::InputMaskReservation).await.unwrap();
                 let client_to_indices = coords[0].wait_for_indices(1).await.unwrap();  // called by node
-                for (c, indices) in &client_to_indices {
-                    println!("NODE: client {:?} reserved indices {:?}", c, indices);
+                for (c, i) in &client_to_indices {
+                    println!("NODE: client {:?} reserved index {:?}", c, i);
                     for node_rpc in node_rpcs.iter_mut() {
                         // just received by one node here, but in reality would be received by
                         // all nodes, so we simulate this here for more nodes
-                        for i in indices {
-                            node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
-                        }
+                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
                     }
                 }
 
@@ -1511,14 +1509,12 @@ mod tests {
                 coords[0].reserve_input_masks().await.unwrap();
                 coords[0].wait_for_round(Round::InputMaskReservation).await.unwrap();
                 let client_to_indices = coords[0].wait_for_indices(1).await.unwrap();  // called by node
-                for (c, indices) in &client_to_indices {
-                    println!("NODE: client {:?} reserved indices {:?}", c, indices);
+                for (c, i) in &client_to_indices {
+                    println!("NODE: client {:?} reserved index {:?}", c, i);
                     for node_rpc in node_rpcs.iter_mut() {
                         // just received by one node here, but in reality would be received by
                         // all nodes, so we simulate this here for more nodes
-                        for i in indices {
-                            node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
-                        }
+                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
                     }
                 }
 

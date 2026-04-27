@@ -79,7 +79,7 @@ pub trait Coordinator<F: FftField> {
 
     /// Used by MPC nodes to wait for indices to be reserved by `n_clients`. Once reserved, the
     /// indices and the reserving clients are returned.
-    fn wait_for_indices(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<u64>>, CoordinatorError>>;
+    fn wait_for_indices(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, u64>, CoordinatorError>>;
 
     /// Called by MPC clients to obtain the private outputs for that client.
     fn obtain_outputs(&self) -> impl Future<Output = Result<Vec<F>, CoordinatorError>>;
