@@ -1,6 +1,6 @@
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
-use ark_ff::FftField;
 use ark_serialize::{Compress, Validate};
+use ark_ff::FftField;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::net::TcpListener;
@@ -12,26 +12,24 @@ use hyper_util::service::TowerToHyperService;
 use hyper_util::rt::TokioIo;
 use crate::self_signed_certs;
 
-/// A wrapper around a field element that is serializable and deserializable for use with JSON-RPC.
+/// A wrapper around a share element that is serializable and deserializable for use with JSON-RPC.
 #[derive(Clone, Debug)]
-pub struct FieldElement<T: FftField> {
+pub struct ValueWrapper<T: FftField> {
     pub value: T
 }
 
-/// Deserialization implementation for a field element.
-impl<'d, T: FftField> Deserialize<'d> for FieldElement<T> {
-    fn deserialize<D>(deserializer: D) -> Result<FieldElement<T>, D::Error>
+impl<'d, T: FftField> Deserialize<'d> for ValueWrapper<T> {
+    fn deserialize<D>(deserializer: D) -> Result<ValueWrapper<T>, D::Error>
     where
         D: Deserializer<'d>
     {
         let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
         T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::Yes)
-            .map(|value| FieldElement::<T> { value }).map_err(serde::de::Error::custom)
+            .map(|value| ValueWrapper::<T> { value }).map_err(serde::de::Error::custom)
     }
 }
 
-/// Serialization implementation for a field element.
-impl<T: FftField> Serialize for FieldElement<T> {
+impl<T: FftField> Serialize for ValueWrapper<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -39,7 +37,7 @@ impl<T: FftField> Serialize for FieldElement<T> {
         let mut bytes = Vec::new();
         self.value.serialize_with_mode(&mut bytes, Compress::Yes)
             .map_err(serde::ser::Error::custom)?;
-        
+
         serializer.serialize_bytes(&bytes)
     }
 }

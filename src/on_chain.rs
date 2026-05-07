@@ -1,5 +1,4 @@
-use ark_bls12_381::Fr;
-use ark_ff::{PrimeField, BigInteger};
+use ark_ff::FftField;
 use alloy::{
     sol_types::SolValue,
     providers::{Provider, ProviderBuilder, WsConnect},
@@ -16,8 +15,6 @@ use futures_util::stream::StreamExt;
 use std::collections::HashMap;
 use std::str::FromStr;
 use super::{Coordinator, CoordinatorError};
-use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::common::SecretSharingScheme;
 use hpke::{
     aead::AesGcm256,
     kdf::HkdfSha256,
@@ -28,8 +25,8 @@ use hpke::{
 };
 use p256::{SecretKey, pkcs8::DecodePrivateKey};
 use rand::{SeedableRng, rngs::StdRng};
-use ark_serialize::CanonicalSerialize;
-use crate::Round;
+use ark_serialize::{CanonicalSerialize, CanonicalDeserialize, SerializationError};
+use crate::{ShareBound, Round};
 
 type KemImpl = DhP256HkdfSha256;
 type KdfImpl = HkdfSha256;
@@ -38,17 +35,18 @@ type AeadImpl = AesGcm256;
 pub type ClientIdentity = Address;
 
 #[derive(Clone)]
-pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone> {
+pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
     coord: StoffelCoordinatorInstance<P>,
     contract_block: u64,
     t: u64,
     n_outputs: Option<u64>,
-    key_der: Option<Vec<u8>>
+    key_der: Option<Vec<u8>>,
+    _marker: std::marker::PhantomData<(F, S)>
 }
 
 /// RPC interface on the node.
 pub mod node_rpc {
-    use ark_bls12_381::Fr;
+    use ark_ff::FftField;
     use alloy::{sol_types::SolValue, providers::{WalletProvider, Provider}};
     use alloy_primitives::{Address, Signature, SignatureError, Keccak256};
     use std::collections::{HashMap, HashSet};
@@ -66,13 +64,9 @@ pub mod node_rpc {
     use async_trait::async_trait;
     use tokio::task::JoinHandle;
     use super::ClientIdentity;
-    use crate::{CoordinatorError, rpc::ClientInfo};
+    use crate::{CoordinatorError, rpc::ClientInfo, NodeRPCError, ShareBound};
     use tokio::task::JoinSet;
-    use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-    use stoffelmpc_mpc::common::SecretSharingScheme;
-    use ark_serialize::CanonicalSerialize;
     use serde::{Serialize, Deserialize};
-    use crate::NodeRPCError;
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
 
     async fn verify_client_sig(base_nonce: u64, i: u64, addr: Address, sig_bytes: Vec<u8>) -> Result<bool, SignatureError> {
@@ -90,20 +84,21 @@ pub mod node_rpc {
     }
 
     /// Exterior representation of the node-side RPC interface.
-    pub struct NodeRPCServer<P: Provider + WalletProvider + Clone> {
-        pub(super) rpc_server: Arc<Mutex<NodeRPCServerShared<P>>>,
+    pub struct NodeRPCServer<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
+        pub(super) rpc_server: Arc<Mutex<NodeRPCServerShared<P, F, S>>>,
         addr: String,
         port: u16,
         server_handle: JoinHandle<()>,
     }
 
     /// Exterior representation of an RPC client that interfaces with the node-side RPC interface.
-    pub struct NodeRPCClient {
+    pub struct NodeRPCClient<F: FftField, S: ShareBound<F>> {
         node_rpcs: Vec<Client>,
-        t: usize
+        t: usize,
+        _marker: std::marker::PhantomData<(F, S)>
     }
 
-    impl NodeRPCClient {
+    impl<F: FftField, S: ShareBound<F>> NodeRPCClient<F, S> {
         /// Start an RPC client from a certificate generated using rcgen.
         pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(String, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
             Self::start_rpc_client(t, addrs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
@@ -123,13 +118,14 @@ pub mod node_rpc {
 
             Self {
                 node_rpcs,
-                t
+                t,
+                _marker: std::marker::PhantomData
             }
         }
 
         /// Returns a mask whose index has been previously reserved by the client by receiving the
         /// individual shares from nodes and reconstructing the mask from them.
-        pub async fn receive_mask(&self, sig: Vec<u8>, addr: Address) -> Result<Fr, CoordinatorError> {
+        pub async fn receive_mask(&self, sig: Vec<u8>, addr: Address) -> Result<S::SecretType, CoordinatorError> {
             let mut share_futures = JoinSet::new();
 
             for rpc in self.node_rpcs.iter() {
@@ -144,7 +140,7 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= 2 * self.t + 1 {
-                    match RobustShare::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
+                    match S::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
                         Ok((_, mask)) => {
                             return Ok(mask);
                         }
@@ -159,7 +155,7 @@ pub mod node_rpc {
         }
     }
 
-    impl<P: Provider + WalletProvider + Clone + 'static> NodeRPCServer<P> {
+    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>> NodeRPCServer<P, F, S> {
         /// Start the node-side RPC server from a certificate generated using rcgen.
         pub async fn start_from_cert(addr: &str, port: u16, coord: StoffelCoordinatorInstance<P>, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
             Self::start(addr, port, coord, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
@@ -169,7 +165,7 @@ pub mod node_rpc {
             let base_nonce = super::u256_to_u64(coord.baseNonce().call().await.expect("failed to fetch base nonce"))
                 .expect("base nonce does not fit in u64");
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord, base_nonce)));
-            let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+            let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
@@ -240,7 +236,7 @@ pub mod node_rpc {
         }
 
         // called when preprocessing has generated the mask shares
-        pub async fn add_mask_share(&mut self, i: u64, share: RobustShare<Fr>) -> Result<(), NodeRPCError> {
+        pub async fn add_mask_share(&mut self, i: u64, share: S) -> Result<(), NodeRPCError> {
             let mut d = self.rpc_server.lock().await;
 
             assert!(!d.mask_shares.contains_key(&i));
@@ -262,15 +258,15 @@ pub mod node_rpc {
     }
 
     /// Represents a connection with a client on the node-side RPC server.
-    pub struct NodeRPCServerConnection<P: Provider + WalletProvider + Clone> {
+    pub struct NodeRPCServerConnection<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
         /// Reference to the server's shared state
-        d: Arc<Mutex<NodeRPCServerShared<P>>>,
+        d: Arc<Mutex<NodeRPCServerShared<P, F, S>>>,
         /// The MPC client's node-facing identity
         id: Vec<u8>
     }
 
-    impl<P: Provider + WalletProvider + Clone + 'static> crate::rpc::RPCServerConnection for NodeRPCServerConnection<P> {
-        type Internal = NodeRPCServerShared<P>;
+    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>> crate::rpc::RPCServerConnection for NodeRPCServerConnection<P, F, S> {
+        type Internal = NodeRPCServerShared<P, F, S>;
 
         fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self {
             Self { d: internal, id }
@@ -281,7 +277,7 @@ pub mod node_rpc {
         }
     }
 
-    pub struct NodeRPCServerShared<P: Provider + WalletProvider + Clone> {
+    pub struct NodeRPCServerShared<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
         index_to_client: HashMap<u64, ClientIdentity>,
         client_to_index: HashMap<ClientIdentity, u64>,
         authenticated: HashSet<ClientIdentity>,
@@ -289,16 +285,17 @@ pub mod node_rpc {
         // sinks stored if some info to send shares to clients is still missing, but client has
         // already sent the RPC request
         sinks: HashMap<ClientIdentity, SubscriptionSink>,
-        mask_shares: HashMap<u64, RobustShare<Fr>>,
+        mask_shares: HashMap<u64, S>,
         // (tls_id, addr, pending_sig): pending_sig is Some while awaiting index reservation,
         // None once authenticated
         ids_and_addrs: Vec<(Vec<u8>, ClientIdentity, Option<Vec<u8>>)>,
         clients: HashMap<Vec<u8>, ClientInfo>,
         base_nonce: u64,
-        coord: StoffelCoordinatorInstance<P>
+        coord: StoffelCoordinatorInstance<P>,
+        _marker: std::marker::PhantomData<F>
     }
 
-    impl<P: Provider + WalletProvider + Clone> NodeRPCServerShared<P> {
+    impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> NodeRPCServerShared<P, F, S> {
         pub fn new(coord: StoffelCoordinatorInstance<P>, base_nonce: u64) -> Self {
             Self {
                 index_to_client: HashMap::new(),
@@ -309,12 +306,13 @@ pub mod node_rpc {
                 ids_and_addrs: Vec::new(),
                 clients: HashMap::new(),
                 base_nonce,
-                coord
+                coord,
+                _marker: std::marker::PhantomData
             }
         }
     }
 
-    impl<P: Provider + WalletProvider + Clone> crate::rpc::RPCServerShared for NodeRPCServerShared<P> {
+    impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> crate::rpc::RPCServerShared for NodeRPCServerShared<P, F, S> {
         fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
             self.clients.insert(cert_der.clone(), ClientInfo { cert: cert_der, thread: client_handle, stop_tx });
         }
@@ -333,7 +331,7 @@ pub mod node_rpc {
     }
 
     #[async_trait]
-    impl<P: Provider + WalletProvider + Clone + 'static> OnChainNodeRPCServer for NodeRPCServerConnection<P> {
+    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>> OnChainNodeRPCServer for NodeRPCServerConnection<P, F, S> {
         async fn receive_mask_share(&self, pending: PendingSubscriptionSink, sig_bytes: Vec<u8>, addr: Address) -> SubscriptionResult {
             use OnChainNodeRPCServerError::*;
 
@@ -420,25 +418,16 @@ fn u256_to_u64(x: U256) -> Option<u64> {
     x.try_into().ok()
 }
 
-// lossless: Fr elements always fit into 256 bits
-fn fr_to_u256(x: Fr) -> U256 {
-    let bytes = x.into_bigint().to_bytes_le();
-    U256::from_le_slice(&bytes)
+fn field_to_bytes<F: FftField + CanonicalSerialize>(x: F) -> Result<Bytes, SerializationError> {
+    let mut bytes = Vec::new();
+    x.serialize_compressed(&mut bytes)?;
+
+    Ok(Bytes::from(bytes))
 }
 
-fn u256_to_fr(x: U256) -> Option<Fr> {
-    let r = {
-        let r = <Fr as PrimeField>::MODULUS;
-        let r_bytes = r.to_bytes_le();
-        U256::from_le_slice(&r_bytes)
-    };
-
-    if x >= r {
-        return None;
-    }
-
-    let bytes = x.to_le_bytes::<32>();
-    Some(Fr::from_le_bytes_mod_order(&bytes))
+fn bytes_to_field<F: FftField + CanonicalDeserialize>(x: Bytes) -> Result<F, SerializationError> {
+    let element = F::deserialize_compressed(x.as_ref())?;
+    Ok(element)
 }
 
 pub async fn generate_client_sig(base_nonce: u64, i: u64, signer: PrivateKeySigner) -> Result<Signature, alloy::signers::Error> {
@@ -464,17 +453,17 @@ pub async fn ws_connect(addr: &str, wallet_sk: &str) -> impl Provider + WalletPr
     }
 }
 
-pub async fn setup_coord<T>(eth: T, contract_addr: Address, t: u64, n_outputs: u64, key_der: Option<Vec<u8>>)
-    -> OnChainCoordinator<T>
+pub async fn setup_coord<T, F: FftField, S: ShareBound<F>>(eth: T, contract_addr: Address, t: u64, n_outputs: u64, key_der: Option<Vec<u8>>)
+    -> OnChainCoordinator<T, F, S>
     where T: Provider + WalletProvider + Clone {
     let coord_instance = StoffelCoordinator::new(contract_addr, eth.clone());
     OnChainCoordinator::new(coord_instance, t, n_outputs, key_der).await
 }
 
-impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
+impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> OnChainCoordinator<P, F, S> {
     pub async fn new(coord: StoffelCoordinatorInstance<P>, t: u64, n_outputs: u64, key_der: Option<Vec<u8>>) -> Self {
         let contract_block = Self::coord_creation_block(&coord).await;
-        Self { coord, contract_block, t, n_outputs: Some(n_outputs), key_der }
+        Self { coord, contract_block, t, n_outputs: Some(n_outputs), key_der, _marker: std::marker::PhantomData }
     }
 
     pub fn coord(&self) -> StoffelCoordinatorInstance<P> {
@@ -499,7 +488,7 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
         Ok(())
     }
 
-    async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
+    pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
         let result = match round {
             Round::Idle => { panic!(); }
             Round::Preprocessing => self.coord.startPreprocessing().send().await,
@@ -527,7 +516,7 @@ impl<P: Provider + WalletProvider + Clone> OnChainCoordinator<P> {
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 
-impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinator<P> {
+impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordinator<F, S> for OnChainCoordinator<P, F, S> {
     type ClientIdentity = Address;
 
     async fn start_preprocessing(&self) -> Result<(), CoordinatorError> {
@@ -685,7 +674,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         Ok(addr_to_i)
     }
 
-    async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<RobustShare<Fr>>) -> Result<HashMap<ClientIdentity, Vec<RobustShare<Fr>>>, CoordinatorError> {
+    async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<S>) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
         let mut events = match self.coord
             .MaskedInputEvent_filter()
             .from_block(self.contract_block)
@@ -697,20 +686,16 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
             }
         };
 
-        let mut inputs: HashMap<ClientIdentity, Vec<RobustShare<Fr>>> = HashMap::new();
+        let mut inputs: HashMap<ClientIdentity, Vec<S>> = HashMap::new();
         for _ in 0..n_clients {
             match events.next().await {
                 Some(Ok((StoffelCoordinator::MaskedInputEvent { client, maskedInput, reservedIndex }, _))) => {
-                    let masked_input = u256_to_fr(maskedInput).ok_or(CoordinatorError::U256ToFrError)?;
                     let i: usize = u256_to_u64(reservedIndex)
                         .ok_or(CoordinatorError::U256ToU64Error)?.try_into()
                         .map_err(|_| CoordinatorError::U256ToU64Error)?;
                     let mask_share = &mask_shares[i];
-                    let input = RobustShare::new(
-                        masked_input - mask_share.share[0],
-                        mask_share.id,
-                        mask_share.degree
-                    );
+                    let masked_input_value = bytes_to_field::<S::SecretType>(maskedInput).map_err(|_| CoordinatorError::DeserializationError)?;
+                    let input = S::compute_masked_input(masked_input_value, mask_share).map_err(|_| CoordinatorError::ShareError)?;
 
                     inputs.insert(client, vec![input]);
                 }
@@ -765,8 +750,9 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         Ok(())
     }
 
-    async fn send_masked_input(&self, masked_input: Fr, i: u64) -> Result<(), CoordinatorError> {
-        let builder = self.coord.submitMaskedInput(fr_to_u256(masked_input), U256::from(i));
+    async fn send_masked_input(&self, masked_input: S::ValueType, i: u64) -> Result<(), CoordinatorError> {
+        let masked_input_bytes = field_to_bytes(masked_input).map_err(|_| CoordinatorError::SerializationError)?;
+        let builder = self.coord.submitMaskedInput(masked_input_bytes, U256::from(i));
         match builder.send().await {
             Ok(r) => {
                 match r.watch().await {
@@ -800,7 +786,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         }
     }
 
-    async fn obtain_outputs(&self) -> Result<Vec<Fr>, CoordinatorError> {
+    async fn obtain_outputs(&self) -> Result<Vec<S::ValueType>, CoordinatorError> {
         let client_sk = {
             let der_bytes = self.key_der.clone().unwrap();
             let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes).map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
@@ -833,7 +819,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                 let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
                     &OpModeR::Base, &client_sk, &encapped_key, ENC_INFO, &c, b"",
                 ).map_err(|_| CoordinatorError::DecryptionError)?;
-                let shares: Vec<RobustShare<Fr>> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
+                let shares: Vec<S> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
 
                 if shares.len() as u64 != self.n_outputs.unwrap() {
                     println!("Some node sent an invalid number of output shares, ignoring.");
@@ -848,7 +834,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
                 let shares_i: Vec<_> = output_shares.iter().map(|shares| shares[i].clone()).collect();
 
                 // at least 2t+1 shares available as checked previously by the coordinator
-                match RobustShare::recover_secret(&shares_i, (4 * self.t + 1) as usize, self.t as usize) {
+                match S::recover_secret(shares_i.as_slice(), (4 * self.t + 1) as usize, self.t as usize) {
                     Ok((_, output_i)) => {
                         Some(output_i)
                     }
@@ -867,7 +853,7 @@ impl<P: Provider + WalletProvider + Clone> Coordinator<Fr> for OnChainCoordinato
         Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for EnoughOutputShares events".to_string()))
     }
 
-    async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<RobustShare<Fr>>) -> Result<(), CoordinatorError> {
+    async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<S>) -> Result<(), CoordinatorError> {
         let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key).map_err(|_| CoordinatorError::ParsingPublicKeyFailed)?;
         let mut output_shares_bytes = Vec::new();
         output_shares.serialize_compressed(&mut output_shares_bytes).map_err(|_| CoordinatorError::SerializationError)?;
@@ -910,13 +896,18 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use alloy::providers::{Provider, WalletProvider};
     use ark_std::test_rng;
+    #[cfg(feature = "avss")]
+    use ark_bls12_381::G1Projective;
     use ark_bls12_381::Fr;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy_primitives::{Address, U256, FixedBytes, address};
     use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
     use tokio::time::{timeout, Duration};
     use rand::Rng;
+    #[cfg(not(feature = "avss"))]
     use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+    #[cfg(feature = "avss")]
+    use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
     use stoffelmpc_mpc::common::SecretSharingScheme;
 
     static SK: [&str; 10] = [
@@ -943,17 +934,37 @@ mod tests {
         address!("0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"),
         address!("0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"),
         address!("0xa0Ee7A142d267C1f36714E4a8F75612F20a79720")
-    ];
+    ]; 
+
+    type TestShareValueType = Fr;
+
+    #[cfg(not(feature = "avss"))]
+    type TestShareType = RobustShare<TestShareValueType>;
+
+    #[cfg(feature = "avss")]
+    type TestShareGroupType = G1Projective;
+    #[cfg(feature = "avss")]
+    type TestShareType = FeldmanShamirShare<TestShareValueType, TestShareGroupType>;
+
+    type TestValueType = <TestShareType as SecretSharingScheme<TestShareValueType>>::SecretType;
+    type TestOnChainCoordinator<P> = OnChainCoordinator::<P, TestShareValueType, TestShareType>;
+
+    type TestNodeRPCServer<P> = super::node_rpc::NodeRPCServer<P, TestShareValueType, TestShareType>;
+    type TestNodeRPCClient = super::node_rpc::NodeRPCClient<TestShareValueType, TestShareType>;
+
+    fn sample_ids(n: usize) -> Vec<usize> {
+        (1..=n).collect()
+    }
 
     fn spawn_anvil() -> AnvilInstance {
         Anvil::new().spawn()
     }
 
     async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
-        coords: &mut [OnChainCoordinator<P>],
-        node_rpcs: &mut [super::node_rpc::NodeRPCServer<P>],
-        mask_shares: Vec<RobustShare<Fr>>,
-        output_shares: Vec<RobustShare<Fr>>,
+        coords: &mut [OnChainCoordinator<P, TestShareValueType, TestShareType>],
+        node_rpcs: &mut [super::node_rpc::NodeRPCServer<P, TestShareValueType, TestShareType>],
+        mask_shares: Vec<TestShareType>,
+        output_shares: Vec<TestShareType>,
         client_addr: Address,
         public_key: Vec<u8>,
     ) {
@@ -978,7 +989,10 @@ mod tests {
         let client_to_masked_input = coords[0].wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
         for (c, masked_inputs) in client_to_masked_input {
             for masked_input in masked_inputs {
+                #[cfg(not(feature = "avss"))]
                 println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
+                #[cfg(feature = "avss")]
+                println!("NODE: client {:?} submitted masked input {}", c, masked_input.feldmanshare.share[0]);
             }
         }
         coords[0].trigger_round(Round::MPCExecution).await.unwrap();
@@ -1000,12 +1014,12 @@ mod tests {
     }
 
     async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
-        coord: &mut OnChainCoordinator<P>,
-        rpc_client: &super::node_rpc::NodeRPCClient,
+        coord: &mut OnChainCoordinator<P, TestShareValueType, TestShareType>,
+        rpc_client: &super::node_rpc::NodeRPCClient<TestShareValueType, TestShareType>,
         client_addr: Address,
         client_sk: &str,
-        correct_mask: Fr,
-        correct_output: Fr,
+        correct_mask: TestValueType,
+        correct_output: TestValueType,
     ) {
         let _ = coord.wait_for_round(Round::Preprocessing).await;
         let _ = coord.wait_for_round(Round::InputMaskReservation).await;
@@ -1017,7 +1031,7 @@ mod tests {
         let mask = rpc_client.receive_mask(sig.into(), client_addr).await.unwrap();
         assert_eq!(mask, correct_mask);
         let _ = coord.wait_for_round(Round::InputCollection).await;
-        let masked_input = mask + Fr::from(1337);
+        let masked_input = mask + TestValueType::from(1337);
         coord.send_masked_input(masked_input, 0).await.unwrap();
         let _ = coord.wait_for_round(Round::MPCExecution).await;
         let _ = coord.wait_for_round(Round::OutputDistribution).await;
@@ -1028,14 +1042,14 @@ mod tests {
     }
 
     #[test]
-    pub fn fr_u256_conversion() {
+    pub fn fr_bytes_conversion() {
         let mut rng = rand::rng();
         for _ in 0..100 {
             let n: u64 = rng.random();
             let fr = Fr::from(n);
-            let u = fr_to_u256(fr);
-            let fr2 = u256_to_fr(u);
-            assert!(fr2.is_some());
+            let bytes = field_to_bytes(fr).unwrap();
+            let fr2: Result<Fr, _> = bytes_to_field(bytes);
+            assert!(fr2.is_ok());
             assert_eq!(fr, fr2.unwrap());
         }
     }
@@ -1063,7 +1077,7 @@ mod tests {
 
         let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
         let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-        let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
+        let coord = TestOnChainCoordinator::new(coord_instance, t, 1, None).await;
         assert_eq!(coord.contract_block, 1);
     }
 
@@ -1080,7 +1094,7 @@ mod tests {
 
             let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
             let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-            let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
+            let coord = TestOnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             coord.trigger_round(Round::Preprocessing).await.unwrap();
             coord.wait_for_round(Round::Preprocessing).await.unwrap();
@@ -1097,7 +1111,7 @@ mod tests {
 
             let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
             let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-            let coord = OnChainCoordinator::new(coord_instance, t, 1, None).await;
+            let coord = TestOnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             tokio::spawn({
                 let coord = coord.clone();
@@ -1136,11 +1150,11 @@ mod tests {
             let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
             let instance = StoffelCoordinatorInstance::new(*contract.address(), provider.clone());
 
-            let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
+            let node_rpc = TestNodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1, instance.clone(), crate::self_signed_certs::server_cert()).await;
             node_rpcs.push(node_rpc);
         }
-        let _ = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), crate::self_signed_certs::client_cert()).await;
+        let _ = TestNodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), crate::self_signed_certs::client_cert()).await;
     }
 
     #[tokio::test]
@@ -1180,8 +1194,9 @@ mod tests {
         }
 
         let mut rng = test_rng();
-        let mask_shares = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
-        let output_shares = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
+        let ids = sample_ids(n);
+        let mask_shares = TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        let output_shares = TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
 
         let mut node_rpcs = Vec::new();
         for i in 0..3 {
@@ -1254,8 +1269,9 @@ mod tests {
         let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), certs[5].clone()).await;
 
         // Round 1
-        let mask_shares = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
-        let output_shares = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
+        let ids = sample_ids(n);
+        let mask_shares = TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        let output_shares = TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
         tokio::join!(
             run_node_round(&mut coords, &mut node_rpcs, mask_shares, output_shares[..3].to_vec(), ACC[5], public_keys[5].clone()),
             run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)
@@ -1272,8 +1288,9 @@ mod tests {
         }
 
         // Round 2
-        let mask_shares2 = RobustShare::compute_shares(correct_mask, n, t as usize, None, &mut rng).unwrap();
-        let output_shares2 = RobustShare::compute_shares(correct_output, n, t as usize, None, &mut rng).unwrap();
+        let ids = sample_ids(n);
+        let mask_shares2 = TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        let output_shares2 = TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
         tokio::join!(
             run_node_round(&mut coords, &mut node_rpcs, mask_shares2, output_shares2[..3].to_vec(), ACC[5], public_keys[5].clone()),
             run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)

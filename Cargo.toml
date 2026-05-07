@@ -11,6 +11,9 @@ path = "src/deploy-contract/bin/main.rs"
 name = "run-coord"
 path = "src/run-coord/bin/main.rs"
 
+[features]
+avss = []
+
 [dependencies]
 stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "dev" }
 stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
@@ -26,6 +29,7 @@ jsonrpsee = { version = "0.26.0", features = ["full"] }
 serde = "1.0.228"
 dyn-clone = "1.0.20"
 ark-ff = "0.5.0"
+ark-ec = "0.5.0"
 ark-serialize = "0.5.0"
 thiserror = "2.0.18"
 async-trait = "0.1.89"
