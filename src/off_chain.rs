@@ -131,19 +131,17 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Self {
-            let mut node_rpcs = Vec::new();
-
-            // connect to all nodes
-            for (addr, port) in addrs.iter() {
-                let node_rpc = crate::self_signed_certs::setup_client(
-                    addr,
-                    *port,
-                    cert_der.clone(),
-                    key_der.clone(),
-                )
-                .await;
-                node_rpcs.push(node_rpc);
-            }
+            let node_rpcs = futures_util::future::join_all(
+                addrs.iter().map(|(addr, port)| {
+                    crate::self_signed_certs::setup_client(
+                        addr,
+                        *port,
+                        cert_der.clone(),
+                        key_der.clone(),
+                    )
+                }),
+            )
+            .await;
 
             Self {
                 node_rpcs,
@@ -749,12 +747,16 @@ impl<T: FftField> CoordinatorRPCServerSharedBase<T> {
             .get_mut(&round)
             .expect(&format!("BUG: {:?} must be present!", round));
 
-        // broadcast event to all subscribed RPC clients
-        for sink in sinks.iter() {
-            let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            sink.send(json)
-                .await
-                .map_err(|_| CoordinatorError::JSONError("client disconnected".to_string()))?;
+        // broadcast event to all subscribed RPC clients concurrently
+        let results = futures_util::future::join_all(
+            sinks.iter().map(|sink| {
+                let json = to_json_raw_value(&event).expect("failed convert to JSON");
+                sink.send(json)
+            }),
+        )
+        .await;
+        for result in results {
+            result.map_err(|_| CoordinatorError::JSONError("client disconnected".to_string()))?;
         }
 
         // clear all subscribed RPC clients
