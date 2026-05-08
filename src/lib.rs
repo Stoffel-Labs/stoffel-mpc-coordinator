@@ -195,6 +195,12 @@ pub enum CoordinatorError {
     CannotTransitionToIdle,
     #[error("Calculating a share failed")]
     ShareError,
+    #[error("Failed to bind to address {0}")]
+    BindError(String),
+    #[error("Failed to connect: {0}")]
+    ConnectError(String),
+    #[error("TLS configuration error: {0}")]
+    TlsConfigError(String),
 }
 
 #[derive(Error, Clone, Debug)]

@@ -1,4 +1,4 @@
-use crate::self_signed_certs;
+use crate::{self_signed_certs, CoordinatorError};
 use ark_ff::FftField;
 use ark_serialize::{Compress, Validate};
 use hyper_util::rt::TokioIo;
@@ -83,13 +83,15 @@ pub async fn start_coord<T: RPCServerConnection>(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     rpc_server_data: Arc<Mutex<T::Internal>>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>, CoordinatorError> {
     let full_addr = format!("{}:{}", addr, port);
-    let tls_config = self_signed_certs::server_tls_config(cert_der, key_der);
+    let tls_config = self_signed_certs::server_tls_config(cert_der, key_der)?;
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let listener = TcpListener::bind(full_addr).await.unwrap();
+    let listener = TcpListener::bind(&full_addr)
+        .await
+        .map_err(|e| CoordinatorError::BindError(e.to_string()))?;
 
-    tokio::spawn({
+    Ok(tokio::spawn({
         let tls_acceptor = tls_acceptor.clone();
         let rpc_server_data = rpc_server_data.clone();
 
@@ -106,25 +108,37 @@ pub async fn start_coord<T: RPCServerConnection>(
                 let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("Handshake failed: {}", e);
+                        tracing::warn!("TLS handshake failed: {}", e);
                         continue;
                     }
                 };
 
                 let (stop_rx, stop_tx) = jsonrpsee::server::stop_channel();
-                let cert_der = tls_stream
+                let cert_der = match tls_stream
                     .get_ref()
                     .1
                     .peer_certificates()
                     .and_then(|c| c.first())
                     .map(|c| c.to_vec())
-                    .expect("Client certificate required");
+                {
+                    Some(c) => c,
+                    None => {
+                        tracing::warn!("Client connected without a certificate, rejecting");
+                        continue;
+                    }
+                };
 
-                let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
-                    .expect("Failed to parse X.509 certificate DER");
-                let public_key = parsed_cert.public_key().subject_public_key.data.as_ref();
+                let public_key = match X509Certificate::from_der(&cert_der) {
+                    Ok((_remainder, parsed_cert)) => {
+                        parsed_cert.public_key().subject_public_key.data.as_ref().to_vec()
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse client X.509 certificate: {}", e);
+                        continue;
+                    }
+                };
 
-                let rpc_server = T::new(rpc_server_data.clone(), public_key.to_vec());
+                let rpc_server = T::new(rpc_server_data.clone(), public_key);
                 let rpc_module = rpc_server.into_rpc();
                 let rpc_service = Server::builder()
                     .to_service_builder()
@@ -147,7 +161,7 @@ pub async fn start_coord<T: RPCServerConnection>(
                             .with_upgrades()
                             .await
                         {
-                            eprintln!("Connection error: {}", e);
+                            tracing::warn!("Connection error: {}", e);
                         }
                     }
                 });
@@ -159,5 +173,5 @@ pub async fn start_coord<T: RPCServerConnection>(
                 barrier.clone().wait().await;
             }
         }
-    })
+    }))
 }

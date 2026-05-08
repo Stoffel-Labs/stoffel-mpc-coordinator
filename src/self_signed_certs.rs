@@ -4,6 +4,7 @@
 //! chain validation is intentionally skipped — only handshake signature verification
 //! is performed — since self-signed certs have no CA chain to validate against.
 
+use crate::CoordinatorError;
 use jsonrpsee::async_client::Client;
 use jsonrpsee::client_transport::ws::WsTransportClientBuilder;
 use jsonrpsee::core::client::ClientBuilder;
@@ -144,38 +145,50 @@ impl ServerCertVerifier for SelfSignedServerVerifier {
 pub fn server_cert() -> Arc<rcgen::CertifiedKey<rcgen::KeyPair>> {
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
 
-    Arc::new(rcgen::generate_simple_self_signed(subject_alt_names).unwrap())
+    Arc::new(
+        rcgen::generate_simple_self_signed(subject_alt_names)
+            .expect("cert generation with fixed subject alt names never fails"),
+    )
 }
 
 /// Generates a self-signed certificate for a client.
 pub fn client_cert() -> Arc<rcgen::CertifiedKey<rcgen::KeyPair>> {
     let subject_alt_names = vec!["client".to_string()];
 
-    Arc::new(rcgen::generate_simple_self_signed(subject_alt_names).unwrap())
+    Arc::new(
+        rcgen::generate_simple_self_signed(subject_alt_names)
+            .expect("cert generation with fixed subject alt names never fails"),
+    )
 }
 
 /// Builds a `rustls::ServerConfig` for mTLS using `SelfSignedClientVerifier`.
 ///
 /// Clients must present a certificate, but chain validation is skipped.
-pub fn server_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> rustls::ServerConfig {
+pub fn server_tls_config(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<rustls::ServerConfig, CoordinatorError> {
     let certs = vec![CertificateDer::from(cert_der)];
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
 
     rustls::ServerConfig::builder()
         .with_client_cert_verifier(Arc::new(SelfSignedClientVerifier {}))
         .with_single_cert(certs, key)
-        .unwrap()
+        .map_err(|e| CoordinatorError::TlsConfigError(e.to_string()))
 }
 
 /// Builds a `rustls::ClientConfig` for mTLS, presenting the given client certificate.
-fn client_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> ClientConfig {
+fn client_tls_config(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<ClientConfig, CoordinatorError> {
     let certs = vec![CertificateDer::from(cert_der)];
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
 
     ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_client_auth_cert(certs, key)
-        .unwrap()
+        .map_err(|e| CoordinatorError::TlsConfigError(e.to_string()))
 }
 
 /// Connects to a remote WebSocket server over mTLS and returns a `Client`.
@@ -183,23 +196,38 @@ fn client_tls_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> ClientConfig {
 /// Establishes a TCP connection to `addr:port`, upgrades it to TLS using the
 /// provided client certificate, and wraps the TLS stream in a WebSocket transport.
 /// Server certificate chain validation is skipped via `SelfSignedServerVerifier`.
-pub async fn setup_client(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Client {
+pub async fn setup_client(
+    addr: &str,
+    port: u16,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<Client, CoordinatorError> {
     let full_addr = format!("{}:{}", addr, port);
     let url = format!("wss://{}/", full_addr);
-    let mut tls_config = client_tls_config(cert_der, key_der);
+    let mut tls_config = client_tls_config(cert_der, key_der)?;
     tls_config
         .dangerous()
         .set_certificate_verifier(Arc::new(SelfSignedServerVerifier {}));
 
     let tls_connector = TlsConnector::from(Arc::new(tls_config));
-    let tcp_stream = TcpStream::connect(full_addr).await.unwrap();
-    let domain = ServerName::try_from(addr).unwrap().to_owned();
-    let tls_stream = tls_connector.connect(domain, tcp_stream).await.unwrap();
+    let tcp_stream = TcpStream::connect(&full_addr)
+        .await
+        .map_err(|e| CoordinatorError::ConnectError(e.to_string()))?;
+    let domain = ServerName::try_from(addr)
+        .map_err(|e| CoordinatorError::ConnectError(e.to_string()))?
+        .to_owned();
+    let tls_stream = tls_connector
+        .connect(domain, tcp_stream)
+        .await
+        .map_err(|e| CoordinatorError::ConnectError(e.to_string()))?;
 
     let (sender, receiver) = WsTransportClientBuilder::default()
-        .build_with_stream(Url::parse(&url).unwrap(), tls_stream)
+        .build_with_stream(
+            Url::parse(&url).map_err(|e| CoordinatorError::ConnectError(e.to_string()))?,
+            tls_stream,
+        )
         .await
-        .unwrap();
+        .map_err(|e| CoordinatorError::ConnectError(e.to_string()))?;
 
-    ClientBuilder::default().build_with_tokio(sender, receiver)
+    Ok(ClientBuilder::default().build_with_tokio(sender, receiver))
 }

@@ -114,7 +114,7 @@ pub mod node_rpc {
             t: usize,
             addrs: Vec<(String, u16)>,
             client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-        ) -> Self {
+        ) -> Result<Self, CoordinatorError> {
             Self::start_rpc_client(
                 t,
                 addrs,
@@ -130,8 +130,8 @@ pub mod node_rpc {
             addrs: Vec<(String, u16)>,
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
-        ) -> Self {
-            let node_rpcs = futures_util::future::join_all(
+        ) -> Result<Self, CoordinatorError> {
+            let node_rpcs: Vec<Client> = futures_util::future::join_all(
                 addrs.iter().map(|(addr, port)| {
                     crate::self_signed_certs::setup_client(
                         addr,
@@ -141,13 +141,15 @@ pub mod node_rpc {
                     )
                 }),
             )
-            .await;
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
-            Self {
+            Ok(Self {
                 node_rpcs,
                 t,
                 _phantom: PhantomData,
-            }
+            })
         }
 
         /// Returns a mask whose index has been previously reserved by the client by receiving the
@@ -208,7 +210,7 @@ pub mod node_rpc {
             addr: &str,
             port: u16,
             cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-        ) -> Self {
+        ) -> Result<Self, CoordinatorError> {
             Self::start(
                 addr,
                 port,
@@ -218,7 +220,12 @@ pub mod node_rpc {
             .await
         }
 
-        pub async fn start(addr: &str, port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+        pub async fn start(
+            addr: &str,
+            port: u16,
+            cert_der: Vec<u8>,
+            key_der: Vec<u8>,
+        ) -> Result<Self, CoordinatorError> {
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new()));
             let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl<F, S>>(
                 addr,
@@ -227,13 +234,13 @@ pub mod node_rpc {
                 key_der,
                 rpc_server_data.clone(),
             )
-            .await;
-            Self {
+            .await?;
+            Ok(Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
                 port,
                 server_handle,
-            }
+            })
         }
 
         pub fn get_addr(&self) -> String {
@@ -733,13 +740,8 @@ impl<T: FftField> CoordinatorRPCServerSharedBase<T> {
     }
 
     async fn transition(&mut self, event: Event<T>, round: Round) -> Result<(), CoordinatorError> {
-        let round_before = match round_before(round) {
-            Some(r) => r,
-            None => return Err(CoordinatorError::CannotTransitionToIdle),
-        };
-
-        if self.round != round_before {
-            panic!();
+        if round_before(round).is_none() {
+            return Err(CoordinatorError::CannotTransitionToIdle);
         }
 
         let sinks = self
@@ -1225,7 +1227,7 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
         port: u16,
         t: u64,
         cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-    ) -> Self {
+    ) -> Result<Self, CoordinatorError> {
         Self::start_coord(
             shared,
             addr,
@@ -1244,12 +1246,12 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
         t: u64,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
-    ) -> Self {
+    ) -> Result<Self, CoordinatorError> {
         let rpc_server_data = Arc::new(Mutex::new(shared));
         let server_handle =
             crate::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone())
-                .await;
-        Self {
+                .await?;
+        Ok(Self {
             rpc_server: Some(rpc_server_data),
             rpc_coord: None,
             addr: Some(String::from(addr)),
@@ -1264,7 +1266,7 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
             t,
             n_outputs: None,
             key_der: None,
-        }
+        })
     }
 
     pub fn get_addr(&self) -> String {
@@ -1284,7 +1286,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         t: u64,
         n_outputs: u64,
         client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-    ) -> Self {
+    ) -> Result<Self, CoordinatorError> {
         Self::start_rpc_client(
             addr,
             port,
@@ -1305,18 +1307,18 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         n_outputs: u64,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
-    ) -> Self {
+    ) -> Result<Self, CoordinatorError> {
         let rpc_coord =
-            crate::self_signed_certs::setup_client(addr, port, cert_der, key_der.clone()).await;
+            crate::self_signed_certs::setup_client(addr, port, cert_der, key_der.clone()).await?;
 
-        Self {
+        Ok(Self {
             rpc_coord: Some(rpc_coord),
             timestamp: Some(timestamp),
             t,
             n_outputs: Some(n_outputs),
             key_der: Some(key_der),
             _phantom: std::marker::PhantomData,
-        }
+        })
     }
 
     pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
@@ -1712,7 +1714,8 @@ mod tests {
             t,
             server_cert(),
         )
-        .await;
+        .await
+        .unwrap();
         let timestamp = coord.get_timestamp();
 
         let _ = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
@@ -1723,7 +1726,8 @@ mod tests {
             1,
             client_cert(),
         )
-        .await;
+        .await
+        .unwrap();
     }
 
     // Tests event triggering.
@@ -1752,7 +1756,8 @@ mod tests {
                     t,
                     server_cert(),
                 )
-                .await;
+                .await
+                .unwrap();
             let timestamp = coord.get_timestamp();
 
             let node0 = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
@@ -1763,7 +1768,8 @@ mod tests {
                 1,
                 certs.remove(0),
             )
-            .await;
+            .await
+            .unwrap();
             let node1 = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
                 addr,
                 port,
@@ -1772,7 +1778,8 @@ mod tests {
                 1,
                 certs.remove(0),
             )
-            .await;
+            .await
+            .unwrap();
 
             node0.trigger_round(Round::Preprocessing).await.unwrap();
 
@@ -1808,7 +1815,8 @@ mod tests {
                     t,
                     server_cert(),
                 )
-                .await;
+                .await
+                .unwrap();
             let timestamp = coord.get_timestamp();
             let barrier = Arc::new(Barrier::new(2));
 
@@ -1820,7 +1828,8 @@ mod tests {
                 1,
                 certs.remove(0),
             )
-            .await;
+            .await
+            .unwrap();
             let node1 = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
                 addr,
                 port,
@@ -1829,7 +1838,8 @@ mod tests {
                 1,
                 certs.remove(0),
             )
-            .await;
+            .await
+            .unwrap();
 
             tokio::spawn({
                 let barrier = barrier.clone();
@@ -1885,7 +1895,8 @@ mod tests {
             t,
             server_cert(),
         )
-        .await;
+        .await
+        .unwrap();
         let timestamp = coord.get_timestamp();
         let barrier = Arc::new(Barrier::new(3));
 
@@ -1903,7 +1914,8 @@ mod tests {
                     1,
                     certs[i].clone(),
                 )
-                .await;
+                .await
+                .unwrap();
                 coords.push(coord);
             }
 
@@ -1935,7 +1947,8 @@ mod tests {
                     node_rpc_addrs[i].1,
                     certs[i].clone(),
                 )
-                .await;
+                .await
+                .unwrap();
 
                 node_rpc.add_mask_share(0, &mask_shares[i]).await.unwrap();
                 node_rpcs.push(node_rpc);
@@ -2032,13 +2045,15 @@ mod tests {
                 1,
                 cert.clone(),
             )
-            .await;
+            .await
+            .unwrap();
             let rpc_client = TestNodeRPCClient::start_rpc_client_from_cert(
                 t as usize,
                 node_rpc_addrs.clone(),
                 cert.clone(),
             )
-            .await;
+            .await
+            .unwrap();
             async move {
                 coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 coord
@@ -2112,7 +2127,8 @@ mod tests {
             t,
             server_cert(),
         )
-        .await;
+        .await
+        .unwrap();
         let timestamp = coord.get_timestamp();
         let barrier = Arc::new(Barrier::new(3));
 
@@ -2130,7 +2146,8 @@ mod tests {
                     1,
                     certs[i].clone(),
                 )
-                .await;
+                .await
+                .unwrap();
                 coords.push(coord);
             }
 
@@ -2152,7 +2169,8 @@ mod tests {
                     node_rpc_addrs[i].1,
                     certs[i].clone(),
                 )
-                .await;
+                .await
+                .unwrap();
 
                 node_rpc
                     .add_mask_share(0, &mask_shares[i].clone())
@@ -2240,13 +2258,15 @@ mod tests {
                 1,
                 cert.clone(),
             )
-            .await;
+            .await
+            .unwrap();
             let rpc_client = TestNodeRPCClient::start_rpc_client_from_cert(
                 t as usize,
                 node_rpc_addrs.clone(),
                 cert.clone(),
             )
-            .await;
+            .await
+            .unwrap();
             async move {
                 coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 coord

@@ -129,7 +129,7 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Self {
-            let node_rpcs = futures_util::future::join_all(
+            let node_rpcs: Vec<Client> = futures_util::future::join_all(
                 addrs.iter().map(|(addr, port)| {
                     crate::self_signed_certs::setup_client(
                         addr,
@@ -139,7 +139,10 @@ pub mod node_rpc {
                     )
                 }),
             )
-            .await;
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("failed to connect to node RPC");
 
             Self {
                 node_rpcs,
@@ -234,7 +237,8 @@ pub mod node_rpc {
                 key_der,
                 rpc_server_data.clone(),
             )
-            .await;
+            .await
+            .expect("failed to start node RPC server");
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),

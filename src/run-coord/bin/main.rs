@@ -82,7 +82,8 @@ async fn main() {
         server_cert_der,
         server_key_der,
     )
-    .await;
+    .await
+    .expect("failed to start coordinator");
     let timestamp = coord.get_timestamp();
 
     println!("Listening on {}:{}", addr, port);
