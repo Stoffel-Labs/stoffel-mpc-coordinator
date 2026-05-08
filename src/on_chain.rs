@@ -1,32 +1,30 @@
-use ark_ff::FftField;
+use super::{Coordinator, CoordinatorError};
+use crate::{Round, ShareBound};
+use alloy::providers::WalletProvider;
 use alloy::{
-    sol_types::SolValue,
+    network::EthereumWallet,
     providers::{Provider, ProviderBuilder, WsConnect},
     signers::local::PrivateKeySigner,
-    network::EthereumWallet,
-    signers::Signer
+    signers::Signer,
+    sol_types::SolValue,
 };
-use alloy::providers::WalletProvider;
-use alloy_primitives::{U256, Address, Signature, Bytes, Keccak256 };
-use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorErrors;
-use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
-use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
+use alloy_primitives::{Address, Bytes, Keccak256, Signature, U256};
+use ark_ff::FftField;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
 use futures_util::stream::StreamExt;
-use std::collections::HashMap;
-use std::str::FromStr;
-use super::{Coordinator, CoordinatorError};
 use hpke::{
     aead::AesGcm256,
     kdf::HkdfSha256,
     kem::{DhP256HkdfSha256, Kem},
-    single_shot_open, single_shot_seal,
-    Deserializable, Serializable,
-    OpModeR, OpModeS,
+    single_shot_open, single_shot_seal, Deserializable, OpModeR, OpModeS, Serializable,
 };
-use p256::{SecretKey, pkcs8::DecodePrivateKey};
-use rand::{SeedableRng, rngs::StdRng};
-use ark_serialize::{CanonicalSerialize, CanonicalDeserialize, SerializationError};
-use crate::{ShareBound, Round};
+use p256::{pkcs8::DecodePrivateKey, SecretKey};
+use rand::{rngs::StdRng, SeedableRng};
+use std::collections::HashMap;
+use std::str::FromStr;
+use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
+use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorErrors;
+use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
 
 type KemImpl = DhP256HkdfSha256;
 type KdfImpl = HkdfSha256;
@@ -41,45 +39,53 @@ pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone, F: FftField,
     t: u64,
     n_outputs: Option<u64>,
     key_der: Option<Vec<u8>>,
-    _marker: std::marker::PhantomData<(F, S)>
+    _marker: std::marker::PhantomData<(F, S)>,
 }
 
 /// RPC interface on the node.
 pub mod node_rpc {
+    use alloy::{
+        providers::{Provider, WalletProvider},
+        sol_types::SolValue,
+    };
+    use alloy_primitives::{Address, Keccak256, Signature, SignatureError};
     use ark_ff::FftField;
-    use alloy::{sol_types::SolValue, providers::{WalletProvider, Provider}};
-    use alloy_primitives::{Address, Signature, SignatureError, Keccak256};
+    use jsonrpsee::{
+        async_client::Client,
+        core::{to_json_raw_value, SubscriptionResult},
+        proc_macros::rpc,
+        server::{RpcModule, ServerHandle},
+        types::{error::ErrorCode, ErrorObjectOwned},
+        PendingSubscriptionSink, SubscriptionSink,
+    };
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use jsonrpsee::{
-        core::{SubscriptionResult, to_json_raw_value},
-        async_client::Client,
-        server::{RpcModule, ServerHandle},
-        proc_macros::rpc,
-        PendingSubscriptionSink, SubscriptionSink,
-        types::{ErrorObjectOwned, error::ErrorCode},
-    };
 
-    use async_trait::async_trait;
-    use tokio::task::JoinHandle;
     use super::ClientIdentity;
-    use crate::{CoordinatorError, rpc::ClientInfo, NodeRPCError, ShareBound};
-    use tokio::task::JoinSet;
-    use serde::{Serialize, Deserialize};
+    use crate::{rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound};
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
+    use tokio::task::JoinHandle;
+    use tokio::task::JoinSet;
 
-    async fn verify_client_sig(base_nonce: u64, i: u64, addr: Address, sig_bytes: Vec<u8>) -> Result<bool, SignatureError> {
+    async fn verify_client_sig(
+        base_nonce: u64,
+        i: u64,
+        addr: Address,
+        sig_bytes: Vec<u8>,
+    ) -> Result<bool, SignatureError> {
         let sig = Signature::from_raw(&sig_bytes)?;
-    
+
         let hash = {
             let mut hasher = Keccak256::new();
             hasher.update((base_nonce + i).abi_encode());
             hasher.finalize()
         };
-    
+
         let sig_addr = sig.recover_address_from_msg(hash)?;
-    
+
         Ok(sig_addr == addr)
     }
 
@@ -95,37 +101,62 @@ pub mod node_rpc {
     pub struct NodeRPCClient<F: FftField, S: ShareBound<F>> {
         node_rpcs: Vec<Client>,
         t: usize,
-        _marker: std::marker::PhantomData<(F, S)>
+        _marker: std::marker::PhantomData<(F, S)>,
     }
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCClient<F, S> {
         /// Start an RPC client from a certificate generated using rcgen.
-        pub async fn start_rpc_client_from_cert(t: usize, addrs: Vec<(String, u16)>, client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
-            Self::start_rpc_client(t, addrs, client_cert.cert.der().to_vec(), client_cert.signing_key.serialize_der()).await
+        pub async fn start_rpc_client_from_cert(
+            t: usize,
+            addrs: Vec<(String, u16)>,
+            client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
+        ) -> Self {
+            Self::start_rpc_client(
+                t,
+                addrs,
+                client_cert.cert.der().to_vec(),
+                client_cert.signing_key.serialize_der(),
+            )
+            .await
         }
 
         /// Start an RPC client from a raw certificate and corresponding private key in DER format.
         /// The information is the same as for `start_rpc_client_from_cert`, but the format
         /// differs.
-        pub async fn start_rpc_client(t: usize, addrs: Vec<(String, u16)>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+        pub async fn start_rpc_client(
+            t: usize,
+            addrs: Vec<(String, u16)>,
+            cert_der: Vec<u8>,
+            key_der: Vec<u8>,
+        ) -> Self {
             let mut node_rpcs = Vec::new();
 
             // connect to all nodes
             for (addr, port) in addrs.iter() {
-                let node_rpc = crate::self_signed_certs::setup_client(addr, *port, cert_der.clone(), key_der.clone()).await;
+                let node_rpc = crate::self_signed_certs::setup_client(
+                    addr,
+                    *port,
+                    cert_der.clone(),
+                    key_der.clone(),
+                )
+                .await;
                 node_rpcs.push(node_rpc);
             }
 
             Self {
                 node_rpcs,
                 t,
-                _marker: std::marker::PhantomData
+                _marker: std::marker::PhantomData,
             }
         }
 
         /// Returns a mask whose index has been previously reserved by the client by receiving the
         /// individual shares from nodes and reconstructing the mask from them.
-        pub async fn receive_mask(&self, sig: Vec<u8>, addr: Address) -> Result<S::SecretType, CoordinatorError> {
+        pub async fn receive_mask(
+            &self,
+            sig: Vec<u8>,
+            addr: Address,
+        ) -> Result<S::SecretType, CoordinatorError> {
             let mut share_futures = JoinSet::new();
 
             for rpc in self.node_rpcs.iter() {
@@ -136,7 +167,10 @@ pub mod node_rpc {
             let mut mask_shares = Vec::new();
 
             while let Some(share_bytes) = share_futures.join_next().await {
-                let share = ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.unwrap().unwrap().unwrap().as_slice()).unwrap();
+                let share = ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                    share_bytes.unwrap().unwrap().unwrap().as_slice(),
+                )
+                .unwrap();
                 mask_shares.push(share);
 
                 if mask_shares.len() >= 2 * self.t + 1 {
@@ -145,32 +179,69 @@ pub mod node_rpc {
                             return Ok(mask);
                         }
                         Err(_) => {
-                            return Err(CoordinatorError::MaskReconstructionFailed(mask_shares.len()));
+                            return Err(CoordinatorError::MaskReconstructionFailed(
+                                mask_shares.len(),
+                            ));
                         }
                     }
                 }
             }
 
-            Err(CoordinatorError::MaskReconstructionFailed(mask_shares.len()))
+            Err(CoordinatorError::MaskReconstructionFailed(
+                mask_shares.len(),
+            ))
         }
     }
 
-    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>> NodeRPCServer<P, F, S> {
+    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>>
+        NodeRPCServer<P, F, S>
+    {
         /// Start the node-side RPC server from a certificate generated using rcgen.
-        pub async fn start_from_cert(addr: &str, port: u16, coord: StoffelCoordinatorInstance<P>, cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> Self {
-            Self::start(addr, port, coord, cert.cert.der().to_vec(), cert.signing_key.serialize_der()).await
+        pub async fn start_from_cert(
+            addr: &str,
+            port: u16,
+            coord: StoffelCoordinatorInstance<P>,
+            cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
+        ) -> Self {
+            Self::start(
+                addr,
+                port,
+                coord,
+                cert.cert.der().to_vec(),
+                cert.signing_key.serialize_der(),
+            )
+            .await
         }
 
-        pub async fn start(addr: &str, port: u16, coord: StoffelCoordinatorInstance<P>, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
-            let base_nonce = super::u256_to_u64(coord.baseNonce().call().await.expect("failed to fetch base nonce"))
-                .expect("base nonce does not fit in u64");
+        pub async fn start(
+            addr: &str,
+            port: u16,
+            coord: StoffelCoordinatorInstance<P>,
+            cert_der: Vec<u8>,
+            key_der: Vec<u8>,
+        ) -> Self {
+            let base_nonce = super::u256_to_u64(
+                coord
+                    .baseNonce()
+                    .call()
+                    .await
+                    .expect("failed to fetch base nonce"),
+            )
+            .expect("base nonce does not fit in u64");
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord, base_nonce)));
-            let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(addr, port, cert_der, key_der, rpc_server_data.clone()).await;
+            let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(
+                addr,
+                port,
+                cert_der,
+                key_der,
+                rpc_server_data.clone(),
+            )
+            .await;
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
                 port,
-                server_handle
+                server_handle,
             }
         }
 
@@ -181,7 +252,8 @@ pub mod node_rpc {
         pub async fn ids_and_addrs(&self) -> Vec<(Vec<u8>, ClientIdentity)> {
             let d = self.rpc_server.lock().await;
 
-            d.ids_and_addrs.iter()
+            d.ids_and_addrs
+                .iter()
                 .filter(|(_, _, sig)| sig.is_none())
                 .map(|(id, addr, _)| (id.clone(), *addr))
                 .collect()
@@ -189,8 +261,14 @@ pub mod node_rpc {
 
         pub async fn reset(&mut self) {
             let mut d = self.rpc_server.lock().await;
-            let base_nonce = super::u256_to_u64(d.coord.baseNonce().call().await.expect("failed to fetch base nonce"))
-                .expect("base nonce does not fit in u64");
+            let base_nonce = super::u256_to_u64(
+                d.coord
+                    .baseNonce()
+                    .call()
+                    .await
+                    .expect("failed to fetch base nonce"),
+            )
+            .expect("base nonce does not fit in u64");
             d.index_to_client.clear();
             d.client_to_index.clear();
             d.authenticated.clear();
@@ -201,7 +279,11 @@ pub mod node_rpc {
         }
 
         // called when the client has reserved indices at the coordinator
-        pub async fn add_reserved_index(&mut self, addr: ClientIdentity, i: u64) -> Result<(), NodeRPCError> {
+        pub async fn add_reserved_index(
+            &mut self,
+            addr: ClientIdentity,
+            i: u64,
+        ) -> Result<(), NodeRPCError> {
             let mut d = self.rpc_server.lock().await;
 
             assert!(!d.index_to_client.contains_key(&i));
@@ -213,7 +295,8 @@ pub mod node_rpc {
                 let sig_bytes = entry.2.take().unwrap();
                 let tls_id = entry.0.clone();
 
-                let authenticated = verify_client_sig(d.base_nonce, i, addr, sig_bytes).await
+                let authenticated = verify_client_sig(d.base_nonce, i, addr, sig_bytes)
+                    .await
                     .unwrap_or(false);
 
                 if !authenticated {
@@ -225,8 +308,11 @@ pub mod node_rpc {
                 if let Some(share) = d.mask_shares.get(&i) {
                     if let Some(sink) = d.sinks.get(&addr) {
                         let mut share_bytes = Vec::new();
-                        share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
-                        let json = to_json_raw_value(&share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                        share
+                            .serialize_compressed(&mut share_bytes)
+                            .map_err(|_| NodeRPCError::SerializationError)?;
+                        let json = to_json_raw_value(&share_bytes)
+                            .map_err(|_| NodeRPCError::SerializationError)?;
                         sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                     }
                 }
@@ -246,8 +332,11 @@ pub mod node_rpc {
                 if d.authenticated.contains(addr) {
                     if let Some(sink) = d.sinks.get(addr) {
                         let mut share_bytes = Vec::new();
-                        share.serialize_compressed(&mut share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
-                        let json = to_json_raw_value(&share_bytes).map_err(|_| NodeRPCError::SerializationError)?;
+                        share
+                            .serialize_compressed(&mut share_bytes)
+                            .map_err(|_| NodeRPCError::SerializationError)?;
+                        let json = to_json_raw_value(&share_bytes)
+                            .map_err(|_| NodeRPCError::SerializationError)?;
                         sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                     }
                 }
@@ -258,26 +347,39 @@ pub mod node_rpc {
     }
 
     /// Represents a connection with a client on the node-side RPC server.
-    pub struct NodeRPCServerConnection<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
+    pub struct NodeRPCServerConnection<
+        P: Provider + WalletProvider + Clone,
+        F: FftField,
+        S: ShareBound<F>,
+    > {
         /// Reference to the server's shared state
         d: Arc<Mutex<NodeRPCServerShared<P, F, S>>>,
         /// The MPC client's node-facing identity
-        id: Vec<u8>
+        id: Vec<u8>,
     }
 
-    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>> crate::rpc::RPCServerConnection for NodeRPCServerConnection<P, F, S> {
+    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>>
+        crate::rpc::RPCServerConnection for NodeRPCServerConnection<P, F, S>
+    {
         type Internal = NodeRPCServerShared<P, F, S>;
 
         fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self {
             Self { d: internal, id }
         }
 
-        fn into_rpc(self) -> RpcModule<Self> where Self: Sized {
+        fn into_rpc(self) -> RpcModule<Self>
+        where
+            Self: Sized,
+        {
             crate::on_chain::node_rpc::OnChainNodeRPCServer::into_rpc(self)
         }
     }
 
-    pub struct NodeRPCServerShared<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
+    pub struct NodeRPCServerShared<
+        P: Provider + WalletProvider + Clone,
+        F: FftField,
+        S: ShareBound<F>,
+    > {
         index_to_client: HashMap<u64, ClientIdentity>,
         client_to_index: HashMap<ClientIdentity, u64>,
         authenticated: HashSet<ClientIdentity>,
@@ -292,10 +394,12 @@ pub mod node_rpc {
         clients: HashMap<Vec<u8>, ClientInfo>,
         base_nonce: u64,
         coord: StoffelCoordinatorInstance<P>,
-        _marker: std::marker::PhantomData<F>
+        _marker: std::marker::PhantomData<F>,
     }
 
-    impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> NodeRPCServerShared<P, F, S> {
+    impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
+        NodeRPCServerShared<P, F, S>
+    {
         pub fn new(coord: StoffelCoordinatorInstance<P>, base_nonce: u64) -> Self {
             Self {
                 index_to_client: HashMap::new(),
@@ -307,14 +411,28 @@ pub mod node_rpc {
                 clients: HashMap::new(),
                 base_nonce,
                 coord,
-                _marker: std::marker::PhantomData
+                _marker: std::marker::PhantomData,
             }
         }
     }
 
-    impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> crate::rpc::RPCServerShared for NodeRPCServerShared<P, F, S> {
-        fn add_client(&mut self, cert_der: Vec<u8>, client_handle: JoinHandle<()>, stop_tx: ServerHandle) {
-            self.clients.insert(cert_der.clone(), ClientInfo { cert: cert_der, thread: client_handle, stop_tx });
+    impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
+        crate::rpc::RPCServerShared for NodeRPCServerShared<P, F, S>
+    {
+        fn add_client(
+            &mut self,
+            cert_der: Vec<u8>,
+            client_handle: JoinHandle<()>,
+            stop_tx: ServerHandle,
+        ) {
+            self.clients.insert(
+                cert_der.clone(),
+                ClientInfo {
+                    cert: cert_der,
+                    thread: client_handle,
+                    stop_tx,
+                },
+            );
         }
     }
 
@@ -331,22 +449,32 @@ pub mod node_rpc {
     }
 
     #[async_trait]
-    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>> OnChainNodeRPCServer for NodeRPCServerConnection<P, F, S> {
-        async fn receive_mask_share(&self, pending: PendingSubscriptionSink, sig_bytes: Vec<u8>, addr: Address) -> SubscriptionResult {
+    impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>>
+        OnChainNodeRPCServer for NodeRPCServerConnection<P, F, S>
+    {
+        async fn receive_mask_share(
+            &self,
+            pending: PendingSubscriptionSink,
+            sig_bytes: Vec<u8>,
+            addr: Address,
+        ) -> SubscriptionResult {
             use OnChainNodeRPCServerError::*;
 
             let mut d = self.d.lock().await;
 
             // each client can only authenticate one address and each address can only be
             // authenticated once
-            if d.ids_and_addrs.iter().any(|(id, prev_addr, _)| {
-                self.id == *id || addr == *prev_addr
-            }) {
-                pending.reject(ErrorObjectOwned::owned(
-                    ErrorCode::InvalidParams.code(),
-                    format!("Client {} already requested mask share", addr),
-                    None::<()>)
-                ).await;
+            if d.ids_and_addrs
+                .iter()
+                .any(|(id, prev_addr, _)| self.id == *id || addr == *prev_addr)
+            {
+                pending
+                    .reject(ErrorObjectOwned::owned(
+                        ErrorCode::InvalidParams.code(),
+                        format!("Client {} already requested mask share", addr),
+                        None::<()>,
+                    ))
+                    .await;
                 return Ok(());
             }
 
@@ -355,15 +483,18 @@ pub mod node_rpc {
 
             if let Some(&i) = d.client_to_index.get(&addr) {
                 // reservation already known: verify immediately
-                let authenticated = verify_client_sig(d.base_nonce, i, addr, sig_bytes).await
+                let authenticated = verify_client_sig(d.base_nonce, i, addr, sig_bytes)
+                    .await
                     .unwrap_or(false);
 
                 if !authenticated {
-                    pending.reject(ErrorObjectOwned::owned(
-                        ErrorCode::InvalidParams.code(),
-                        format!("Authentication failed for address {}", addr),
-                        None::<()>)
-                    ).await;
+                    pending
+                        .reject(ErrorObjectOwned::owned(
+                            ErrorCode::InvalidParams.code(),
+                            format!("Authentication failed for address {}", addr),
+                            None::<()>,
+                        ))
+                        .await;
                     return Ok(());
                 }
 
@@ -372,24 +503,28 @@ pub mod node_rpc {
                 if let Some(share) = d.mask_shares.get(&i) {
                     let mut share_bytes = Vec::new();
                     match share.serialize_compressed(&mut share_bytes) {
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(e) => {
-                            pending.reject(ErrorObjectOwned::owned(
-                                ErrorCode::ServerError(SerializationError as i32).code(),
-                                format!("Serializing share bytes failed: {e}"),
-                                None::<()>)
-                            ).await;
+                            pending
+                                .reject(ErrorObjectOwned::owned(
+                                    ErrorCode::ServerError(SerializationError as i32).code(),
+                                    format!("Serializing share bytes failed: {e}"),
+                                    None::<()>,
+                                ))
+                                .await;
                             return Ok(());
                         }
                     };
                     let json = match to_json_raw_value(&share_bytes) {
                         Ok(j) => j,
                         Err(e) => {
-                            pending.reject(ErrorObjectOwned::owned(
-                                ErrorCode::ServerError(SerializationError as i32).code(),
-                                format!("Converting serialized shares to JSON failed: {e}"),
-                                None::<()>)
-                            ).await;
+                            pending
+                                .reject(ErrorObjectOwned::owned(
+                                    ErrorCode::ServerError(SerializationError as i32).code(),
+                                    format!("Converting serialized shares to JSON failed: {e}"),
+                                    None::<()>,
+                                ))
+                                .await;
                             return Ok(());
                         }
                     };
@@ -430,7 +565,11 @@ fn bytes_to_field<F: FftField + CanonicalDeserialize>(x: Bytes) -> Result<F, Ser
     Ok(element)
 }
 
-pub async fn generate_client_sig(base_nonce: u64, i: u64, signer: PrivateKeySigner) -> Result<Signature, alloy::signers::Error> {
+pub async fn generate_client_sig(
+    base_nonce: u64,
+    i: u64,
+    signer: PrivateKeySigner,
+) -> Result<Signature, alloy::signers::Error> {
     let hash = {
         let mut hasher = Keccak256::new();
         hasher.update((base_nonce + i).abi_encode());
@@ -441,29 +580,57 @@ pub async fn generate_client_sig(base_nonce: u64, i: u64, signer: PrivateKeySign
     Ok(sig)
 }
 
-pub async fn ws_connect(addr: &str, wallet_sk: &str) -> impl Provider + WalletProvider + Clone + 'static {
+pub async fn ws_connect(
+    addr: &str,
+    wallet_sk: &str,
+) -> impl Provider + WalletProvider + Clone + 'static {
     let ws = WsConnect::new(addr);
-    let wallet = EthereumWallet::from(PrivateKeySigner::from_str(wallet_sk).expect("invalid private key"));
+    let wallet =
+        EthereumWallet::from(PrivateKeySigner::from_str(wallet_sk).expect("invalid private key"));
 
     match ProviderBuilder::new().wallet(wallet).connect_ws(ws).await {
-        Ok(p) => { p }
+        Ok(p) => p,
         Err(e) => {
-            panic!("could not connect to Ethereum node at {} via WebSockets: {}", addr, e);
+            panic!(
+                "could not connect to Ethereum node at {} via WebSockets: {}",
+                addr, e
+            );
         }
     }
 }
 
-pub async fn setup_coord<T, F: FftField, S: ShareBound<F>>(eth: T, contract_addr: Address, t: u64, n_outputs: u64, key_der: Option<Vec<u8>>)
-    -> OnChainCoordinator<T, F, S>
-    where T: Provider + WalletProvider + Clone {
+pub async fn setup_coord<T, F: FftField, S: ShareBound<F>>(
+    eth: T,
+    contract_addr: Address,
+    t: u64,
+    n_outputs: u64,
+    key_der: Option<Vec<u8>>,
+) -> OnChainCoordinator<T, F, S>
+where
+    T: Provider + WalletProvider + Clone,
+{
     let coord_instance = StoffelCoordinator::new(contract_addr, eth.clone());
     OnChainCoordinator::new(coord_instance, t, n_outputs, key_der).await
 }
 
-impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> OnChainCoordinator<P, F, S> {
-    pub async fn new(coord: StoffelCoordinatorInstance<P>, t: u64, n_outputs: u64, key_der: Option<Vec<u8>>) -> Self {
+impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
+    OnChainCoordinator<P, F, S>
+{
+    pub async fn new(
+        coord: StoffelCoordinatorInstance<P>,
+        t: u64,
+        n_outputs: u64,
+        key_der: Option<Vec<u8>>,
+    ) -> Self {
         let contract_block = Self::coord_creation_block(&coord).await;
-        Self { coord, contract_block, t, n_outputs: Some(n_outputs), key_der, _marker: std::marker::PhantomData }
+        Self {
+            coord,
+            contract_block,
+            t,
+            n_outputs: Some(n_outputs),
+            key_der,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     pub fn coord(&self) -> StoffelCoordinatorInstance<P> {
@@ -471,52 +638,74 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> OnChai
     }
 
     async fn coord_creation_block(coord: &StoffelCoordinatorInstance<P>) -> u64 {
-            let x = coord.creationBlock().call().await.expect("sending TX failed");
-            u256_to_u64(x).expect("impossible bug: block number does not fit into u64")
+        let x = coord
+            .creationBlock()
+            .call()
+            .await
+            .expect("sending TX failed");
+        u256_to_u64(x).expect("impossible bug: block number does not fit into u64")
     }
 
     pub async fn base_nonce(&self) -> u64 {
-        let base_nonce = self.coord.baseNonce().call().await.expect("sending TX failed");
+        let base_nonce = self
+            .coord
+            .baseNonce()
+            .call()
+            .await
+            .expect("sending TX failed");
         u256_to_u64(base_nonce).expect("impossible bug: block number does not fit into u64")
     }
 
     /// Resets local state after the smart contract has been reset, so subsequent event listeners
     /// do not replay events from previous rounds.
     pub async fn reset(&mut self) -> Result<(), CoordinatorError> {
-        self.contract_block = self.coord.provider().get_block_number().await
-            .map_err(|e| CoordinatorError::EthereumError(format!("error getting current block number: {}", e)))?;
+        self.contract_block = self
+            .coord
+            .provider()
+            .get_block_number()
+            .await
+            .map_err(|e| {
+                CoordinatorError::EthereumError(format!(
+                    "error getting current block number: {}",
+                    e
+                ))
+            })?;
         Ok(())
     }
 
     pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
         let result = match round {
-            Round::Idle => { panic!(); }
+            Round::Idle => {
+                panic!();
+            }
             Round::Preprocessing => self.coord.startPreprocessing().send().await,
             Round::InputMaskReservation => self.coord.reserveInputMasks().send().await,
             Round::InputCollection => self.coord.collectInputs().send().await,
             Round::MPCExecution => self.coord.startMpc().send().await,
             Round::OutputDistribution => self.coord.sendOutputs().send().await,
-            Round::ProgramFinished => self.coord.finalize().send().await
+            Round::ProgramFinished => self.coord.finalize().send().await,
         };
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to trigger input phase to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to trigger input phase: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to trigger input phase to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to trigger input phase: {}",
+                e
+            ))),
         }
     }
 }
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 
-impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordinator<F, S> for OnChainCoordinator<P, F, S> {
+impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordinator<F, S>
+    for OnChainCoordinator<P, F, S>
+{
     type ClientIdentity = Address;
 
     async fn start_preprocessing(&self) -> Result<(), CoordinatorError> {
@@ -524,17 +713,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to start preprocessing to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to start preprocessing: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to start preprocessing to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to start preprocessing: {}",
+                e
+            ))),
         }
     }
 
@@ -543,17 +732,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to reserve input masks to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to reserve input masks: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to reserve input masks to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to reserve input masks: {}",
+                e
+            ))),
         }
     }
 
@@ -562,17 +751,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to collect inputs to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to collect inputs: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to collect inputs to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to collect inputs: {}",
+                e
+            ))),
         }
     }
 
@@ -581,17 +770,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to start MPC to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to start MPC: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to start MPC to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to start MPC: {}",
+                e
+            ))),
         }
     }
 
@@ -600,17 +789,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to send outputs to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to send outputs: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to send outputs to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to send outputs: {}",
+                e
+            ))),
         }
     }
 
@@ -619,17 +808,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to finalize to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to finalize: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to finalize to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to finalize: {}",
+                e
+            ))),
         }
     }
 
@@ -638,34 +827,52 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to reset coordinator to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to reset coordinator: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to reset coordinator to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to reset coordinator: {}",
+                e
+            ))),
         }
     }
 
-    async fn wait_for_indices(&self, n_clients: u64) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
+    async fn wait_for_indices(
+        &self,
+        n_clients: u64,
+    ) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
         let mut addr_to_i = HashMap::new();
 
         // spawn thread to receive all ReservedInputEvents
-        let mut events = self.coord
+        let mut events = self
+            .coord
             .ReservedInputEvent_filter()
             .from_block(self.contract_block)
             .watch()
-            .await.unwrap().into_stream();
-        
-        while let Some(Ok((StoffelCoordinator::ReservedInputEvent { client, reservedIndex }, _))) = events.next().await {
-            addr_to_i.insert(client, u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"));
-            eprintln!("[party] Recorded reserved mask index {} for client address {:?}",
-                     reservedIndex, client);
+            .await
+            .unwrap()
+            .into_stream();
+
+        while let Some(Ok((
+            StoffelCoordinator::ReservedInputEvent {
+                client,
+                reservedIndex,
+            },
+            _,
+        ))) = events.next().await
+        {
+            addr_to_i.insert(
+                client,
+                u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"),
+            );
+            eprintln!(
+                "[party] Recorded reserved mask index {} for client address {:?}",
+                reservedIndex, client
+            );
             if addr_to_i.len() as u64 == n_clients {
                 break;
             }
@@ -674,33 +881,55 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         Ok(addr_to_i)
     }
 
-    async fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<S>) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
-        let mut events = match self.coord
+    async fn wait_for_inputs(
+        &self,
+        n_clients: u64,
+        mask_shares: Vec<S>,
+    ) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
+        let mut events = match self
+            .coord
             .MaskedInputEvent_filter()
             .from_block(self.contract_block)
             .watch()
-            .await {
+            .await
+        {
             Ok(e) => e.into_stream(),
             Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MaskedInputEvent events: {}", e)));
+                return Err(CoordinatorError::EthereumError(format!(
+                    "error setting up event listener for MaskedInputEvent events: {}",
+                    e
+                )));
             }
         };
 
         let mut inputs: HashMap<ClientIdentity, Vec<S>> = HashMap::new();
         for _ in 0..n_clients {
             match events.next().await {
-                Some(Ok((StoffelCoordinator::MaskedInputEvent { client, maskedInput, reservedIndex }, _))) => {
+                Some(Ok((
+                    StoffelCoordinator::MaskedInputEvent {
+                        client,
+                        maskedInput,
+                        reservedIndex,
+                    },
+                    _,
+                ))) => {
                     let i: usize = u256_to_u64(reservedIndex)
-                        .ok_or(CoordinatorError::U256ToU64Error)?.try_into()
+                        .ok_or(CoordinatorError::U256ToU64Error)?
+                        .try_into()
                         .map_err(|_| CoordinatorError::U256ToU64Error)?;
                     let mask_share = &mask_shares[i];
-                    let masked_input_value = bytes_to_field::<S::SecretType>(maskedInput).map_err(|_| CoordinatorError::DeserializationError)?;
-                    let input = S::compute_masked_input(masked_input_value, mask_share).map_err(|_| CoordinatorError::ShareError)?;
+                    let masked_input_value = bytes_to_field::<S::SecretType>(maskedInput)
+                        .map_err(|_| CoordinatorError::DeserializationError)?;
+                    let input = S::compute_masked_input(masked_input_value, mask_share)
+                        .map_err(|_| CoordinatorError::ShareError)?;
 
                     inputs.insert(client, vec![input]);
                 }
                 _ => {
-                    return Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for MaskedInputEvent events".to_string()));
+                    return Err(CoordinatorError::EthereumError(
+                        "event stream ended unexpectedly while waiting for MaskedInputEvent events"
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -714,25 +943,47 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                     .from_block(self.contract_block)
                     .watch()
                     .await
-                    .map_err(|e| CoordinatorError::EthereumError(format!("error setting up event listener for {} events: {}", $name, e)))?;
+                    .map_err(|e| {
+                        CoordinatorError::EthereumError(format!(
+                            "error setting up event listener for {} events: {}",
+                            $name, e
+                        ))
+                    })?;
 
                 let mut stream = watcher.into_stream();
-                
+
                 match stream.next().await {
                     Some(Ok(_)) => Ok(()),
-                    _ => Err(CoordinatorError::EthereumError(format!("event stream ended unexpectedly while waiting for {} events", $name))),
+                    _ => Err(CoordinatorError::EthereumError(format!(
+                        "event stream ended unexpectedly while waiting for {} events",
+                        $name
+                    ))),
                 }
             }};
         }
 
         match round {
             Round::Idle => panic!(),
-            Round::Preprocessing => wait_for_event!(self.coord.PreprocessingStarted_filter(), "PreprocessingStarted"),
-            Round::InputCollection => wait_for_event!(self.coord.InputCollectionStarted_filter(), "InputCollectionStarted"),
-            Round::InputMaskReservation => wait_for_event!(self.coord.InputMaskReservationStarted_filter(), "InputMaskReservationStarted"),
+            Round::Preprocessing => wait_for_event!(
+                self.coord.PreprocessingStarted_filter(),
+                "PreprocessingStarted"
+            ),
+            Round::InputCollection => wait_for_event!(
+                self.coord.InputCollectionStarted_filter(),
+                "InputCollectionStarted"
+            ),
+            Round::InputMaskReservation => wait_for_event!(
+                self.coord.InputMaskReservationStarted_filter(),
+                "InputMaskReservationStarted"
+            ),
             Round::MPCExecution => wait_for_event!(self.coord.MPCStarted_filter(), "MPCStarted"),
-            Round::OutputDistribution => wait_for_event!(self.coord.OutputSendingStarted_filter(), "OutputSendingStarted"),
-            Round::ProgramFinished => wait_for_event!(self.coord.ExecutionDone_filter(), "ExecutionDone"),
+            Round::OutputDistribution => wait_for_event!(
+                self.coord.OutputSendingStarted_filter(),
+                "OutputSendingStarted"
+            ),
+            Round::ProgramFinished => {
+                wait_for_event!(self.coord.ExecutionDone_filter(), "ExecutionDone")
+            }
         }
     }
 
@@ -742,7 +993,9 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         let receipt = tx.get_receipt().await.expect("failed to get receipt");
 
         if !receipt.status() {
-            return Err(CoordinatorError::EthereumError("invalid receipt sending transaction to obtain input mask indices".to_string()));
+            return Err(CoordinatorError::EthereumError(
+                "invalid receipt sending transaction to obtain input mask indices".to_string(),
+            ));
         }
 
         // TODO: check if reservation successful
@@ -750,38 +1003,56 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         Ok(())
     }
 
-    async fn send_masked_input(&self, masked_input: S::ValueType, i: u64) -> Result<(), CoordinatorError> {
-        let masked_input_bytes = field_to_bytes(masked_input).map_err(|_| CoordinatorError::SerializationError)?;
-        let builder = self.coord.submitMaskedInput(masked_input_bytes, U256::from(i));
+    async fn send_masked_input(
+        &self,
+        masked_input: S::ValueType,
+        i: u64,
+    ) -> Result<(), CoordinatorError> {
+        let masked_input_bytes =
+            field_to_bytes(masked_input).map_err(|_| CoordinatorError::SerializationError)?;
+        let builder = self
+            .coord
+            .submitMaskedInput(masked_input_bytes, U256::from(i));
         match builder.send().await {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to submit masked inputs be mined: {}", e)))
-                    }
-                }
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to submit masked inputs be mined: {}",
+                    e
+                ))),
+            },
             Err(e) => {
-                let msg = if let Some(decoded_error) = e.as_decoded_interface_error::<StoffelCoordinatorErrors>() {
+                let msg = if let Some(decoded_error) =
+                    e.as_decoded_interface_error::<StoffelCoordinatorErrors>()
+                {
                     match decoded_error {
-                        StoffelCoordinatorErrors::IndexNotReserved(StoffelCoordinator::IndexNotReserved { client, index }) => {
+                        StoffelCoordinatorErrors::IndexNotReserved(
+                            StoffelCoordinator::IndexNotReserved { client, index },
+                        ) => {
                             format!("Index {} not reserved by address {}", index, client)
                         }
-                        StoffelCoordinatorErrors::ZeroMaskedInput(StoffelCoordinator::ZeroMaskedInput { client }) => {
-                            format!("Masked input cannot be zero, but client {} submitted zero", client)
+                        StoffelCoordinatorErrors::ZeroMaskedInput(
+                            StoffelCoordinator::ZeroMaskedInput { client },
+                        ) => {
+                            format!(
+                                "Masked input cannot be zero, but client {} submitted zero",
+                                client
+                            )
                         }
-	                StoffelCoordinatorErrors::AlreadySubmittedInputs(StoffelCoordinator::AlreadySubmittedInputs { client }) => {
+                        StoffelCoordinatorErrors::AlreadySubmittedInputs(
+                            StoffelCoordinator::AlreadySubmittedInputs { client },
+                        ) => {
                             format!("Client {} already submitted masked inputs", client)
                         }
-                        _ => {
-                            "Unexpected error".to_string()
-                        }
+                        _ => "Unexpected error".to_string(),
                     }
                 } else {
                     "Unknown error".to_string()
                 };
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to submit masked inputs: {}", msg)))
+                Err(CoordinatorError::EthereumError(format!(
+                    "error sending transaction to submit masked inputs: {}",
+                    msg
+                )))
             }
         }
     }
@@ -789,37 +1060,60 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
     async fn obtain_outputs(&self) -> Result<Vec<S::ValueType>, CoordinatorError> {
         let client_sk = {
             let der_bytes = self.key_der.clone().unwrap();
-            let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes).map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
+            let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes)
+                .map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
             let raw_sk = parsed_secret_key.to_bytes();
 
-            <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk).map_err(|_| CoordinatorError::ParsingPrivateKeyFailed)?
+            <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk)
+                .map_err(|_| CoordinatorError::ParsingPrivateKeyFailed)?
         };
 
-        let mut events = match self.coord
+        let mut events = match self
+            .coord
             .EnoughOutputShares_filter()
             .from_block(self.contract_block)
             .topic1(self.coord.provider().default_signer_address())
             .watch()
-            .await {
+            .await
+        {
             Ok(e) => e.into_stream(),
             Err(e) => {
-                return Err(CoordinatorError::EthereumError(format!("error setting up event listener for MPCStarted events: {}", e)));
+                return Err(CoordinatorError::EthereumError(format!(
+                    "error setting up event listener for MPCStarted events: {}",
+                    e
+                )));
             }
         };
-    
-        while let Some(Ok((StoffelCoordinator::EnoughOutputShares { client: _, shares }, _))) = events.next().await {
+
+        while let Some(Ok((StoffelCoordinator::EnoughOutputShares { client: _, shares }, _))) =
+            events.next().await
+        {
             if (shares.len() as u64) < 2 * self.t + 1 {
                 panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
             }
 
             let mut output_shares = Vec::new();
             for bytes in shares.iter() {
-                let (encapped_key_bytes, c): (Vec<u8>, Vec<u8>) = ark_serialize::CanonicalDeserialize::deserialize_compressed(bytes.to_vec().as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
-                let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(&encapped_key_bytes).map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
+                let (encapped_key_bytes, c): (Vec<u8>, Vec<u8>) =
+                    ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                        bytes.to_vec().as_slice(),
+                    )
+                    .map_err(|_| CoordinatorError::DeserializationError)?;
+                let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(&encapped_key_bytes)
+                    .map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
                 let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
-                    &OpModeR::Base, &client_sk, &encapped_key, ENC_INFO, &c, b"",
-                ).map_err(|_| CoordinatorError::DecryptionError)?;
-                let shares: Vec<S> = ark_serialize::CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice()).map_err(|_| CoordinatorError::DeserializationError)?;
+                    &OpModeR::Base,
+                    &client_sk,
+                    &encapped_key,
+                    ENC_INFO,
+                    &c,
+                    b"",
+                )
+                .map_err(|_| CoordinatorError::DecryptionError)?;
+                let shares: Vec<S> = ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                    output_shares_bytes.as_slice(),
+                )
+                .map_err(|_| CoordinatorError::DeserializationError)?;
 
                 if shares.len() as u64 != self.n_outputs.unwrap() {
                     println!("Some node sent an invalid number of output shares, ignoring.");
@@ -829,34 +1123,55 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                 output_shares.push(shares);
             }
 
-            let outputs: Vec<_> = (0..self.n_outputs.unwrap() as usize).filter_map(|i| {
-                // shares for the ith output
-                let shares_i: Vec<_> = output_shares.iter().map(|shares| shares[i].clone()).collect();
+            let outputs: Vec<_> = (0..self.n_outputs.unwrap() as usize)
+                .filter_map(|i| {
+                    // shares for the ith output
+                    let shares_i: Vec<_> = output_shares
+                        .iter()
+                        .map(|shares| shares[i].clone())
+                        .collect();
 
-                // at least 2t+1 shares available as checked previously by the coordinator
-                match S::recover_secret(shares_i.as_slice(), (4 * self.t + 1) as usize, self.t as usize) {
-                    Ok((_, output_i)) => {
-                        Some(output_i)
+                    // at least 2t+1 shares available as checked previously by the coordinator
+                    match S::recover_secret(
+                        shares_i.as_slice(),
+                        (4 * self.t + 1) as usize,
+                        self.t as usize,
+                    ) {
+                        Ok((_, output_i)) => Some(output_i),
+                        Err(_) => {
+                            println!(
+                                "Reconstruction failed for output {}, waiting for more shares.",
+                                i
+                            );
+                            None
+                        }
                     }
-                    Err(_) => {
-                        println!("Reconstruction failed for output {}, waiting for more shares.", i);
-                        None
-                    }
-                }
-            }).collect();
+                })
+                .collect();
 
             if outputs.len() == self.n_outputs.unwrap() as usize {
                 return Ok(outputs);
             }
         }
 
-        Err(CoordinatorError::EthereumError("event stream ended unexpectedly while waiting for EnoughOutputShares events".to_string()))
+        Err(CoordinatorError::EthereumError(
+            "event stream ended unexpectedly while waiting for EnoughOutputShares events"
+                .to_string(),
+        ))
     }
 
-    async fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<S>) -> Result<(), CoordinatorError> {
-        let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key).map_err(|_| CoordinatorError::ParsingPublicKeyFailed)?;
+    async fn send_output_shares(
+        &self,
+        client_id: Self::ClientIdentity,
+        key: Vec<u8>,
+        output_shares: Vec<S>,
+    ) -> Result<(), CoordinatorError> {
+        let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key)
+            .map_err(|_| CoordinatorError::ParsingPublicKeyFailed)?;
         let mut output_shares_bytes = Vec::new();
-        output_shares.serialize_compressed(&mut output_shares_bytes).map_err(|_| CoordinatorError::SerializationError)?;
+        output_shares
+            .serialize_compressed(&mut output_shares_bytes)
+            .map_err(|_| CoordinatorError::SerializationError)?;
 
         let mut rng = StdRng::from_os_rng();
         let (encapsulated_key, ciphertext) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
@@ -866,26 +1181,28 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
             &output_shares_bytes,
             b"",
             &mut rng,
-        ).map_err(|_| CoordinatorError::EncryptionError)?;
+        )
+        .map_err(|_| CoordinatorError::EncryptionError)?;
         let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
 
         let mut bytes = Vec::new();
-        c.serialize_compressed(&mut bytes).map_err(|_| CoordinatorError::SerializationError)?;
+        c.serialize_compressed(&mut bytes)
+            .map_err(|_| CoordinatorError::SerializationError)?;
         let builder = self.coord.sendOutputShares(client_id, Bytes::from(bytes));
         let result = builder.send().await;
 
         match result {
-            Ok(r) => {
-                match r.watch().await {
-                    Ok(_) => { Ok(()) },
-                    Err(e) => {
-                        Err(CoordinatorError::EthereumError(format!("error waiting for transaction to send output shares to be mined: {}", e)))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(CoordinatorError::EthereumError(format!("error sending transaction to send output shares: {}", e)))
-            }
+            Ok(r) => match r.watch().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(CoordinatorError::EthereumError(format!(
+                    "error waiting for transaction to send output shares to be mined: {}",
+                    e
+                ))),
+            },
+            Err(e) => Err(CoordinatorError::EthereumError(format!(
+                "error sending transaction to send output shares: {}",
+                e
+            ))),
         }
     }
 }
@@ -893,22 +1210,22 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::signers::local::PrivateKeySigner;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::providers::{Provider, WalletProvider};
-    use ark_std::test_rng;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy_primitives::{address, Address, FixedBytes, U256};
+    use ark_bls12_381::Fr;
     #[cfg(feature = "avss")]
     use ark_bls12_381::G1Projective;
-    use ark_bls12_381::Fr;
-    use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy_primitives::{Address, U256, FixedBytes, address};
-    use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
-    use tokio::time::{timeout, Duration};
+    use ark_std::test_rng;
     use rand::Rng;
-    #[cfg(not(feature = "avss"))]
-    use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+    use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
     #[cfg(feature = "avss")]
     use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
     use stoffelmpc_mpc::common::SecretSharingScheme;
+    #[cfg(not(feature = "avss"))]
+    use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+    use tokio::time::{timeout, Duration};
 
     static SK: [&str; 10] = [
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -920,7 +1237,7 @@ mod tests {
         "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e",
         "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
         "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97",
-        "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+        "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6",
     ];
 
     static ACC: [Address; 10] = [
@@ -933,8 +1250,8 @@ mod tests {
         address!("0x976EA74026E726554dB657fA54763abd0C3a0aa9"),
         address!("0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"),
         address!("0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"),
-        address!("0xa0Ee7A142d267C1f36714E4a8F75612F20a79720")
-    ]; 
+        address!("0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"),
+    ];
 
     type TestShareValueType = Fr;
 
@@ -947,9 +1264,10 @@ mod tests {
     type TestShareType = FeldmanShamirShare<TestShareValueType, TestShareGroupType>;
 
     type TestValueType = <TestShareType as SecretSharingScheme<TestShareValueType>>::SecretType;
-    type TestOnChainCoordinator<P> = OnChainCoordinator::<P, TestShareValueType, TestShareType>;
+    type TestOnChainCoordinator<P> = OnChainCoordinator<P, TestShareValueType, TestShareType>;
 
-    type TestNodeRPCServer<P> = super::node_rpc::NodeRPCServer<P, TestShareValueType, TestShareType>;
+    type TestNodeRPCServer<P> =
+        super::node_rpc::NodeRPCServer<P, TestShareValueType, TestShareType>;
     type TestNodeRPCClient = super::node_rpc::NodeRPCClient<TestShareValueType, TestShareType>;
 
     fn sample_ids(n: usize) -> Vec<usize> {
@@ -969,11 +1287,17 @@ mod tests {
         public_key: Vec<u8>,
     ) {
         for (i, node_rpc) in node_rpcs.iter_mut().enumerate() {
-            node_rpc.add_mask_share(0, mask_shares[i].clone()).await.unwrap();
+            node_rpc
+                .add_mask_share(0, mask_shares[i].clone())
+                .await
+                .unwrap();
         }
         coords[0].trigger_round(Round::Preprocessing).await.unwrap();
         let _ = coords[0].wait_for_round(Round::Preprocessing).await;
-        coords[0].trigger_round(Round::InputMaskReservation).await.unwrap();
+        coords[0]
+            .trigger_round(Round::InputMaskReservation)
+            .await
+            .unwrap();
         let _ = coords[0].wait_for_round(Round::InputMaskReservation).await;
         let client_to_index = coords[0].wait_for_indices(1).await.unwrap();
         assert_eq!(client_to_index.len(), 1);
@@ -984,33 +1308,60 @@ mod tests {
                 node_rpc.add_reserved_index(c, i).await.unwrap();
             }
         }
-        coords[0].trigger_round(Round::InputCollection).await.unwrap();
+        coords[0]
+            .trigger_round(Round::InputCollection)
+            .await
+            .unwrap();
         let _ = coords[0].wait_for_round(Round::InputCollection).await;
-        let client_to_masked_input = coords[0].wait_for_inputs(1, vec![mask_shares[0].clone()]).await.unwrap();
+        let client_to_masked_input = coords[0]
+            .wait_for_inputs(1, vec![mask_shares[0].clone()])
+            .await
+            .unwrap();
         for (c, masked_inputs) in client_to_masked_input {
             for masked_input in masked_inputs {
                 #[cfg(not(feature = "avss"))]
-                println!("NODE: client {:?} submitted masked input {}", c, masked_input.share[0]);
+                println!(
+                    "NODE: client {:?} submitted masked input {}",
+                    c, masked_input.share[0]
+                );
                 #[cfg(feature = "avss")]
-                println!("NODE: client {:?} submitted masked input {}", c, masked_input.feldmanshare.share[0]);
+                println!(
+                    "NODE: client {:?} submitted masked input {}",
+                    c, masked_input.feldmanshare.share[0]
+                );
             }
         }
         coords[0].trigger_round(Round::MPCExecution).await.unwrap();
         let _ = coords[0].wait_for_round(Round::MPCExecution).await;
-        coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
+        coords[0]
+            .trigger_round(Round::OutputDistribution)
+            .await
+            .unwrap();
         let _ = coords[0].wait_for_round(Round::OutputDistribution).await;
         for node_rpc in node_rpcs.iter() {
             let authenticated = node_rpc.ids_and_addrs().await;
             assert_eq!(authenticated.len(), 1);
-            let client_public_key = &authenticated.iter()
+            let client_public_key = &authenticated
+                .iter()
                 .find(|(_, addr)| *addr == client_addr)
-                .expect("client address not found").0;
+                .expect("client address not found")
+                .0;
             assert_eq!(public_key, *client_public_key);
         }
         for (i, coord) in coords.iter_mut().enumerate() {
-            coord.send_output_shares(client_addr, public_key.clone(), vec![output_shares[i].clone()]).await.unwrap();
+            coord
+                .send_output_shares(
+                    client_addr,
+                    public_key.clone(),
+                    vec![output_shares[i].clone()],
+                )
+                .await
+                .unwrap();
         }
-        coords[0].trigger_round(Round::ProgramFinished).await.unwrap();
+        coords[0]
+            .trigger_round(Round::ProgramFinished)
+            .await
+            .unwrap();
     }
 
     async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
@@ -1023,12 +1374,20 @@ mod tests {
     ) {
         let _ = coord.wait_for_round(Round::Preprocessing).await;
         let _ = coord.wait_for_round(Round::InputMaskReservation).await;
-        coord.reserve_mask_index(0).await.expect("obtaining mask indices failed");
+        coord
+            .reserve_mask_index(0)
+            .await
+            .expect("obtaining mask indices failed");
         println!("CLIENT: obtained index 0");
         let base_nonce = coord.base_nonce().await;
         let signer = PrivateKeySigner::from_str(client_sk).unwrap();
-        let sig = generate_client_sig(base_nonce, 0, signer).await.expect("generating client signature failed");
-        let mask = rpc_client.receive_mask(sig.into(), client_addr).await.unwrap();
+        let sig = generate_client_sig(base_nonce, 0, signer)
+            .await
+            .expect("generating client signature failed");
+        let mask = rpc_client
+            .receive_mask(sig.into(), client_addr)
+            .await
+            .unwrap();
         assert_eq!(mask, correct_mask);
         let _ = coord.wait_for_round(Round::InputCollection).await;
         let masked_input = mask + TestValueType::from(1337);
@@ -1071,11 +1430,23 @@ mod tests {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
-        let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+        let hash = FixedBytes::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("invalid hash");
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
+        let fake_instance = FakeCoordinator::deploy(
+            provider.clone(),
+            hash,
+            U256::from(t),
+            initial_mpc_nodes.clone(),
+            n_inputs,
+            vec![],
+        )
+        .await
+        .expect("deployment failed");
         let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
         let coord = TestOnChainCoordinator::new(coord_instance, t, 1, None).await;
         assert_eq!(coord.contract_block, 1);
@@ -1088,12 +1459,25 @@ mod tests {
             let anvil = spawn_anvil();
             let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
             let t = 1;
-            let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+            let hash = FixedBytes::from_str(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("invalid hash");
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
-            let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
+            let fake_instance = FakeCoordinator::deploy(
+                provider.clone(),
+                hash,
+                U256::from(t),
+                initial_mpc_nodes.clone(),
+                n_inputs,
+                vec![],
+            )
+            .await
+            .expect("deployment failed");
+            let coord_instance =
+                StoffelCoordinator::new(*fake_instance.address(), provider.clone());
             let coord = TestOnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             coord.trigger_round(Round::Preprocessing).await.unwrap();
@@ -1105,18 +1489,37 @@ mod tests {
             let anvil = spawn_anvil();
             let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
             let t = 1;
-            let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+            let hash = FixedBytes::from_str(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("invalid hash");
             let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
             let n_inputs = U256::from(1);
 
-            let fake_instance = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
-            let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
+            let fake_instance = FakeCoordinator::deploy(
+                provider.clone(),
+                hash,
+                U256::from(t),
+                initial_mpc_nodes.clone(),
+                n_inputs,
+                vec![],
+            )
+            .await
+            .expect("deployment failed");
+            let coord_instance =
+                StoffelCoordinator::new(*fake_instance.address(), provider.clone());
             let coord = TestOnChainCoordinator::new(coord_instance, t, 1, None).await;
 
             tokio::spawn({
                 let coord = coord.clone();
                 async move {
-                    if timeout(Duration::from_millis(500), coord.wait_for_round(Round::Preprocessing)).await.is_err() {
+                    if timeout(
+                        Duration::from_millis(500),
+                        coord.wait_for_round(Round::Preprocessing),
+                    )
+                    .await
+                    .is_err()
+                    {
                         panic!();
                     }
                 }
@@ -1133,16 +1536,28 @@ mod tests {
         let node_rpc_addrs = vec![
             ("127.0.0.1".to_string(), 12348),
             ("127.0.0.1".to_string(), 12349),
-            ("127.0.0.1".to_string(), 12350)
+            ("127.0.0.1".to_string(), 12350),
         ];
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
-        let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+        let hash = FixedBytes::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("invalid hash");
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![]).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(
+            provider.clone(),
+            hash,
+            U256::from(t),
+            initial_mpc_nodes.clone(),
+            n_inputs,
+            vec![],
+        )
+        .await
+        .expect("deployment failed");
 
         // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
         let mut node_rpcs = Vec::new();
@@ -1150,19 +1565,34 @@ mod tests {
             let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
             let instance = StoffelCoordinatorInstance::new(*contract.address(), provider.clone());
 
-            let node_rpc = TestNodeRPCServer::start_from_cert(&node_rpc_addrs[i].0,
-                node_rpc_addrs[i].1, instance.clone(), crate::self_signed_certs::server_cert()).await;
+            let node_rpc = TestNodeRPCServer::start_from_cert(
+                &node_rpc_addrs[i].0,
+                node_rpc_addrs[i].1,
+                instance.clone(),
+                crate::self_signed_certs::server_cert(),
+            )
+            .await;
             node_rpcs.push(node_rpc);
         }
-        let _ = TestNodeRPCClient::start_rpc_client_from_cert(t, node_rpc_addrs.clone(), crate::self_signed_certs::client_cert()).await;
+        let _ = TestNodeRPCClient::start_rpc_client_from_cert(
+            t,
+            node_rpc_addrs.clone(),
+            crate::self_signed_certs::client_cert(),
+        )
+        .await;
     }
 
     #[tokio::test]
     pub async fn end_to_end() {
         crate::setup_test();
 
-        let certs = (0..7).map(|_| crate::self_signed_certs::client_cert()).collect::<Vec<_>>();
-        let public_keys = certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
+        let certs = (0..7)
+            .map(|_| crate::self_signed_certs::client_cert())
+            .collect::<Vec<_>>();
+        let public_keys = certs
+            .iter()
+            .map(|c| c.signing_key.public_key_raw().to_vec())
+            .collect::<Vec<_>>();
 
         let correct_mask = Fr::from(42);
         let correct_output = Fr::from(31415);
@@ -1175,12 +1605,24 @@ mod tests {
         let anvil = spawn_anvil();
         let n = 5;
         let t = 1u64;
-        let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+        let hash = FixedBytes::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("invalid hash");
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
         let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![ACC[5]]).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(
+            provider.clone(),
+            hash,
+            U256::from(t),
+            initial_mpc_nodes.clone(),
+            n_inputs,
+            vec![ACC[5]],
+        )
+        .await
+        .expect("deployment failed");
 
         let mut instances = Vec::new();
         for i in 0..3 {
@@ -1195,25 +1637,58 @@ mod tests {
 
         let mut rng = test_rng();
         let ids = sample_ids(n);
-        let mask_shares = TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
-        let output_shares = TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        let mask_shares =
+            TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+                .unwrap();
+        let output_shares =
+            TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+                .unwrap();
 
         let mut node_rpcs = Vec::new();
         for i in 0..3 {
             let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(
-                &node_rpc_addrs[i].0, node_rpc_addrs[i].1, instances[i].clone(), certs[i].clone()
-            ).await;
+                &node_rpc_addrs[i].0,
+                node_rpc_addrs[i].1,
+                instances[i].clone(),
+                certs[i].clone(),
+            )
+            .await;
             node_rpcs.push(node_rpc);
         }
 
         let client_provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
         let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
-        let mut client_coord = OnChainCoordinator::new(client_instance, t, 1, Some(certs[5].signing_key.serialize_der())).await;
-        let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), certs[5].clone()).await;
+        let mut client_coord = OnChainCoordinator::new(
+            client_instance,
+            t,
+            1,
+            Some(certs[5].signing_key.serialize_der()),
+        )
+        .await;
+        let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(
+            t as usize,
+            node_rpc_addrs.clone(),
+            certs[5].clone(),
+        )
+        .await;
 
         tokio::join!(
-            run_node_round(&mut coords, &mut node_rpcs, mask_shares, output_shares[..3].to_vec(), ACC[5], public_keys[5].clone()),
-            run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)
+            run_node_round(
+                &mut coords,
+                &mut node_rpcs,
+                mask_shares,
+                output_shares[..3].to_vec(),
+                ACC[5],
+                public_keys[5].clone()
+            ),
+            run_client_round(
+                &mut client_coord,
+                &rpc_client,
+                ACC[5],
+                SK[5],
+                correct_mask,
+                correct_output
+            )
         );
     }
 
@@ -1221,8 +1696,13 @@ mod tests {
     pub async fn reset_and_rerun() {
         crate::setup_test();
 
-        let certs = (0..7).map(|_| crate::self_signed_certs::client_cert()).collect::<Vec<_>>();
-        let public_keys = certs.iter().map(|c| c.signing_key.public_key_raw().to_vec()).collect::<Vec<_>>();
+        let certs = (0..7)
+            .map(|_| crate::self_signed_certs::client_cert())
+            .collect::<Vec<_>>();
+        let public_keys = certs
+            .iter()
+            .map(|c| c.signing_key.public_key_raw().to_vec())
+            .collect::<Vec<_>>();
 
         let correct_mask = Fr::from(42);
         let correct_output = Fr::from(31415);
@@ -1235,12 +1715,24 @@ mod tests {
         let anvil = spawn_anvil();
         let n = 5;
         let t = 1u64;
-        let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+        let hash = FixedBytes::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("invalid hash");
         let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
         let n_inputs = U256::from(1);
 
         let provider = ws_connect(&anvil.ws_endpoint(), SK[9]).await;
-        let contract = FakeCoordinator::deploy(provider.clone(), hash, U256::from(t), initial_mpc_nodes.clone(), n_inputs, vec![ACC[5]]).await.expect("deployment failed");
+        let contract = FakeCoordinator::deploy(
+            provider.clone(),
+            hash,
+            U256::from(t),
+            initial_mpc_nodes.clone(),
+            n_inputs,
+            vec![ACC[5]],
+        )
+        .await
+        .expect("deployment failed");
 
         let mut instances = Vec::new();
         for i in 0..3 {
@@ -1258,23 +1750,56 @@ mod tests {
         let mut node_rpcs = Vec::new();
         for i in 0..3 {
             let node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(
-                &node_rpc_addrs[i].0, node_rpc_addrs[i].1, instances[i].clone(), certs[i].clone()
-            ).await;
+                &node_rpc_addrs[i].0,
+                node_rpc_addrs[i].1,
+                instances[i].clone(),
+                certs[i].clone(),
+            )
+            .await;
             node_rpcs.push(node_rpc);
         }
 
         let client_provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
         let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
-        let mut client_coord = OnChainCoordinator::new(client_instance, t, 1, Some(certs[5].signing_key.serialize_der())).await;
-        let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(t as usize, node_rpc_addrs.clone(), certs[5].clone()).await;
+        let mut client_coord = OnChainCoordinator::new(
+            client_instance,
+            t,
+            1,
+            Some(certs[5].signing_key.serialize_der()),
+        )
+        .await;
+        let rpc_client = super::node_rpc::NodeRPCClient::start_rpc_client_from_cert(
+            t as usize,
+            node_rpc_addrs.clone(),
+            certs[5].clone(),
+        )
+        .await;
 
         // Round 1
         let ids = sample_ids(n);
-        let mask_shares = TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
-        let output_shares = TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        let mask_shares =
+            TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+                .unwrap();
+        let output_shares =
+            TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+                .unwrap();
         tokio::join!(
-            run_node_round(&mut coords, &mut node_rpcs, mask_shares, output_shares[..3].to_vec(), ACC[5], public_keys[5].clone()),
-            run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)
+            run_node_round(
+                &mut coords,
+                &mut node_rpcs,
+                mask_shares,
+                output_shares[..3].to_vec(),
+                ACC[5],
+                public_keys[5].clone()
+            ),
+            run_client_round(
+                &mut client_coord,
+                &rpc_client,
+                ACC[5],
+                SK[5],
+                correct_mask,
+                correct_output
+            )
         );
 
         // Reset: on-chain reset, then update local state on all coordinators and node RPCs
@@ -1289,11 +1814,29 @@ mod tests {
 
         // Round 2
         let ids = sample_ids(n);
-        let mask_shares2 = TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
-        let output_shares2 = TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        let mask_shares2 =
+            TestShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+                .unwrap();
+        let output_shares2 =
+            TestShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+                .unwrap();
         tokio::join!(
-            run_node_round(&mut coords, &mut node_rpcs, mask_shares2, output_shares2[..3].to_vec(), ACC[5], public_keys[5].clone()),
-            run_client_round(&mut client_coord, &rpc_client, ACC[5], SK[5], correct_mask, correct_output)
+            run_node_round(
+                &mut coords,
+                &mut node_rpcs,
+                mask_shares2,
+                output_shares2[..3].to_vec(),
+                ACC[5],
+                public_keys[5].clone()
+            ),
+            run_client_round(
+                &mut client_coord,
+                &rpc_client,
+                ACC[5],
+                SK[5],
+                correct_mask,
+                correct_output
+            )
         );
     }
 }

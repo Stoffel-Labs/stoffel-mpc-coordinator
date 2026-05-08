@@ -1,5 +1,5 @@
-use std::fs;
 use clap::Parser;
+use std::fs;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -11,7 +11,7 @@ struct Args {
     key: String,
 
     #[arg(long, required=true, value_delimiter=',', num_args=1..)]
-    subject_alt_names: Vec<String>
+    subject_alt_names: Vec<String>,
 }
 
 fn main() {

@@ -3,7 +3,7 @@
 /// Self-signed certificates used for tests.
 pub mod self_signed_certs;
 
-/// TODO
+/// Things related to JSON-RPC interfaces.
 pub mod rpc;
 
 /// The on-chain coordinator.
@@ -12,38 +12,45 @@ pub mod on_chain;
 /// The off-chain coordinator.
 pub mod off_chain;
 
-use std::future::Future;
-use thiserror::Error;
+use ark_ec::CurveGroup;
+use ark_ff::FftField;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
+use std::future::Future;
 use std::sync::Once;
-use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::share::ShareError;
+use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
-use ark_ff::FftField;
-use ark_ec::CurveGroup;
+use thiserror::Error;
 
-pub trait ShareBound<F: FftField> : SecretSharingScheme<F, SecretType = Self::ValueType> + CanonicalSerialize + CanonicalDeserialize + Clone + Send + 'static {
+pub trait ShareBound<F: FftField>:
+    SecretSharingScheme<F, SecretType = Self::ValueType>
+    + CanonicalSerialize
+    + CanonicalDeserialize
+    + Clone
+    + Send
+    + 'static
+{
     type ValueType: FftField;
 
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError>;
 }
 
-impl <F: FftField> ShareBound<F> for RobustShare<F> {
+impl<F: FftField> ShareBound<F> for RobustShare<F> {
     type ValueType = Self::SecretType;
 
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError> {
         Ok(RobustShare::new(
             input - mask_share.share[0],
             mask_share.id,
-            mask_share.degree
+            mask_share.degree,
         ))
     }
 }
 
-impl <F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShamirShare<F, G> {
+impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShamirShare<F, G> {
     type ValueType = Self::SecretType;
 
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError> {
@@ -65,7 +72,7 @@ pub enum Round {
     InputCollection,
     MPCExecution,
     OutputDistribution,
-    ProgramFinished
+    ProgramFinished,
 }
 
 /// Returns the round before `current`.
@@ -102,7 +109,11 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
 
     /// Used by MPC clients to send their masked input `masked_input` for the previously reserved index `i` via
     /// `obtain_mask_indices`.
-    fn send_masked_input(&self, masked_input: S::ValueType, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
+    fn send_masked_input(
+        &self,
+        masked_input: S::ValueType,
+        i: u64,
+    ) -> impl Future<Output = Result<(), CoordinatorError>>;
 
     /// Used by MPC nodes to wait for masked inputs by `n_clients`. TODO: this is hardcoded to one input per client!
     /// For a masked input at index `i`, the node knows a mask share `mask_shares[i]` and by
@@ -111,11 +122,18 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
     /// `mask_shares` is indexed by the reserved mask indices. The returned vector of shares for a
     /// given client is indexed by TODO: should be indexed by sth like input IDs, but we currently
     /// do not have that.
-    fn wait_for_inputs(&self, n_clients: u64, mask_shares: Vec<S>) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<S>>, CoordinatorError>>;
+    fn wait_for_inputs(
+        &self,
+        n_clients: u64,
+        mask_shares: Vec<S>,
+    ) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<S>>, CoordinatorError>>;
 
     /// Used by MPC nodes to wait for indices to be reserved by `n_clients`. Once reserved, the
     /// indices and the reserving clients are returned.
-    fn wait_for_indices(&self, n_clients: u64) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, u64>, CoordinatorError>>;
+    fn wait_for_indices(
+        &self,
+        n_clients: u64,
+    ) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, u64>, CoordinatorError>>;
 
     /// Called by MPC clients to obtain the private outputs for that client.
     fn obtain_outputs(&self) -> impl Future<Output = Result<Vec<S::ValueType>, CoordinatorError>>;
@@ -123,7 +141,12 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
     /// Called by MPC nodes to send the encrypted output shares `output_shares` for a client, which
     /// the coordinator knows under the identity `client_id`. The shares are encrypted under the
     /// public key `key`.
-    fn send_output_shares(&self, client_id: Self::ClientIdentity, key: Vec<u8>, output_shares: Vec<S>) -> impl Future<Output = Result<(), CoordinatorError>>;
+    fn send_output_shares(
+        &self,
+        client_id: Self::ClientIdentity,
+        key: Vec<u8>,
+        output_shares: Vec<S>,
+    ) -> impl Future<Output = Result<(), CoordinatorError>>;
 
     /// Called by the designated party to reset the coordinator, so the program can be
     /// executed again again.

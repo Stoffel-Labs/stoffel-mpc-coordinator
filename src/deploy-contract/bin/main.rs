@@ -1,34 +1,41 @@
 use alloy::{
+    network::EthereumWallet,
     providers::{Provider, ProviderBuilder, WsConnect},
     signers::local::PrivateKeySigner,
-    network::EthereumWallet                  
 };
-use alloy_primitives::{U256, FixedBytes, Address};
-use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
-use std::str::FromStr;
+use alloy_primitives::{Address, FixedBytes, U256};
 use clap::Parser;
+use std::str::FromStr;
+use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// The WebSocket address of an Ethereum node to connect to.
     #[arg(long)]
     eth_node_addr: String,
 
+    /// The private key for the Ethereum account that will deploy the contract.
     #[arg(long)]
     sk: String,
 
+    /// The hash of the MPC program.
     #[arg(long)]
     hash: String,
 
+    /// The Ethereum addresses of the initial MPC nodes.
     #[arg(long, value_delimiter=',', num_args=1..)]
     initial_mpc_nodes: Vec<String>,
 
+    /// The Ethereum address of the clients, which will receive the outputs of the MPC program.
     #[arg(long, value_delimiter=',', num_args=1..)]
     output_clients: Vec<String>,
 
+    /// The threshold value `t`.
     #[arg(long)]
     t: u32,
 
+    /// The number of inputs for the MPC program.
     #[arg(long)]
     n_inputs: u32,
 }
@@ -36,10 +43,12 @@ struct Args {
 async fn connect_to_eth_node(addr: &str, sk: &str) -> impl Provider + Clone {
     let ws = WsConnect::new(addr);
     let wallet = EthereumWallet::from(PrivateKeySigner::from_str(sk).expect("invalid private key"));
-    
+
     ProviderBuilder::new()
         .wallet(wallet)
-        .connect_ws(ws).await.expect("could not connect to Anvil via WebSockets")
+        .connect_ws(ws)
+        .await
+        .expect("could not connect to Anvil via WebSockets")
 }
 
 #[tokio::main]
@@ -49,21 +58,36 @@ async fn main() {
 
     let t = U256::from(args.t);
     let hash = FixedBytes::from_str(&args.hash).expect("invalid hash");
-    let initial_mpc_nodes: Vec<Address> = args.initial_mpc_nodes.iter()
+    let initial_mpc_nodes: Vec<Address> = args
+        .initial_mpc_nodes
+        .iter()
         .map(|s| Address::from_str(s).expect("invalid initial MPC node address"))
         .collect();
-    let output_clients: Vec<Address> = args.output_clients.iter()
+    let output_clients: Vec<Address> = args
+        .output_clients
+        .iter()
         .map(|s| Address::from_str(s).expect("invalid output client address"))
         .collect();
     let n_inputs = U256::from(args.n_inputs);
 
-    let contract = match FakeCoordinator::deploy(provider.clone(), hash, t, initial_mpc_nodes, n_inputs, output_clients).await {
+    let contract = match FakeCoordinator::deploy(
+        provider.clone(),
+        hash,
+        t,
+        initial_mpc_nodes,
+        n_inputs,
+        output_clients,
+    )
+    .await
+    {
         Ok(contract) => contract,
         Err(e) => {
             eprintln!("Failed to deploy contract: {}", e);
-            if let Some(decoded_err) = e.as_decoded_interface_error::<FakeCoordinator::FakeCoordinatorErrors>() {
+            if let Some(decoded_err) =
+                e.as_decoded_interface_error::<FakeCoordinator::FakeCoordinatorErrors>()
+            {
                 println!("Decoded error: {:?}", decoded_err);
-            } 
+            }
             return;
         }
     };
