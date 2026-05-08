@@ -11,6 +11,10 @@ path = "src/deploy-contract/bin/main.rs"
 name = "run-coord"
 path = "src/run-coord/bin/main.rs"
 
+[[bin]]
+name = "generate-ids"
+path = "src/generate-ids/bin/main.rs"
+
 [features]
 avss = []
 

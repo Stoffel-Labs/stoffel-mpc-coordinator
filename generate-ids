@@ -1,0 +1,36 @@
+if [ $# -ne 3 ]; then
+    echo "Usage: $0 <root directory> <number of clients> <number of nodes>"
+    exit 1
+fi
+
+generate_ids() {
+    env RUSTFLAGS="-A warnings" cargo run --bin generate-ids -q -- "$@"
+}
+
+ROOT_DIR=$1
+N_CLIENTS=$2
+N_NODES=$3
+
+if [ $N_CLIENTS -lt 1 ] || [ $N_NODES -lt 1 ]; then
+    echo "Number of clients and nodes must be at least 1."
+    exit 1
+fi
+
+mkdir $ROOT_DIR || exit 1
+mkdir $ROOT_DIR/clients $ROOT_DIR/nodes
+
+echo "Generating coordinator identity..."
+
+generate_ids --cert $ROOT_DIR/coord.crt --key $ROOT_DIR/coord.der --subject-alt-names coord
+
+echo "Generating client identities..."
+
+for i in $(seq 1 $N_CLIENTS); do
+    generate_ids --cert $ROOT_DIR/clients/client$i.crt --key $ROOT_DIR/clients/client$i.der --subject-alt-names client$i
+done
+
+echo "Generating node identities..."
+
+for i in $(seq 1 $N_NODES); do
+    generate_ids --cert $ROOT_DIR/nodes/node$i.crt --key $ROOT_DIR/nodes/node$i.der --subject-alt-names node$i
+done
