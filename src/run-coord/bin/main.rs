@@ -29,6 +29,9 @@ struct Args {
 
     #[arg(long)]
     n_inputs: u64,
+
+    #[arg(long, value_delimiter=',', num_args=1..)]
+    output_clients: Vec<String>,
 }
 
 #[tokio::main]
@@ -46,21 +49,25 @@ async fn main() {
         h.try_into().expect("hash should be 32 bytes")
     };
 
-    let public_keys = args
-        .initial_mpc_nodes
-        .iter()
-        .map(|cert_file| {
-            let cert_der = fs::read(cert_file).expect("could not read certificate file");
-            let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
-                .expect("Failed to parse X.509 certificate DER");
-            parsed_cert
-                .public_key()
-                .subject_public_key
-                .data
-                .as_ref()
-                .to_vec()
-        })
-        .collect();
+    let parse_public_keys = |cert_files: &[String]| -> Vec<Vec<u8>> {
+        cert_files
+            .iter()
+            .map(|cert_file| {
+                let cert_der = fs::read(cert_file).expect("could not read certificate file");
+                let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
+                    .expect("Failed to parse X.509 certificate DER");
+                parsed_cert
+                    .public_key()
+                    .subject_public_key
+                    .data
+                    .as_ref()
+                    .to_vec()
+            })
+            .collect()
+    };
+
+    let public_keys = parse_public_keys(&args.initial_mpc_nodes);
+    let output_client_keys = parse_public_keys(&args.output_clients);
 
     let server_cert_der = fs::read(args.server_cert).unwrap();
     let server_key_der = fs::read(args.server_key).unwrap();
@@ -73,6 +80,7 @@ async fn main() {
         t,
         public_keys,
         args.n_inputs,
+        output_client_keys,
     );
     let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord(
         server_state,

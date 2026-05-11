@@ -559,6 +559,7 @@ pub enum CoordinatorRPCBaseError {
     OutputSharesAlreadyRequested = 9,
     NotParty = 10,
     SendingFailed = 11,
+    NotOutputClient = 12,
 }
 
 /// The basic server-side information for one client connection to the coordinator RPC interface.
@@ -603,6 +604,8 @@ pub struct CoordinatorRPCServerSharedBase<T: FftField> {
     output_shares: HashMap<(ClientIdentity, ClientIdentity), (Vec<u8>, Vec<u8>)>,
     /// Sinks for MPC clients that are waiting to obtain their output shares.
     output_sinks: HashMap<ClientIdentity, SubscriptionSink>,
+    /// The set of clients that are permitted to call `obtain_output_shares`.
+    output_clients: Vec<ClientIdentity>,
 }
 
 impl<T: FftField> CoordinatorRPCServerSharedBase<T> {
@@ -612,6 +615,7 @@ impl<T: FftField> CoordinatorRPCServerSharedBase<T> {
         t: u64,
         initial_mpc_nodes: Vec<ClientIdentity>,
         n_inputs: u64,
+        output_clients: Vec<ClientIdentity>,
     ) -> Self {
         Self {
             sinks: HashMap::from([
@@ -646,6 +650,7 @@ impl<T: FftField> CoordinatorRPCServerSharedBase<T> {
             clients: HashMap::new(),
             output_shares: HashMap::new(),
             output_sinks: HashMap::new(),
+            output_clients,
         }
     }
 
@@ -1143,6 +1148,17 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
 
     async fn obtain_output_shares(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
         let mut d = self.d.lock().await;
+
+        if !d.output_clients.contains(&self.id) {
+            pending
+                .reject(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(NotOutputClient as i32).code(),
+                    format!("Client {:?} is not an authorized output client.", self.id),
+                    None::<()>,
+                ))
+                .await;
+            return Ok(());
+        }
 
         if d.output_sinks.contains_key(&self.id) {
             pending
@@ -1706,7 +1722,7 @@ mod tests {
         let addr = "127.0.0.1";
         let port = 12345;
         let t = 1;
-        let server_state = TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1);
+        let server_state = TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
         let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
             server_state,
             addr,
@@ -1747,7 +1763,7 @@ mod tests {
             let port = 12346;
             let t = 1;
             let server_state =
-                TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1);
+                TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
             let coord =
                 OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
                     server_state,
@@ -1806,7 +1822,7 @@ mod tests {
             let port = 12347;
             let t = 1;
             let server_state =
-                TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1);
+                TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
             let coord =
                 OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
                     server_state,
@@ -1886,8 +1902,14 @@ mod tests {
         let t = 1;
         let coord_addr = "127.0.0.1";
         let coord_port = 12348;
-        let server_state =
-            TestCoordinatorRPCServerSharedBase::new([0u8; 32], n, t, public_keys.clone(), 1);
+        let server_state = TestCoordinatorRPCServerSharedBase::new(
+            [0u8; 32],
+            n,
+            t,
+            public_keys.clone(),
+            1,
+            vec![public_keys[5].clone()],
+        );
         let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
             server_state,
             coord_addr,
@@ -2118,8 +2140,14 @@ mod tests {
         let coord_addr = "127.0.0.1";
         let coord_port = 12352;
         let t = 1;
-        let server_state =
-            TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys.clone(), 1);
+        let server_state = TestCoordinatorRPCServerSharedBase::new(
+            [0u8; 32],
+            5,
+            t,
+            public_keys.clone(),
+            1,
+            vec![public_keys[5].clone()],
+        );
         let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
             server_state,
             coord_addr,
