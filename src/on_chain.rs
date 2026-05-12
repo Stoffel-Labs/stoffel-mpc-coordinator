@@ -555,15 +555,15 @@ fn u256_to_u64(x: U256) -> Option<u64> {
     x.try_into().ok()
 }
 
-fn field_to_bytes<F: FftField + CanonicalSerialize>(x: F) -> Result<Bytes, SerializationError> {
+fn to_bytes<T: CanonicalSerialize>(x: T) -> Result<Bytes, SerializationError> {
     let mut bytes = Vec::new();
     x.serialize_compressed(&mut bytes)?;
 
     Ok(Bytes::from(bytes))
 }
 
-fn bytes_to_field<F: FftField + CanonicalDeserialize>(x: Bytes) -> Result<F, SerializationError> {
-    let element = F::deserialize_compressed(x.as_ref())?;
+fn from_bytes<T: CanonicalDeserialize>(x: Bytes) -> Result<T, SerializationError> {
+    let element = T::deserialize_compressed(x.as_ref())?;
     Ok(element)
 }
 
@@ -920,7 +920,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                         .try_into()
                         .map_err(|_| CoordinatorError::U256ToU64Error)?;
                     let mask_share = &mask_shares[i];
-                    let masked_input_value = bytes_to_field::<S::SecretType>(maskedInput)
+                    let masked_input_value = from_bytes::<S::SecretType>(maskedInput)
                         .map_err(|_| CoordinatorError::DeserializationError)?;
                     let input = S::compute_masked_input(masked_input_value, mask_share)
                         .map_err(|_| CoordinatorError::ShareError)?;
@@ -1011,7 +1011,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         i: u64,
     ) -> Result<(), CoordinatorError> {
         let masked_input_bytes =
-            field_to_bytes(masked_input).map_err(|_| CoordinatorError::SerializationError)?;
+            to_bytes(masked_input).map_err(|_| CoordinatorError::SerializationError)?;
         let builder = self
             .coord
             .submitMaskedInput(masked_input_bytes, U256::from(i));
@@ -1408,8 +1408,8 @@ mod tests {
         for _ in 0..100 {
             let n: u64 = rng.random();
             let fr = Fr::from(n);
-            let bytes = field_to_bytes(fr).unwrap();
-            let fr2: Result<Fr, _> = bytes_to_field(bytes);
+            let bytes = to_bytes(fr).unwrap();
+            let fr2: Result<Fr, _> = from_bytes(bytes);
             assert!(fr2.is_ok());
             assert_eq!(fr, fr2.unwrap());
         }

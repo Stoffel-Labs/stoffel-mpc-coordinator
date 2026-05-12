@@ -32,6 +32,9 @@ struct Args {
 
     #[arg(long, value_delimiter=',', num_args=1..)]
     output_clients: Vec<String>,
+
+    #[arg(long, default_value = "127.0.0.1")]
+    addr: String,
 }
 
 #[tokio::main]
@@ -72,7 +75,7 @@ async fn main() {
     let server_cert_der = fs::read(args.server_cert).unwrap();
     let server_key_der = fs::read(args.server_key).unwrap();
 
-    let addr = "127.0.0.1";
+    let addr = args.addr.as_str();
     let port = 31415;
     let server_state = CoordinatorRPCServerSharedBase::<FakeValueType>::new(
         hash,

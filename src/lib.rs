@@ -33,7 +33,7 @@ pub trait ShareBound<F: FftField>:
     + Send
     + 'static
 {
-    type ValueType: FftField;
+    type ValueType: CanonicalSerialize + CanonicalDeserialize + Clone + Send;
 
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError>;
 }

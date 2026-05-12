@@ -45,11 +45,18 @@ type KemImpl = DhP256HkdfSha256;
 type KdfImpl = HkdfSha256;
 type AeadImpl = AesGcm256;
 
-/// The identity of an MPC client with the off-chain coordinator is the same when talking to the
-/// coordinator or the MPC nodes: it is always a public key represented by a vector of bytes in DER
-/// format.
-/// Since the identity is the same, linking identities between the coordinator and MPC nodes as
-/// done for the on-chain coordinator is not necessary.
+/// An MPC client interacts with two types of entities: the coordinator and nodes.
+/// Towards the nodes, the MPC client uses a public key (currently ECDSA).
+/// Towards the coordinator, it uses either an Ethereum address (on-chain) or the same public key as for the nodes (off-chain).
+///
+/// In the on-chain case we make clients sign a nonce with the Ethereum address,
+/// which is sent to the nodes through a TLS channel that authenticates the client as
+/// the owner of the public key, so the node can deduce that the public key and the
+/// owner of the Ethereum address are the same and the node can safely send its mask share to the client.
+///
+/// In the off-chain case, no signature is needed, since the identities towards coordinator and nodes
+/// must simply be the same: if a client requests a mask share from a node for a previously reserved
+/// mask index, then the node simply checks that the public keys used for both these actions are the same.
 type ClientIdentity = Vec<u8>;
 
 /// The node-side RPC interface.
@@ -440,7 +447,7 @@ pub mod node_rpc {
     serialize = "ValueWrapper<T>: Serialize",
     deserialize = "ValueWrapper<T>: Deserialize<'de>"
 ))]
-pub enum Event<T: FftField> {
+pub enum Event<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
     CoordinatorInitialized {
         creation_block: u64,
         designated_party: ClientIdentity,
@@ -574,7 +581,7 @@ pub struct CoordinatorRPCServerConnectionBase<F: FftField, S: ShareBound<F>> {
 
 /// The basic internal state of the coordinator RPC server.
 /// Can be extended by the developer.
-pub struct CoordinatorRPCServerSharedBase<T: FftField> {
+pub struct CoordinatorRPCServerSharedBase<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
     // Contains the sinks of clients, which subscribed to the transition to the given round.
     sinks: HashMap<Round, Vec<SubscriptionSink>>,
     // Stores events that some round has been triggered along with a timestamp when it was
@@ -608,7 +615,7 @@ pub struct CoordinatorRPCServerSharedBase<T: FftField> {
     output_clients: Vec<ClientIdentity>,
 }
 
-impl<T: FftField> CoordinatorRPCServerSharedBase<T> {
+impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerSharedBase<T> {
     pub fn new(
         prog_hash: [u8; 32],
         n: u64,
@@ -788,7 +795,7 @@ impl<T: FftField> CoordinatorRPCServerSharedBase<T> {
 }
 
 /// The basic shared state can be used as a full-fledged shared state.
-impl<T: FftField> crate::rpc::RPCServerShared for CoordinatorRPCServerSharedBase<T> {
+impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> crate::rpc::RPCServerShared for CoordinatorRPCServerSharedBase<T> {
     fn add_client(
         &mut self,
         cert_der: Vec<u8>,
@@ -910,7 +917,7 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
                         None::<()>,
                     ));
                 }
-                d.masked_inputs[reserved_index] = Some(masked_input.value);
+                d.masked_inputs[reserved_index] = Some(masked_input.value.clone());
 
                 let event = Event::MaskedInputEvent {
                     client: self.id.clone(),
@@ -2339,16 +2346,5 @@ mod tests {
     #[tokio::test]
     async fn stop_rpc_server() {
         // TODO: try using stop_tx
-    }
-
-    #[tokio::test]
-    async fn gen() {
-        use std::fs;
-        let cert = crate::self_signed_certs::client_cert();
-        let cert_der = cert.cert.der().to_vec();
-        let key_der = cert.signing_key.serialize_der();
-
-        fs::write("cert.crt", cert_der).unwrap();
-        fs::write("key.der", key_der).unwrap();
     }
 }

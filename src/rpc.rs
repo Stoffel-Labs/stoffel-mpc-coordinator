@@ -1,6 +1,5 @@
 use crate::{self_signed_certs, CoordinatorError};
-use ark_ff::FftField;
-use ark_serialize::{Compress, Validate};
+use ark_serialize::{Compress, Validate, CanonicalDeserialize, CanonicalSerialize};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use jsonrpsee::{
@@ -17,11 +16,11 @@ use x509_parser::prelude::*;
 
 /// A wrapper around a share element that is serializable and deserializable for use with JSON-RPC.
 #[derive(Clone, Debug)]
-pub struct ValueWrapper<T: FftField> {
+pub struct ValueWrapper<T: CanonicalSerialize + CanonicalDeserialize> {
     pub value: T,
 }
 
-impl<'d, T: FftField> Deserialize<'d> for ValueWrapper<T> {
+impl<'d, T: CanonicalSerialize + CanonicalDeserialize> Deserialize<'d> for ValueWrapper<T> {
     fn deserialize<D>(deserializer: D) -> Result<ValueWrapper<T>, D::Error>
     where
         D: Deserializer<'d>,
@@ -33,7 +32,7 @@ impl<'d, T: FftField> Deserialize<'d> for ValueWrapper<T> {
     }
 }
 
-impl<T: FftField> Serialize for ValueWrapper<T> {
+impl<T: CanonicalSerialize + CanonicalDeserialize> Serialize for ValueWrapper<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
