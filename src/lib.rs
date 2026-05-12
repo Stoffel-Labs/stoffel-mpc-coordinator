@@ -1,4 +1,14 @@
-// This is the coordinator library's entry point.
+// The coordinator is generic over the share type `S` used to represent shares in the underlying
+// MPC protocol. Concretely, `S` must implement `ShareBound`, which is `SecretSharingScheme` from
+// mpc-protocols plus some additional bounds to make the code work.
+// Every struct and trait in this library that touches shares is parametrized as `<F: FftField, S: ShareBound<F>>`;
+// the generic type `F` comes directly from the definition of `SecretSharingScheme`.
+//
+// Two share types are already contained and are selected at compile time through the `avss` feature:
+//
+// * **`RobustShare<F>`** (default, `avss` off): the plain Shamir share used by HoneyBadger MPC.
+// * **`FeldmanShamirShare<F, G>`** (`avss` on): a Shamir share augmented with group elements that 
+// enable verifiable secret sharing.
 
 /// Self-signed certificates used for tests.
 pub mod self_signed_certs;
@@ -25,6 +35,33 @@ use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use thiserror::Error;
 
+/// Bundles the constraints that the coordinator places on a share type.
+///
+/// Any share type that the coordinator operates on must satisfy these bounds:
+///
+/// * `SecretSharingScheme<F>`: the type is a secret share over `F` and exposes secret
+///   reconstruction (`recover_secret`) and share generation (`compute_shares`).
+/// * `CanonicalSerialize` / `CanonicalDeserialize`: shares are sent over JSON-RPC as
+///   compressed bytes, so they must be (de-)serializable via `ark-serialize`.
+/// * `Clone`, `Send`, `'static`: required for sharing across async tasks and Tokio threads.
+///
+/// The associated type `ValueType` is the plaintext type that the share scheme
+/// produces upon reconstruction — typically the field element type `F` itself.
+///
+/// # Input masking
+///
+/// The key operation that differs between share types is `compute_masked_input`.
+/// During the input-collection phase an MPC client sends a masked input `x + m` (where `x` is the
+/// private input and `m` is the preprocessing mask), and each MPC node holds a share `m_i` of
+/// the mask `m`. The node turns the client's masked input into a share of the *unmasked* input by
+/// computing `(x + m) - m_i`, i.e. a share of `x`. Share types differ in how the represented
+/// values are stored, so this step is implemented differently.
+///
+/// # Adding a new share type
+///
+/// Implement this trait for the new share type and make sure the `compute_masked_input` method
+/// correctly subtracts the mask share from the masked input while carrying over any per-share
+/// metadata.
 pub trait ShareBound<F: FftField>:
     SecretSharingScheme<F, SecretType = Self::ValueType>
     + CanonicalSerialize
@@ -33,11 +70,20 @@ pub trait ShareBound<F: FftField>:
     + Send
     + 'static
 {
+    /// The plaintext type reconstructed from shares — typically the field element `F`.
+    /// Essentially `SecretType` from `SecretSharingScheme`, but with more trait bounds.
     type ValueType: CanonicalSerialize + CanonicalDeserialize + Clone + Send;
 
+    /// Given a masked input `input = x + m` and this node's share `mask_share` of the mask `m`,
+    /// computes a share of the unmasked input `x`.
+    ///
+    /// The result is a share of `x = input - m`, constructed by subtracting the share's field
+    /// value from `input`. All share metadata (ID, degree, and for Feldman shares the commitment
+    /// vector) is copied from `mask_share`.
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError>;
 }
 
+/// `ShareBound` implementation for plain HoneyBadger MPC shares (default, `avss` feature off).
 impl<F: FftField> ShareBound<F> for RobustShare<F> {
     type ValueType = Self::SecretType;
 
@@ -89,8 +135,15 @@ fn round_before(current: Round) -> Option<Round> {
 }
 
 /// The interface to the coordinator that MPC clients and MPC nodes interact with.
-/// While these functions are implemented for both on- and off-chain coordinators, the concrete
-/// coordinators may provide extended functionality.
+///
+/// Both the on-chain (`on_chain::OnChainCoordinator`) and off-chain
+/// (`off_chain::OffChainCoordinatorClient`) coordinators implement this trait. Concrete
+/// implementations may expose additional methods beyond what is defined here.
+///
+/// The type parameter `S: ShareBound<F>` determines the share type used throughout the protocol.
+/// Changing `S` (e.g. from `RobustShare` to `FeldmanShamirShare`) transparently switches the
+/// serialisation format of shares sent over the wire and the masking computation performed on
+/// MPC nodes — no changes to the coordinator logic are required.
 pub trait Coordinator<F: FftField, S: ShareBound<F>> {
     type ClientIdentity;
 
