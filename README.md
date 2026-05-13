@@ -6,7 +6,7 @@ Install a mock on-chain coordinator with
 `DEPLOY_SK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' cargo run --bin deploy-contract -- --eth-node-addr ws://127.0.0.1:8545 --hash 0000000000000000000000000000000000000000000000000000000000000000 --t 1 --n-inputs 2 --initial-mpc-nodes 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC,0x90F79bf6EB2c4f870365E785982E1f101E93b906,0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65`.
 
 For the off-chain coordinator, generate identities using `./generate-ids ids 2 5` (in the `ids` directory, 2 clients, 5 nodes).
-Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/coord.crt --server-key ids/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/nodes/node0.crt,ids/nodes/node1.crt,ids/nodes/node2.crt,ids/nodes/node3.crt,ids/nodes/node4.crt`.
+Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/coord.crt --server-key ids/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/nodes/node0.crt,ids/nodes/node1.crt,ids/nodes/node2.crt,ids/nodes/node3.crt,ids/nodes/node4.crt --output-clients ids/clients/client0.crt,ids/clients/client1.crt`.
 
 # Stoffel MPC Coordinator Library
 

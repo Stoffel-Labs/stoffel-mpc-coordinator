@@ -12,7 +12,7 @@ struct Args {
     #[arg(long)]
     hash: String,
 
-    #[arg(long, value_delimiter=',', num_args=1..)]
+    #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     initial_mpc_nodes: Vec<String>,
 
     #[arg(long)]
@@ -30,7 +30,7 @@ struct Args {
     #[arg(long)]
     n_inputs: u64,
 
-    #[arg(long, value_delimiter=',', num_args=1..)]
+    #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     output_clients: Vec<String>,
 
     #[arg(long, default_value = "127.0.0.1")]
