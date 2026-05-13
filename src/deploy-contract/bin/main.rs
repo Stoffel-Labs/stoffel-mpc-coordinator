@@ -5,7 +5,7 @@ use alloy::{
 };
 use alloy_primitives::{Address, FixedBytes, U256};
 use clap::Parser;
-use std::str::FromStr;
+use std::{env, str::FromStr};
 use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
 
 #[derive(Parser, Debug)]
@@ -14,10 +14,6 @@ struct Args {
     /// The WebSocket address of an Ethereum node to connect to.
     #[arg(long)]
     eth_node_addr: String,
-
-    /// The private key for the Ethereum account that will deploy the contract.
-    #[arg(long)]
-    sk: String,
 
     /// The hash of the MPC program.
     #[arg(long)]
@@ -54,7 +50,8 @@ async fn connect_to_eth_node(addr: &str, sk: &str) -> impl Provider + Clone {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let provider = connect_to_eth_node(&args.eth_node_addr, &args.sk).await;
+    let sk = env::var("DEPLOY_SK").expect("DEPLOY_SK environment variable not set");
+    let provider = connect_to_eth_node(&args.eth_node_addr, &sk).await;
 
     let t = U256::from(args.t);
     let hash = FixedBytes::from_str(&args.hash).expect("invalid hash");
