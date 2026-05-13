@@ -1698,19 +1698,19 @@ impl StoffelCoordinatorRPCServer for FakeCoordinatorConnection {
     }
 }
 
+pub type FakeOffChainCoordinatorClient = OffChainCoordinatorClient<FakeShareValueType, FakeShareType>;
+pub type FakeOffChainCoordinatorServer = OffChainCoordinatorServer<FakeCoordinatorConnection>;
+pub type FakeCoordinatorRPCServerSharedBase = CoordinatorRPCServerSharedBase<FakeValueType>;
+pub type FakeNodeRPCClient = node_rpc::NodeRPCClient<FakeShareValueType, FakeShareType>;
+pub type FakeNodeRPCServer = node_rpc::NodeRPCServer<FakeShareValueType, FakeShareType>;
+
 #[cfg(test)]
 mod tests {
-    use super::node_rpc::NodeRPCClient;
     use super::*;
     use crate::self_signed_certs::{client_cert, server_cert};
     use ark_bls12_381::Fr;
     use ark_std::test_rng;
     use tokio::sync::Barrier;
-
-    type TestCoordinatorRPCServerSharedBase = CoordinatorRPCServerSharedBase<FakeValueType>;
-    type TestOffChainCoordinatorClient =
-        OffChainCoordinatorClient<FakeShareValueType, FakeShareType>;
-    type TestNodeRPCClient = NodeRPCClient<FakeShareValueType, FakeShareType>;
 
     fn sample_ids(n: usize) -> Vec<usize> {
         (1..=n).collect()
@@ -1729,7 +1729,7 @@ mod tests {
         let addr = "127.0.0.1";
         let port = 12345;
         let t = 1;
-        let server_state = TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+        let server_state = FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
         let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
             server_state,
             addr,
@@ -1741,7 +1741,7 @@ mod tests {
         .unwrap();
         let timestamp = coord.get_timestamp();
 
-        let _ = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let _ = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
             timestamp,
@@ -1753,7 +1753,7 @@ mod tests {
         .unwrap();
     }
 
-    // Tests event triggering.
+    // Fakes event triggering.
     #[tokio::test]
     async fn trigger_pp() {
         crate::setup_test();
@@ -1770,7 +1770,7 @@ mod tests {
             let port = 12346;
             let t = 1;
             let server_state =
-                TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+                FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
             let coord =
                 OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
                     server_state,
@@ -1783,7 +1783,7 @@ mod tests {
                 .unwrap();
             let timestamp = coord.get_timestamp();
 
-            let node0 = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 addr,
                 port,
                 timestamp,
@@ -1793,7 +1793,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let node1 = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 addr,
                 port,
                 timestamp,
@@ -1829,7 +1829,7 @@ mod tests {
             let port = 12347;
             let t = 1;
             let server_state =
-                TestCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+                FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
             let coord =
                 OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord_from_cert(
                     server_state,
@@ -1843,7 +1843,7 @@ mod tests {
             let timestamp = coord.get_timestamp();
             let barrier = Arc::new(Barrier::new(2));
 
-            let node0 = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 addr,
                 port,
                 timestamp,
@@ -1853,7 +1853,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let node1 = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 addr,
                 port,
                 timestamp,
@@ -1909,7 +1909,7 @@ mod tests {
         let t = 1;
         let coord_addr = "127.0.0.1";
         let coord_port = 12348;
-        let server_state = TestCoordinatorRPCServerSharedBase::new(
+        let server_state = FakeCoordinatorRPCServerSharedBase::new(
             [0u8; 32],
             n,
             t,
@@ -1933,9 +1933,9 @@ mod tests {
         tokio::spawn({
             let barrier = barrier.clone();
 
-            let mut coords: Vec<TestOffChainCoordinatorClient> = Vec::new();
+            let mut coords: Vec<FakeOffChainCoordinatorClient> = Vec::new();
             for i in 0..3 {
-                let coord = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+                let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                     coord_addr,
                     coord_port,
                     timestamp,
@@ -1971,7 +1971,7 @@ mod tests {
 
             let mut node_rpcs = Vec::new();
             for i in 0..3 {
-                let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(
+                let mut node_rpc = FakeNodeRPCServer::start_from_cert(
                     &node_rpc_addrs[i].0,
                     node_rpc_addrs[i].1,
                     certs[i].clone(),
@@ -2066,7 +2066,7 @@ mod tests {
         tokio::spawn({
             let barrier = barrier.clone();
             let cert = certs[5].clone();
-            let mut coord = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
                 timestamp,
@@ -2076,7 +2076,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let rpc_client = TestNodeRPCClient::start_rpc_client_from_cert(
+            let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
                 t as usize,
                 node_rpc_addrs.clone(),
                 cert.clone(),
@@ -2147,7 +2147,7 @@ mod tests {
         let coord_addr = "127.0.0.1";
         let coord_port = 12352;
         let t = 1;
-        let server_state = TestCoordinatorRPCServerSharedBase::new(
+        let server_state = FakeCoordinatorRPCServerSharedBase::new(
             [0u8; 32],
             5,
             t,
@@ -2173,7 +2173,7 @@ mod tests {
 
             let mut coords = Vec::new();
             for i in 0..3 {
-                let coord = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+                let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                     coord_addr,
                     coord_port,
                     timestamp,
@@ -2199,7 +2199,7 @@ mod tests {
 
             let mut node_rpcs = Vec::new();
             for i in 0..3 {
-                let mut node_rpc = super::node_rpc::NodeRPCServer::start_from_cert(
+                let mut node_rpc = FakeNodeRPCServer::start_from_cert(
                     &node_rpc_addrs[i].0,
                     node_rpc_addrs[i].1,
                     certs[i].clone(),
@@ -2285,7 +2285,7 @@ mod tests {
         tokio::spawn({
             let barrier = barrier.clone();
             let cert = certs[5].clone();
-            let mut coord = TestOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
                 timestamp,
@@ -2295,7 +2295,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let rpc_client = TestNodeRPCClient::start_rpc_client_from_cert(
+            let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
                 t as usize,
                 node_rpc_addrs.clone(),
                 cert.clone(),
