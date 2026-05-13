@@ -1,3 +1,5 @@
+#!/bin/sh
+
 if [ $# -ne 3 ]; then
     echo "Usage: $0 <root directory> <number of clients> <number of nodes>"
     exit 1
@@ -25,12 +27,12 @@ generate_ids --cert $ROOT_DIR/coord.crt --key $ROOT_DIR/coord.der --subject-alt-
 
 echo "Generating client identities..."
 
-for i in $(seq 1 $N_CLIENTS); do
+for i in $(seq 0 $(($N_CLIENTS-1))); do
     generate_ids --cert $ROOT_DIR/clients/client$i.crt --key $ROOT_DIR/clients/client$i.der --subject-alt-names client$i
 done
 
 echo "Generating node identities..."
 
-for i in $(seq 1 $N_NODES); do
+for i in $(seq 0 $(($N_NODES-1))); do
     generate_ids --cert $ROOT_DIR/nodes/node$i.crt --key $ROOT_DIR/nodes/node$i.der --subject-alt-names node$i
 done
