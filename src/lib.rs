@@ -22,6 +22,9 @@ pub mod on_chain;
 /// The off-chain coordinator.
 pub mod off_chain;
 
+/// Things related to the fake coordinator.
+pub mod fake_coord;
+
 use ark_ec::CurveGroup;
 use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};

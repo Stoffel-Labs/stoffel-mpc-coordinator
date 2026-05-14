@@ -1,9 +1,6 @@
 use clap::Parser;
 use std::fs;
-use stoffel_mpc_coordinator::off_chain::{
-    CoordinatorRPCServerSharedBase, FakeCoordinatorConnection, FakeValueType,
-    OffChainCoordinatorServer,
-};
+use stoffel_mpc_coordinator::fake_coord::off_chain::{FakeCoordinatorRPCServerSharedBase, FakeOffChainCoordinatorServer};
 use x509_parser::prelude::*;
 
 #[derive(Parser, Debug)]
@@ -77,7 +74,7 @@ async fn main() {
 
     let addr = args.addr.as_str();
     let port = 31415;
-    let server_state = CoordinatorRPCServerSharedBase::<FakeValueType>::new(
+    let server_state = FakeCoordinatorRPCServerSharedBase::new(
         hash,
         n,
         t,
@@ -85,7 +82,7 @@ async fn main() {
         args.n_inputs,
         output_client_keys,
     );
-    let coord = OffChainCoordinatorServer::<FakeCoordinatorConnection>::start_coord(
+    let coord = FakeOffChainCoordinatorServer::start_coord(
         server_state,
         addr,
         port,
