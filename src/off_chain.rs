@@ -1633,6 +1633,3 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::fs;
-use stoffel_mpc_coordinator::fake_coord::off_chain::{FakeCoordinatorRPCServerSharedBase, FakeOffChainCoordinatorServer};
+use stoffel_mpc_coordinator::tests::fake_coord::off_chain::{FakeCoordinatorRPCServerSharedBase, FakeOffChainCoordinatorServer};
 use x509_parser::prelude::*;
 
 #[derive(Parser, Debug)]

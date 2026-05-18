@@ -35,7 +35,7 @@ pub type ClientIdentity = Address;
 #[derive(Clone)]
 pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
     coord: StoffelCoordinatorInstance<P>,
-    contract_block: u64,
+    pub contract_block: u64,
     t: u64,
     n_outputs: Option<u64>,
     key_der: Option<Vec<u8>>,
@@ -1210,4 +1210,34 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use ark_bls12_381::Fr;
+    use rand::Rng;
+
+    #[test]
+    pub fn fr_bytes_conversion() {
+        let mut rng = rand::rng();
+        for _ in 0..100 {
+            let n: u64 = rng.random();
+            let fr = Fr::from(n);
+            let bytes = to_bytes(fr).unwrap();
+            let fr2: Result<Fr, _> = from_bytes(bytes);
+            assert!(fr2.is_ok());
+            assert_eq!(fr, fr2.unwrap());
+        }
+    }
+
+    #[test]
+    pub fn u64_u256_conversion() {
+        let mut rng = rand::rng();
+        for _ in 0..100 {
+            let n1: u64 = rng.random();
+            let n1_u256 = U256::from(n1);
+            let n2 = u256_to_u64(n1_u256);
+            assert!(n2.is_some());
+            assert_eq!(n1, n2.unwrap());
+        }
+    }
+}

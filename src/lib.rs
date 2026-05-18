@@ -22,8 +22,10 @@ pub mod on_chain;
 /// The off-chain coordinator.
 pub mod off_chain;
 
-/// Things related to the fake coordinator.
-pub mod fake_coord;
+/// Things for testing the coordinator when deployed, using Docker, for example.
+/// This goes one step further towards actual deployment than the unit tests or the integration
+/// tests in `tests/`.
+pub mod tests;
 
 use ark_ec::CurveGroup;
 use ark_ff::FftField;

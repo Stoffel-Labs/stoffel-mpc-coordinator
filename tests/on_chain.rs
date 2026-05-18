@@ -1,15 +1,21 @@
-use super::*;
 use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::providers::{Provider, WalletProvider};
 use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{address, Address, FixedBytes, U256};
 use ark_bls12_381::Fr;
 use ark_std::test_rng;
-use rand::Rng;
+use stoffel_mpc_coordinator::tests::fake_coord::{
+    FakeShareType, FakeValueType,
+    on_chain::{FakeNodeRPCClient, FakeNodeRPCServer, FakeOnChainCoordinator}
+};
+use std::str::FromStr;
+use stoffel_mpc_coordinator::on_chain::{generate_client_sig, ws_connect, OnChainCoordinator};
+use stoffel_mpc_coordinator::{Coordinator, Round};
+use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
+use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
 use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
-use tokio::time::{timeout, Duration};
-use crate::fake_coord::{on_chain::{FakeOnChainCoordinator, FakeNodeRPCClient, FakeNodeRPCServer}, FakeShareType, FakeValueType};
 use stoffelmpc_mpc::common::SecretSharingScheme;
+use tokio::time::{timeout, Duration};
 
 static SK: [&str; 10] = [
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -167,31 +173,6 @@ async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
     assert_eq!(outputs[0], correct_output);
 }
 
-#[test]
-pub fn fr_bytes_conversion() {
-    let mut rng = rand::rng();
-    for _ in 0..100 {
-        let n: u64 = rng.random();
-        let fr = Fr::from(n);
-        let bytes = to_bytes(fr).unwrap();
-        let fr2: Result<Fr, _> = from_bytes(bytes);
-        assert!(fr2.is_ok());
-        assert_eq!(fr, fr2.unwrap());
-    }
-}
-
-#[test]
-pub fn u64_u256_conversion() {
-    let mut rng = rand::rng();
-    for _ in 0..100 {
-        let n1: u64 = rng.random();
-        let n1_u256 = U256::from(n1);
-        let n2 = u256_to_u64(n1_u256);
-        assert!(n2.is_some());
-        assert_eq!(n1, n2.unwrap());
-    }
-}
-
 #[tokio::test]
 pub async fn coord_creation_block() {
     let anvil = spawn_anvil();
@@ -298,7 +279,7 @@ pub async fn event_listening() {
 
 #[tokio::test]
 pub async fn start_node_rpc() {
-    crate::setup_test();
+    stoffel_mpc_coordinator::setup_test();
 
     let node_rpc_addrs = vec![
         ("127.0.0.1".to_string(), 12348),
@@ -336,7 +317,7 @@ pub async fn start_node_rpc() {
             &node_rpc_addrs[i].0,
             node_rpc_addrs[i].1,
             instance.clone(),
-            crate::self_signed_certs::server_cert(),
+            stoffel_mpc_coordinator::self_signed_certs::server_cert(),
         )
         .await;
         node_rpcs.push(node_rpc);
@@ -344,17 +325,17 @@ pub async fn start_node_rpc() {
     let _ = FakeNodeRPCClient::start_rpc_client_from_cert(
         t,
         node_rpc_addrs.clone(),
-        crate::self_signed_certs::client_cert(),
+        stoffel_mpc_coordinator::self_signed_certs::client_cert(),
     )
     .await;
 }
 
 #[tokio::test]
 pub async fn end_to_end() {
-    crate::setup_test();
+    stoffel_mpc_coordinator::setup_test();
 
     let certs = (0..7)
-        .map(|_| crate::self_signed_certs::client_cert())
+        .map(|_| stoffel_mpc_coordinator::self_signed_certs::client_cert())
         .collect::<Vec<_>>();
     let public_keys = certs
         .iter()
@@ -461,10 +442,10 @@ pub async fn end_to_end() {
 
 #[tokio::test]
 pub async fn reset_and_rerun() {
-    crate::setup_test();
+    stoffel_mpc_coordinator::setup_test();
 
     let certs = (0..7)
-        .map(|_| crate::self_signed_certs::client_cert())
+        .map(|_| stoffel_mpc_coordinator::self_signed_certs::client_cert())
         .collect::<Vec<_>>();
     let public_keys = certs
         .iter()

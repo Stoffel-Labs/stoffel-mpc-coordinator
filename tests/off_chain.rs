@@ -1,10 +1,18 @@
-use super::*;
-use crate::self_signed_certs::{client_cert, server_cert};
 use ark_bls12_381::Fr;
 use ark_std::test_rng;
-use tokio::sync::Barrier;
-use crate::fake_coord::{off_chain::{FakeOffChainCoordinatorServer, FakeOffChainCoordinatorClient, FakeCoordinatorRPCServerSharedBase, FakeNodeRPCClient, FakeNodeRPCServer}, FakeShareType};
+use std::sync::Arc;
+use stoffel_mpc_coordinator::self_signed_certs::{client_cert, server_cert};
+use stoffel_mpc_coordinator::Round;
+use stoffel_mpc_coordinator::tests::fake_coord::{
+    FakeShareType,
+    off_chain::{
+        FakeCoordinatorRPCServerSharedBase, FakeNodeRPCClient, FakeNodeRPCServer,
+        FakeOffChainCoordinatorClient, FakeOffChainCoordinatorServer,
+    }
+};
 use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffel_mpc_coordinator::Coordinator;
+use tokio::sync::Barrier;
 
 fn sample_ids(n: usize) -> Vec<usize> {
     (1..=n).collect()
@@ -12,7 +20,7 @@ fn sample_ids(n: usize) -> Vec<usize> {
 
 #[tokio::test]
 async fn start_client_server() {
-    crate::setup_test();
+    stoffel_mpc_coordinator::setup_test();
 
     let certs = (0..7).map(|_| server_cert()).collect::<Vec<_>>();
     let public_keys = certs
@@ -50,7 +58,7 @@ async fn start_client_server() {
 // Fakes event triggering.
 #[tokio::test]
 async fn trigger_pp() {
-    crate::setup_test();
+    stoffel_mpc_coordinator::setup_test();
 
     // event triggered BEFORE waiting for the event
     {
@@ -182,7 +190,7 @@ async fn trigger_pp() {
 // Goes through one entire program execution, calling all needed coordinator methods.
 #[tokio::test]
 async fn end_to_end() {
-    crate::setup_test();
+    stoffel_mpc_coordinator::setup_test();
 
     let node_rpc_addrs = vec![
         ("127.0.0.1".to_string(), 12349),
@@ -329,10 +337,7 @@ async fn end_to_end() {
             }
             coords[0].trigger_round(Round::MPCExecution).await.unwrap();
             coords[0].wait_for_round(Round::MPCExecution).await.unwrap();
-            coords[0]
-                .trigger_round(Round::OutputDistribution)
-                .await
-                .unwrap();
+            coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
             coords[0]
                 .wait_for_round(Round::OutputDistribution)
                 .await
@@ -420,7 +425,7 @@ async fn end_to_end() {
 
 #[tokio::test]
 async fn end_to_end_fake_coord() {
-    crate::setup_test();
+    stoffel_mpc_coordinator::setup_test();
 
     let node_rpc_addrs = vec![
         ("127.0.0.1".to_string(), 12353),
