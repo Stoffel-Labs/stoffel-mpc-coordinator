@@ -5,15 +5,15 @@ edition = "2021"
 
 [[bin]]
 name = "deploy-contract"
-path = "src/deploy-contract/bin/main.rs"
+path = "src/tests/deploy-contract/bin/main.rs"
 
 [[bin]]
 name = "run-coord"
-path = "src/run-coord/bin/main.rs"
+path = "src/tests/run-coord/bin/main.rs"
 
 [[bin]]
 name = "generate-ids"
-path = "src/generate-ids/bin/main.rs"
+path = "src/tests/generate-ids/bin/main.rs"
 
 [features]
 avss = []
