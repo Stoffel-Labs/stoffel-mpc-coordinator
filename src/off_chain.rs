@@ -184,7 +184,7 @@ pub mod node_rpc {
 
                 mask_shares.push(share);
 
-                if mask_shares.len() >= 2 * self.t + 1 {
+                if mask_shares.len() >= S::min_shares(self.t) {
                     match S::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
                         Ok((_, mask)) => {
                             return Ok(mask);
@@ -1136,7 +1136,7 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
             .map(|(_, shares)| shares.clone())
             .collect();
 
-        if output_shares.len() as u64 >= 2 * d.t + 1 {
+        if output_shares.len() >= S::min_shares(d.t as usize) {
             if let Some(sink) = d.output_sinks.get(&client_id) {
                 let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
                 sink.send(json.clone()).await.map_err(|_| {
@@ -1189,7 +1189,7 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
             .map(|(_, shares)| shares.clone())
             .collect();
 
-        if output_shares.len() as u64 >= 2 * d.t + 1 {
+        if output_shares.len() >= S::min_shares(d.t as usize) {
             let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
             let sink = d.output_sinks.get(&self.id).unwrap();
 
@@ -1533,7 +1533,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
         // Try to decrypt and reconstruct outputs until it succeeds.
         while let Some(Ok(enc_output_shares)) = sub.next().await {
-            if (enc_output_shares.len() as u64) < 2 * self.t + 1 {
+            if enc_output_shares.len() < S::min_shares(self.t as usize) {
                 panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
             }
 

@@ -86,6 +86,9 @@ pub trait ShareBound<F: FftField>:
     /// value from `input`. All share metadata (ID, degree, and for Feldman shares the commitment
     /// vector) is copied from `mask_share`.
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError>;
+
+    /// Returns the minimum number of shares required to reconstruct a secret given threshold `t`.
+    fn min_shares(t: usize) -> usize;
 }
 
 /// `ShareBound` implementation for plain HoneyBadger MPC shares (default, `avss` feature off).
@@ -99,6 +102,10 @@ impl<F: FftField> ShareBound<F> for RobustShare<F> {
             mask_share.degree,
         ))
     }
+
+    fn min_shares(t: usize) -> usize {
+        2 * t + 1
+    }
 }
 
 impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShamirShare<F, G> {
@@ -111,6 +118,10 @@ impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShami
             mask_share.feldmanshare.degree,
             mask_share.commitments.clone(),
         )
+    }
+
+    fn min_shares(t: usize) -> usize {
+        t + 1
     }
 }
 

@@ -5,9 +5,10 @@ use alloy_primitives::{address, Address, FixedBytes, U256};
 use ark_bls12_381::Fr;
 use ark_std::test_rng;
 use stoffel_mpc_coordinator::tests::fake_coord::{
-    FakeShareType, FakeValueType,
+    FakeShareType, FakeShareValueType, FakeValueType,
     on_chain::{FakeNodeRPCClient, FakeNodeRPCServer, FakeOnChainCoordinator}
 };
+use stoffel_mpc_coordinator::ShareBound;
 use std::str::FromStr;
 use stoffel_mpc_coordinator::on_chain::{generate_client_sig, ws_connect, OnChainCoordinator};
 use stoffel_mpc_coordinator::{Coordinator, Round};
@@ -345,14 +346,13 @@ pub async fn end_to_end() {
     let correct_mask = Fr::from(42);
     let correct_output = Fr::from(31415);
 
-    let node_rpc_addrs = vec![
-        ("127.0.0.1".to_string(), 12351),
-        ("127.0.0.1".to_string(), 12352),
-        ("127.0.0.1".to_string(), 12353),
-    ];
-    let anvil = spawn_anvil();
     let n = 5;
     let t = 1u64;
+    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
+        .map(|i| ("127.0.0.1".to_string(), 12351u16 + i as u16))
+        .collect();
+    let anvil = spawn_anvil();
     let hash = FixedBytes::from_str(
         "0000000000000000000000000000000000000000000000000000000000000000",
     )
@@ -373,13 +373,13 @@ pub async fn end_to_end() {
     .expect("deployment failed");
 
     let mut instances = Vec::new();
-    for i in 0..3 {
+    for i in 0..n_nodes {
         let p = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
         instances.push(StoffelCoordinatorInstance::new(*contract.address(), p));
     }
 
     let mut coords = Vec::new();
-    for i in 0..3 {
+    for i in 0..n_nodes {
         coords.push(FakeOnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
     }
 
@@ -393,7 +393,7 @@ pub async fn end_to_end() {
             .unwrap();
 
     let mut node_rpcs = Vec::new();
-    for i in 0..3 {
+    for i in 0..n_nodes {
         let node_rpc = FakeNodeRPCServer::start_from_cert(
             &node_rpc_addrs[i].0,
             node_rpc_addrs[i].1,
@@ -425,7 +425,7 @@ pub async fn end_to_end() {
             &mut coords,
             &mut node_rpcs,
             mask_shares,
-            output_shares[..3].to_vec(),
+            output_shares[..n_nodes].to_vec(),
             ACC[5],
             public_keys[5].clone()
         ),
@@ -455,14 +455,13 @@ pub async fn reset_and_rerun() {
     let correct_mask = Fr::from(42);
     let correct_output = Fr::from(31415);
 
-    let node_rpc_addrs = vec![
-        ("127.0.0.1".to_string(), 12354),
-        ("127.0.0.1".to_string(), 12355),
-        ("127.0.0.1".to_string(), 12356),
-    ];
-    let anvil = spawn_anvil();
     let n = 5;
     let t = 1u64;
+    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
+        .map(|i| ("127.0.0.1".to_string(), 12354u16 + i as u16))
+        .collect();
+    let anvil = spawn_anvil();
     let hash = FixedBytes::from_str(
         "0000000000000000000000000000000000000000000000000000000000000000",
     )
@@ -483,20 +482,20 @@ pub async fn reset_and_rerun() {
     .expect("deployment failed");
 
     let mut instances = Vec::new();
-    for i in 0..3 {
+    for i in 0..n_nodes {
         let p = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
         instances.push(StoffelCoordinatorInstance::new(*contract.address(), p));
     }
 
     let mut coords = Vec::new();
-    for i in 0..3 {
+    for i in 0..n_nodes {
         coords.push(OnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
     }
 
     let mut rng = test_rng();
 
     let mut node_rpcs = Vec::new();
-    for i in 0..3 {
+    for i in 0..n_nodes {
         let node_rpc = FakeNodeRPCServer::start_from_cert(
             &node_rpc_addrs[i].0,
             node_rpc_addrs[i].1,
@@ -536,7 +535,7 @@ pub async fn reset_and_rerun() {
             &mut coords,
             &mut node_rpcs,
             mask_shares,
-            output_shares[..3].to_vec(),
+            output_shares[..n_nodes].to_vec(),
             ACC[5],
             public_keys[5].clone()
         ),
@@ -573,7 +572,7 @@ pub async fn reset_and_rerun() {
             &mut coords,
             &mut node_rpcs,
             mask_shares2,
-            output_shares2[..3].to_vec(),
+            output_shares2[..n_nodes].to_vec(),
             ACC[5],
             public_keys[5].clone()
         ),

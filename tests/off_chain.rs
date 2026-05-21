@@ -4,14 +4,14 @@ use std::sync::Arc;
 use stoffel_mpc_coordinator::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator::Round;
 use stoffel_mpc_coordinator::tests::fake_coord::{
-    FakeShareType,
+    FakeShareType, FakeShareValueType,
     off_chain::{
         FakeCoordinatorRPCServerSharedBase, FakeNodeRPCClient, FakeNodeRPCServer,
         FakeOffChainCoordinatorClient, FakeOffChainCoordinatorServer,
     }
 };
 use stoffelmpc_mpc::common::SecretSharingScheme;
-use stoffel_mpc_coordinator::Coordinator;
+use stoffel_mpc_coordinator::{Coordinator, ShareBound};
 use tokio::sync::Barrier;
 
 fn sample_ids(n: usize) -> Vec<usize> {
@@ -192,11 +192,12 @@ async fn trigger_pp() {
 async fn end_to_end() {
     stoffel_mpc_coordinator::setup_test();
 
-    let node_rpc_addrs = vec![
-        ("127.0.0.1".to_string(), 12349),
-        ("127.0.0.1".to_string(), 12350),
-        ("127.0.0.1".to_string(), 12351),
-    ];
+    let n = 5;
+    let t = 1;
+    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
+        .map(|i| ("127.0.0.1".to_string(), 12349u16 + i as u16))
+        .collect();
 
     let certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
     let public_keys = certs
@@ -206,9 +207,6 @@ async fn end_to_end() {
 
     let correct_mask = Fr::from(42);
     let correct_output = Fr::from(31415);
-
-    let n = 5;
-    let t = 1;
     let coord_addr = "127.0.0.1";
     let coord_port = 12348;
     let server_state = FakeCoordinatorRPCServerSharedBase::new(
@@ -236,7 +234,7 @@ async fn end_to_end() {
         let barrier = barrier.clone();
 
         let mut coords: Vec<FakeOffChainCoordinatorClient> = Vec::new();
-        for i in 0..3 {
+        for i in 0..n_nodes {
             let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
@@ -250,7 +248,7 @@ async fn end_to_end() {
             coords.push(coord);
         }
 
-        // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
+        // simulate min_shares(t) = n_nodes RPC nodes for client authentication; we just have one
         // node here, but we use 3 RPC nodes to make the process work
         let mut rng = test_rng();
         let ids = sample_ids(n as usize);
@@ -272,7 +270,7 @@ async fn end_to_end() {
         .unwrap();
 
         let mut node_rpcs = Vec::new();
-        for i in 0..3 {
+        for i in 0..n_nodes {
             let mut node_rpc = FakeNodeRPCServer::start_from_cert(
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
@@ -427,11 +425,12 @@ async fn end_to_end() {
 async fn end_to_end_fake_coord() {
     stoffel_mpc_coordinator::setup_test();
 
-    let node_rpc_addrs = vec![
-        ("127.0.0.1".to_string(), 12353),
-        ("127.0.0.1".to_string(), 12354),
-        ("127.0.0.1".to_string(), 12355),
-    ];
+    let n: usize = 5;
+    let t = 1u64;
+    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
+        .map(|i| ("127.0.0.1".to_string(), 12353u16 + i as u16))
+        .collect();
 
     let certs = (0..7).map(|_| client_cert()).collect::<Vec<_>>();
     let public_keys = certs
@@ -442,10 +441,8 @@ async fn end_to_end_fake_coord() {
     let correct_mask = Fr::from(42);
     let correct_output = Fr::from(31415);
 
-    let n: usize = 5;
     let coord_addr = "127.0.0.1";
     let coord_port = 12352;
-    let t = 1;
     let server_state = FakeCoordinatorRPCServerSharedBase::new(
         [0u8; 32],
         5,
@@ -471,7 +468,7 @@ async fn end_to_end_fake_coord() {
         let barrier = barrier.clone();
 
         let mut coords = Vec::new();
-        for i in 0..3 {
+        for i in 0..n_nodes {
             let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
@@ -485,7 +482,7 @@ async fn end_to_end_fake_coord() {
             coords.push(coord);
         }
 
-        // simulate 2 * t + 1 = 3 RPC nodes for client authentication; we just have one
+        // simulate min_shares(t) = n_nodes RPC nodes for client authentication; we just have one
         // node here, but we use 3 RPC nodes to make the process work
         let mut rng = test_rng();
         let ids = sample_ids(n);
@@ -497,7 +494,7 @@ async fn end_to_end_fake_coord() {
                 .unwrap();
 
         let mut node_rpcs = Vec::new();
-        for i in 0..3 {
+        for i in 0..n_nodes {
             let mut node_rpc = FakeNodeRPCServer::start_from_cert(
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
