@@ -174,7 +174,7 @@ pub mod node_rpc {
                 .unwrap();
                 mask_shares.push(share);
 
-                if mask_shares.len() >= 2 * self.t + 1 {
+                if mask_shares.len() >= S::min_shares(self.t) {
                     match S::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
                         Ok((_, mask)) => {
                             return Ok(mask);
@@ -1090,8 +1090,8 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
         while let Some(Ok((StoffelCoordinator::EnoughOutputShares { client: _, shares }, _))) =
             events.next().await
         {
-            if (shares.len() as u64) < 2 * self.t + 1 {
-                panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
+            if shares.len() < S::min_shares(self.t as usize) {
+                panic!("BUG: less than the minimal number of ({}) output shares received, coordinator should make sure this does not happen!!!", S::min_shares(self.t as usize));
             }
 
             let mut output_shares = Vec::new();

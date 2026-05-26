@@ -7,6 +7,10 @@ use alloy_primitives::{Address, FixedBytes, U256};
 use clap::Parser;
 use std::{env, str::FromStr};
 use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
+use stoffel_mpc_coordinator::{
+    ShareBound,
+    tests::fake_coord::{FakeShareType, FakeShareValueType},
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -53,7 +57,7 @@ async fn main() {
     let sk = env::var("DEPLOY_SK").expect("DEPLOY_SK environment variable not set");
     let provider = connect_to_eth_node(&args.eth_node_addr, &sk).await;
 
-    let t = U256::from(args.t);
+    let t = args.t;
     let hash = FixedBytes::from_str(&args.hash).expect("invalid hash");
     let initial_mpc_nodes: Vec<Address> = args
         .initial_mpc_nodes
@@ -66,14 +70,16 @@ async fn main() {
         .map(|s| Address::from_str(s).expect("invalid output client address"))
         .collect();
     let n_inputs = U256::from(args.n_inputs);
+    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
 
     let contract = match FakeCoordinator::deploy(
         provider.clone(),
         hash,
-        t,
+        U256::from(t),
         initial_mpc_nodes,
         n_inputs,
         output_clients,
+        threshold
     )
     .await
     {

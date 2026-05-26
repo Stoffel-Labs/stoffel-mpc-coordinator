@@ -179,6 +179,7 @@ pub async fn coord_creation_block() {
     let anvil = spawn_anvil();
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
     let t = 1;
+    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
     let hash = FixedBytes::from_str(
         "0000000000000000000000000000000000000000000000000000000000000000",
     )
@@ -193,6 +194,7 @@ pub async fn coord_creation_block() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![],
+        threshold
     )
     .await
     .expect("deployment failed");
@@ -208,6 +210,7 @@ pub async fn event_listening() {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
+        let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -222,6 +225,7 @@ pub async fn event_listening() {
             initial_mpc_nodes.clone(),
             n_inputs,
             vec![],
+            U256::from(threshold)
         )
         .await
         .expect("deployment failed");
@@ -238,6 +242,7 @@ pub async fn event_listening() {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
+        let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -252,6 +257,7 @@ pub async fn event_listening() {
             initial_mpc_nodes.clone(),
             n_inputs,
             vec![],
+            U256::from(threshold)
         )
         .await
         .expect("deployment failed");
@@ -290,6 +296,7 @@ pub async fn start_node_rpc() {
     let anvil = spawn_anvil();
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
     let t = 1;
+    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
     let hash = FixedBytes::from_str(
         "0000000000000000000000000000000000000000000000000000000000000000",
     )
@@ -304,6 +311,7 @@ pub async fn start_node_rpc() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![],
+        threshold
     )
     .await
     .expect("deployment failed");
@@ -368,6 +376,7 @@ pub async fn end_to_end() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![ACC[5]],
+        U256::from(n_nodes)
     )
     .await
     .expect("deployment failed");
@@ -477,6 +486,7 @@ pub async fn reset_and_rerun() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![ACC[5]],
+        U256::from(n_nodes)
     )
     .await
     .expect("deployment failed");
