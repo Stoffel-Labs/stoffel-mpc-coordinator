@@ -19,20 +19,22 @@ if [ $N_CLIENTS -lt 1 ] || [ $N_NODES -lt 1 ]; then
 fi
 
 mkdir $ROOT_DIR || exit 1
-mkdir $ROOT_DIR/clients $ROOT_DIR/nodes
+mkdir $ROOT_DIR/pub $ROOT_DIR/priv
+mkdir $ROOT_DIR/pub/clients $ROOT_DIR/pub/nodes
+mkdir $ROOT_DIR/priv/clients $ROOT_DIR/priv/nodes
 
 echo "Generating coordinator identity..."
 
-generate_ids --cert $ROOT_DIR/coord.crt --key $ROOT_DIR/coord.der --subject-alt-names coord
+generate_ids --cert $ROOT_DIR/pub/coord.crt --key $ROOT_DIR/priv/coord.der --subject-alt-names coord
 
 echo "Generating client identities..."
 
 for i in $(seq 0 $(($N_CLIENTS-1))); do
-    generate_ids --cert $ROOT_DIR/clients/client$i.crt --key $ROOT_DIR/clients/client$i.der --subject-alt-names client$i
+    generate_ids --cert $ROOT_DIR/pub/clients/client$i.crt --key $ROOT_DIR/priv/clients/client$i.der --subject-alt-names client$i
 done
 
 echo "Generating node identities..."
 
 for i in $(seq 0 $(($N_NODES-1))); do
-    generate_ids --cert $ROOT_DIR/nodes/node$i.crt --key $ROOT_DIR/nodes/node$i.der --subject-alt-names node$i
+    generate_ids --cert $ROOT_DIR/pub/nodes/node$i.crt --key $ROOT_DIR/priv/nodes/node$i.der --subject-alt-names node$i
 done
