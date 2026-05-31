@@ -4,10 +4,11 @@
 // Every struct and trait in this library that touches shares is parametrized as `<F: FftField, S: ShareBound<F>>`;
 // the generic type `F` comes directly from the definition of `SecretSharingScheme`.
 //
-// Two share types are already contained and are selected at compile time through the `avss` feature:
+// Two share types are already contained and can be selected by choosing the concrete `S`
+// at coordinator startup:
 //
-// * **`RobustShare<F>`** (default, `avss` off): the plain Shamir share used by HoneyBadger MPC.
-// * **`FeldmanShamirShare<F, G>`** (`avss` on): a Shamir share augmented with group elements that 
+// * **`RobustShare<F>`**: the plain Shamir share used by HoneyBadger MPC.
+// * **`FeldmanShamirShare<F, G>`**: a Shamir share augmented with group elements that
 // enable verifiable secret sharing.
 
 /// Self-signed certificates used for tests.
@@ -91,7 +92,7 @@ pub trait ShareBound<F: FftField>:
     fn min_shares(t: usize) -> usize;
 }
 
-/// `ShareBound` implementation for plain HoneyBadger MPC shares (default, `avss` feature off).
+/// `ShareBound` implementation for plain HoneyBadger MPC shares.
 impl<F: FftField> ShareBound<F> for RobustShare<F> {
     type ValueType = Self::SecretType;
 
@@ -112,12 +113,8 @@ impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShami
     type ValueType = Self::SecretType;
 
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError> {
-        FeldmanShamirShare::<F, G>::new(
-            input - mask_share.feldmanshare.share[0],
-            mask_share.feldmanshare.id,
-            mask_share.feldmanshare.degree,
-            mask_share.commitments.clone(),
-        )
+        let neg_mask_share = (mask_share.clone() * (-F::one()))?;
+        neg_mask_share + input
     }
 
     fn min_shares(t: usize) -> usize {
@@ -184,25 +181,24 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
         i: u64,
     ) -> impl Future<Output = Result<(), CoordinatorError>>;
 
-    /// Used by MPC nodes to wait for masked inputs by `n_clients`. TODO: this is hardcoded to one input per client!
+    /// Used by MPC nodes to wait for masked inputs by `n_inputs`.
     /// For a masked input at index `i`, the node knows a mask share `mask_shares[i]` and by
     /// subtracting `mask_shares[i]` from the masked input, the node obtains a share of the unmasked input.
     /// These shares of unmasked inputs are returned, along with the clients that have supplied them.
-    /// `mask_shares` is indexed by the reserved mask indices. The returned vector of shares for a
-    /// given client is indexed by TODO: should be indexed by sth like input IDs, but we currently
-    /// do not have that.
+    /// `mask_shares` is indexed by the reserved mask indices. When a client reserves multiple
+    /// indices, its returned shares are ordered by the reserved index.
     fn wait_for_inputs(
         &self,
-        n_clients: u64,
+        n_inputs: u64,
         mask_shares: Vec<S>,
     ) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<S>>, CoordinatorError>>;
 
-    /// Used by MPC nodes to wait for indices to be reserved by `n_clients`. Once reserved, the
+    /// Used by MPC nodes to wait for indices to be reserved by `n_inputs`. Once reserved, the
     /// indices and the reserving clients are returned.
     fn wait_for_indices(
         &self,
-        n_clients: u64,
-    ) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, u64>, CoordinatorError>>;
+        n_inputs: u64,
+    ) -> impl Future<Output = Result<HashMap<Self::ClientIdentity, Vec<u64>>, CoordinatorError>>;
 
     /// Called by MPC clients to obtain the private outputs for that client.
     fn obtain_outputs(&self) -> impl Future<Output = Result<Vec<S::ValueType>, CoordinatorError>>;
@@ -276,6 +272,8 @@ pub enum CoordinatorError {
 pub enum NodeRPCError {
     #[error("Index already added")]
     IndexAlreadyAdded,
+    #[error("Index not added")]
+    IndexNotAdded,
     #[error("JSON error")]
     JSONError,
     #[error("Serialization error")]

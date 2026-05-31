@@ -6,11 +6,12 @@ use alloy::{
 use alloy_primitives::{Address, FixedBytes, U256};
 use clap::Parser;
 use std::{env, str::FromStr};
-use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
 use stoffel_mpc_coordinator::{
+    tests::fake_coord::{AvssShareType, FakeShareValueType, HoneyBadgerShareType},
     ShareBound,
-    tests::fake_coord::{FakeShareType, FakeShareValueType},
 };
+use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
+use stoffel_vm_types::compiled_binary::MpcBackend;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -38,6 +39,10 @@ struct Args {
     /// The number of inputs for the MPC program.
     #[arg(long)]
     n_inputs: u32,
+
+    /// The compiled Stoffel program whose manifest determines the MPC backend.
+    #[arg(long)]
+    program: Option<String>,
 }
 
 async fn connect_to_eth_node(addr: &str, sk: &str) -> impl Provider + Clone {
@@ -70,7 +75,24 @@ async fn main() {
         .map(|s| Address::from_str(s).expect("invalid output client address"))
         .collect();
     let n_inputs = U256::from(args.n_inputs);
-    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
+    let backend = args
+        .program
+        .as_deref()
+        .map(|path| {
+            stoffel_vm_types::compiled_binary::utils::load_from_file(path)
+                .expect("failed to load Stoffel bytecode")
+                .client_io_manifest
+                .mpc_backend
+        })
+        .unwrap_or(MpcBackend::HoneyBadger);
+    let threshold = match backend {
+        MpcBackend::HoneyBadger => U256::from(<HoneyBadgerShareType as ShareBound<
+            FakeShareValueType,
+        >>::min_shares(t as usize)),
+        MpcBackend::Avss => {
+            U256::from(<AvssShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize))
+        }
+    };
 
     let contract = match FakeCoordinator::deploy(
         provider.clone(),
@@ -79,7 +101,7 @@ async fn main() {
         initial_mpc_nodes,
         n_inputs,
         output_clients,
-        threshold
+        threshold,
     )
     .await
     {

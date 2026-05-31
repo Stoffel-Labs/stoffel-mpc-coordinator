@@ -3,7 +3,7 @@ use crate::{
     rpc::{ClientInfo, ValueWrapper},
     Coordinator, CoordinatorError, Round, ShareBound,
 };
-use ark_ff::FftField;
+use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use async_trait::async_trait;
 use hpke::{
@@ -24,9 +24,14 @@ use jsonrpsee::{
 use p256::{pkcs8::DecodePrivateKey, SecretKey};
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use stoffel_vm_types::{
+    compiled_binary::{ClientIoManifest, ClientIoSchema},
+    core_types::ShareType,
+};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use CoordinatorRPCBaseError::*;
@@ -51,9 +56,375 @@ type AeadImpl = AesGcm256;
 /// mask index, then the node simply checks that the public keys used for both these actions are the same.
 pub type ClientIdentity = Vec<u8>;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundClientIoSchema {
+    pub schema_hash: [u8; 32],
+    pub client: ClientIdentity,
+    pub client_slot: u64,
+    pub inputs: Vec<ShareType>,
+    pub outputs: Vec<ShareType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedMaskReservation {
+    pub client: ClientIdentity,
+    pub reserved_index: u64,
+    pub input_ordinal: u64,
+    pub share_type: ShareType,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "ValueWrapper<T>: Serialize",
+    deserialize = "ValueWrapper<T>: Deserialize<'de>"
+))]
+pub struct TypedMaskedInput<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
+    pub reserved_index: u64,
+    pub input_ordinal: u64,
+    pub share_type: ShareType,
+    pub masked_input: ValueWrapper<T>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "ValueWrapper<T>: Serialize",
+    deserialize = "ValueWrapper<T>: Deserialize<'de>"
+))]
+pub struct TypedMaskedInputEvent<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
+    pub client: ClientIdentity,
+    pub reserved_index: u64,
+    pub input_ordinal: u64,
+    pub share_type: ShareType,
+    pub masked_input: ValueWrapper<T>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedMaskShare {
+    pub reserved_index: u64,
+    pub input_ordinal: u64,
+    pub share_type: ShareType,
+    pub share_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TypedOutputShare<S> {
+    pub output_ordinal: u64,
+    pub share_type: ShareType,
+    pub share: S,
+}
+
+#[derive(Clone, Debug)]
+pub struct TypedOutputShareEnvelope<S> {
+    pub schema_hash: [u8; 32],
+    pub outputs: Vec<TypedOutputShare<S>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClearShareValue {
+    Integer(i64),
+    Boolean(bool),
+    FixedPoint(f64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypedClearOutput {
+    pub output_ordinal: u64,
+    pub share_type: ShareType,
+    pub value: ClearShareValue,
+}
+
+#[derive(Clone, Debug)]
+struct InputSlotSchema {
+    client: ClientIdentity,
+    input_ordinal: u64,
+    share_type: ShareType,
+}
+
+fn share_type_hash_update(ctx: &mut ring::digest::Context, share_type: ShareType) {
+    match share_type {
+        ShareType::SecretInt { bit_length } => {
+            ctx.update(&[0]);
+            ctx.update(&(bit_length as u64).to_le_bytes());
+        }
+        ShareType::SecretFixedPoint { precision } => {
+            ctx.update(&[1]);
+            ctx.update(&(precision.total_bits() as u64).to_le_bytes());
+            ctx.update(&(precision.fractional_bits() as u64).to_le_bytes());
+        }
+    }
+}
+
+fn compute_schema_hash(schemas: &[BoundClientIoSchema]) -> [u8; 32] {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(b"StoffelClientIoManifestV1");
+    let mut ordered = schemas.to_vec();
+    ordered.sort_by_key(|schema| schema.client_slot);
+    for schema in ordered {
+        ctx.update(&schema.client_slot.to_le_bytes());
+        ctx.update(&(schema.inputs.len() as u64).to_le_bytes());
+        for share_type in schema.inputs {
+            share_type_hash_update(&mut ctx, share_type);
+        }
+        ctx.update(&(schema.outputs.len() as u64).to_le_bytes());
+        for share_type in schema.outputs {
+            share_type_hash_update(&mut ctx, share_type);
+        }
+    }
+    ctx.finish().as_ref().try_into().expect("SHA-256 length")
+}
+
+type BoundClientIoBuildResult = (
+    HashMap<ClientIdentity, BoundClientIoSchema>,
+    Vec<InputSlotSchema>,
+    Vec<ClientIdentity>,
+);
+
+fn build_bound_client_io(
+    manifest: ClientIoManifest,
+    bindings: Vec<(u64, ClientIdentity)>,
+) -> Result<BoundClientIoBuildResult, CoordinatorError> {
+    let mut by_slot: HashMap<u64, ClientIoSchema> = HashMap::new();
+    for schema in manifest.clients {
+        let client_slot = schema.client_slot;
+        if by_slot.insert(client_slot, schema).is_some() {
+            return Err(CoordinatorError::JSONError(format!(
+                "Duplicate client_slot {client_slot} in client IO manifest"
+            )));
+        }
+    }
+
+    let mut bound_schemas = Vec::new();
+    for (client_slot, client) in bindings {
+        let schema = by_slot.remove(&client_slot).ok_or_else(|| {
+            CoordinatorError::JSONError(format!(
+                "No client IO manifest entry for bound client_slot {client_slot}"
+            ))
+        })?;
+        bound_schemas.push(BoundClientIoSchema {
+            schema_hash: [0u8; 32],
+            client,
+            client_slot,
+            inputs: schema.inputs,
+            outputs: schema.outputs,
+        });
+    }
+
+    if !by_slot.is_empty() {
+        let mut unbound_slots = by_slot.keys().copied().collect::<Vec<_>>();
+        unbound_slots.sort_unstable();
+        return Err(CoordinatorError::JSONError(format!(
+            "Client IO manifest slots are not bound to off-chain identities: {unbound_slots:?}"
+        )));
+    }
+
+    let schema_hash = compute_schema_hash(&bound_schemas);
+    let mut map = HashMap::new();
+    let mut input_slots = Vec::new();
+    let mut output_clients = Vec::new();
+    for mut schema in bound_schemas {
+        schema.schema_hash = schema_hash;
+        if !schema.outputs.is_empty() {
+            output_clients.push(schema.client.clone());
+        }
+        for (input_ordinal, share_type) in schema.inputs.iter().copied().enumerate() {
+            input_slots.push(InputSlotSchema {
+                client: schema.client.clone(),
+                input_ordinal: input_ordinal as u64,
+                share_type,
+            });
+        }
+        if map.insert(schema.client.clone(), schema).is_some() {
+            return Err(CoordinatorError::JSONError(
+                "Client identity is bound to multiple client IO slots".to_string(),
+            ));
+        }
+    }
+
+    Ok((map, input_slots, output_clients))
+}
+
+fn default_bound_schema(client: ClientIdentity) -> BoundClientIoSchema {
+    BoundClientIoSchema {
+        schema_hash: compute_schema_hash(&[]),
+        client,
+        client_slot: 0,
+        inputs: vec![],
+        outputs: vec![],
+    }
+}
+
+pub fn encode_clear_input<F: PrimeField>(
+    share_type: ShareType,
+    value: ClearShareValue,
+) -> Result<F, CoordinatorError> {
+    match (share_type, value) {
+        (ShareType::SecretInt { bit_length: 1 }, ClearShareValue::Boolean(value)) => {
+            Ok(F::from(value as u64))
+        }
+        (ShareType::SecretInt { .. }, ClearShareValue::Integer(value)) => Ok(i64_to_field(value)),
+        (ShareType::SecretFixedPoint { precision }, ClearShareValue::FixedPoint(value)) => {
+            let scale = 2f64.powi(precision.fractional_bits() as i32);
+            Ok(i64_to_field((value * scale).round() as i64))
+        }
+        (ShareType::SecretFixedPoint { precision }, ClearShareValue::Integer(value)) => {
+            let scaled = value
+                .checked_shl(precision.fractional_bits() as u32)
+                .ok_or(CoordinatorError::SerializationError)?;
+            Ok(i64_to_field(scaled))
+        }
+        _ => Err(CoordinatorError::SerializationError),
+    }
+}
+
+pub fn decode_clear_output<F: PrimeField>(
+    share_type: ShareType,
+    value: F,
+) -> Result<ClearShareValue, CoordinatorError> {
+    match share_type {
+        ShareType::SecretInt { bit_length: 1 } => Ok(ClearShareValue::Boolean(!value.is_zero())),
+        ShareType::SecretInt { .. } => Ok(ClearShareValue::Integer(field_to_i64(value)?)),
+        ShareType::SecretFixedPoint { precision } => {
+            let scaled = field_to_i64(value)?;
+            let scale = 2f64.powi(precision.fractional_bits() as i32);
+            Ok(ClearShareValue::FixedPoint(scaled as f64 / scale))
+        }
+    }
+}
+
+fn i64_to_field<F: PrimeField>(value: i64) -> F {
+    if value >= 0 {
+        F::from(value as u64)
+    } else {
+        -F::from(value.unsigned_abs())
+    }
+}
+
+fn field_to_i64<F: PrimeField>(value: F) -> Result<i64, CoordinatorError> {
+    let positive = value.into_bigint();
+    if positive.as_ref()[1..].iter().all(|limb| *limb == 0)
+        && positive.as_ref()[0] <= i64::MAX as u64
+    {
+        return Ok(positive.as_ref()[0] as i64);
+    }
+
+    let negative = (-value).into_bigint();
+    if negative.as_ref()[1..].iter().all(|limb| *limb == 0)
+        && negative.as_ref()[0] <= i64::MAX as u64 + 1
+    {
+        let magnitude = negative.as_ref()[0];
+        return if magnitude == (i64::MAX as u64 + 1) {
+            Ok(i64::MIN)
+        } else {
+            Ok(-(magnitude as i64))
+        };
+    }
+
+    Err(CoordinatorError::DeserializationError)
+}
+
+fn write_share_type_bytes(out: &mut Vec<u8>, share_type: ShareType) {
+    match share_type {
+        ShareType::SecretInt { bit_length } => {
+            out.push(0);
+            out.extend_from_slice(&(bit_length as u64).to_le_bytes());
+        }
+        ShareType::SecretFixedPoint { precision } => {
+            out.push(1);
+            out.extend_from_slice(&(precision.total_bits() as u64).to_le_bytes());
+            out.extend_from_slice(&(precision.fractional_bits() as u64).to_le_bytes());
+        }
+    }
+}
+
+fn read_u64_from(cursor: &mut Cursor<&[u8]>) -> Result<u64, CoordinatorError> {
+    let mut bytes = [0u8; 8];
+    cursor
+        .read_exact(&mut bytes)
+        .map_err(|_| CoordinatorError::DeserializationError)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_share_type_bytes(cursor: &mut Cursor<&[u8]>) -> Result<ShareType, CoordinatorError> {
+    let mut tag = [0u8; 1];
+    cursor
+        .read_exact(&mut tag)
+        .map_err(|_| CoordinatorError::DeserializationError)?;
+    match tag[0] {
+        0 => {
+            let bit_length = read_u64_from(cursor)? as usize;
+            ShareType::try_secret_int(bit_length)
+                .map_err(|_| CoordinatorError::DeserializationError)
+        }
+        1 => {
+            let total_bits = read_u64_from(cursor)? as usize;
+            let fractional_bits = read_u64_from(cursor)? as usize;
+            Ok(ShareType::SecretFixedPoint {
+                precision: stoffel_vm_types::core_types::FixedPointPrecision::try_new(
+                    total_bits,
+                    fractional_bits,
+                )
+                .map_err(|_| CoordinatorError::DeserializationError)?,
+            })
+        }
+        _ => Err(CoordinatorError::DeserializationError),
+    }
+}
+
+fn serialize_typed_output_envelope<S: CanonicalSerialize>(
+    envelope: &TypedOutputShareEnvelope<S>,
+) -> Result<Vec<u8>, CoordinatorError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&envelope.schema_hash);
+    out.extend_from_slice(&(envelope.outputs.len() as u64).to_le_bytes());
+    for output in &envelope.outputs {
+        out.extend_from_slice(&output.output_ordinal.to_le_bytes());
+        write_share_type_bytes(&mut out, output.share_type);
+        let mut share_bytes = Vec::new();
+        output
+            .share
+            .serialize_compressed(&mut share_bytes)
+            .map_err(|_| CoordinatorError::SerializationError)?;
+        out.extend_from_slice(&(share_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&share_bytes);
+    }
+    Ok(out)
+}
+
+fn deserialize_typed_output_envelope<S: CanonicalDeserialize>(
+    bytes: &[u8],
+) -> Result<TypedOutputShareEnvelope<S>, CoordinatorError> {
+    let mut cursor = Cursor::new(bytes);
+    let mut schema_hash = [0u8; 32];
+    cursor
+        .read_exact(&mut schema_hash)
+        .map_err(|_| CoordinatorError::DeserializationError)?;
+    let count = read_u64_from(&mut cursor)? as usize;
+    let mut outputs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let output_ordinal = read_u64_from(&mut cursor)?;
+        let share_type = read_share_type_bytes(&mut cursor)?;
+        let share_len = read_u64_from(&mut cursor)? as usize;
+        let mut share_bytes = vec![0u8; share_len];
+        cursor
+            .read_exact(&mut share_bytes)
+            .map_err(|_| CoordinatorError::DeserializationError)?;
+        let share = S::deserialize_compressed(share_bytes.as_slice())
+            .map_err(|_| CoordinatorError::DeserializationError)?;
+        outputs.push(TypedOutputShare {
+            output_ordinal,
+            share_type,
+            share,
+        });
+    }
+    Ok(TypedOutputShareEnvelope {
+        schema_hash,
+        outputs,
+    })
+}
+
 /// The node-side RPC interface.
 pub mod node_rpc {
-    use super::ClientIdentity;
+    use super::{ClientIdentity, TypedMaskReservation, TypedMaskShare};
     use crate::{rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound};
     use ark_ff::FftField;
     use async_trait::async_trait;
@@ -67,7 +438,7 @@ pub mod node_rpc {
         PendingSubscriptionSink, SubscriptionSink,
     };
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::marker::PhantomData;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -90,13 +461,14 @@ pub mod node_rpc {
         /// establish the TLS connection to access this very interface.
         #[subscription(name = "sub_receive_mask_share", unsubscribe = "unsub_receive_mask_share", item = Vec<u8>)]
         async fn receive_mask_share(&self) -> SubscriptionResult;
+
+        #[subscription(name = "sub_receive_typed_mask_share", unsubscribe = "unsub_receive_typed_mask_share", item = TypedMaskShare)]
+        async fn receive_typed_mask_share(&self) -> SubscriptionResult;
     }
 
     pub struct NodeRPCServer<F: FftField, S: ShareBound<F>> {
         rpc_server: Arc<Mutex<NodeRPCServerInternal<F, S>>>,
         addr: String,
-        port: u16,
-        server_handle: JoinHandle<()>,
     }
 
     /// An object used by an MPC client to connect to the RPC interfaces of many nodes.
@@ -130,19 +502,18 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Result<Self, CoordinatorError> {
-            let node_rpcs: Vec<Client> = futures_util::future::join_all(
-                addrs.iter().map(|(addr, port)| {
+            let node_rpcs: Vec<Client> =
+                futures_util::future::join_all(addrs.iter().map(|(addr, port)| {
                     crate::self_signed_certs::setup_client(
                         addr,
                         *port,
                         cert_der.clone(),
                         key_der.clone(),
                     )
-                }),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
 
             Ok(Self {
                 node_rpcs,
@@ -202,6 +573,74 @@ pub mod node_rpc {
                 mask_shares.len(),
             ))
         }
+
+        pub async fn receive_typed_masks(
+            &self,
+            count: usize,
+        ) -> Result<Vec<(TypedMaskShare, S::ValueType)>, CoordinatorError> {
+            let mut outputs = Vec::with_capacity(count);
+            for _ in 0..count {
+                let output_count_before = outputs.len();
+                let mut share_futures = JoinSet::new();
+
+                for rpc in self.node_rpcs.iter() {
+                    let mut sub = rpc
+                        .receive_typed_mask_share()
+                        .await
+                        .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
+                    share_futures.spawn(async move { sub.next().await });
+                }
+
+                let mut mask_shares: Vec<S> = Vec::new();
+                let mut first_metadata: Option<TypedMaskShare> = None;
+
+                while let Some(share_result) = share_futures.join_next().await {
+                    let typed_share_option = share_result
+                        .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
+                    let typed_share = match typed_share_option {
+                        Some(res) => {
+                            res.map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?
+                        }
+                        None => continue,
+                    };
+                    let share: S = ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                        typed_share.share_bytes.as_slice(),
+                    )
+                    .map_err(|_| CoordinatorError::DeserializationError)?;
+
+                    if first_metadata.is_none() {
+                        first_metadata = Some(typed_share.clone());
+                    } else if first_metadata.as_ref().is_some_and(|metadata| {
+                        metadata.reserved_index != typed_share.reserved_index
+                            || metadata.input_ordinal != typed_share.input_ordinal
+                            || metadata.share_type != typed_share.share_type
+                    }) {
+                        return Err(CoordinatorError::JSONError(
+                            "Typed mask share metadata differs across MPC nodes".to_string(),
+                        ));
+                    }
+                    mask_shares.push(share);
+
+                    if mask_shares.len() >= S::min_shares(self.t) {
+                        let metadata = first_metadata.expect("metadata set with first share");
+                        let (_, mask) = S::recover_secret(&mask_shares, 4 * self.t + 1, self.t)
+                            .map_err(|_| {
+                                CoordinatorError::MaskReconstructionFailed(mask_shares.len())
+                            })?;
+                        outputs.push((metadata, mask));
+                        break;
+                    }
+                }
+
+                if outputs.len() == output_count_before {
+                    return Err(CoordinatorError::MaskReconstructionFailed(
+                        mask_shares.len(),
+                    ));
+                }
+            }
+
+            Ok(outputs)
+        }
     }
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCServer<F, S> {
@@ -226,7 +665,7 @@ pub mod node_rpc {
             key_der: Vec<u8>,
         ) -> Result<Self, CoordinatorError> {
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new()));
-            let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl<F, S>>(
+            crate::rpc::start_coord::<NodeRPCServerImpl<F, S>>(
                 addr,
                 port,
                 cert_der,
@@ -237,8 +676,6 @@ pub mod node_rpc {
             Ok(Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
-                port,
-                server_handle,
             })
         }
 
@@ -252,23 +689,64 @@ pub mod node_rpc {
             id: ClientIdentity,
             i: u64,
         ) -> Result<(), NodeRPCError> {
+            self.add_typed_reserved_index(TypedMaskReservation {
+                client: id,
+                reserved_index: i,
+                input_ordinal: i,
+                share_type: stoffel_vm_types::core_types::ShareType::default_secret_int(),
+            })
+            .await
+        }
+
+        pub async fn add_typed_reserved_index(
+            &mut self,
+            reservation: TypedMaskReservation,
+        ) -> Result<(), NodeRPCError> {
             let mut d = self.rpc_server.lock().await;
+            let id = reservation.client.clone();
+            let i = reservation.reserved_index;
 
             if d.index_to_client.contains_key(&i) {
                 return Err(NodeRPCError::IndexAlreadyAdded);
             }
 
             d.index_to_client.insert(i, id.clone());
-            d.client_to_index.insert(id.clone(), i);
+            d.typed_reservations.insert(i, reservation.clone());
+            d.client_to_index
+                .entry(id.clone())
+                .or_default()
+                .push_back(i);
 
             // if mask share is there and share has been requested, send it
-            if let Some(share) = d.mask_shares.get(&i) {
-                if let Some(sink) = d.sinks.get(&id) {
+            if let Some(share) = d.mask_shares.get(&i).cloned() {
+                if let Some(sink) = d.sinks.remove(&id) {
+                    if let Some(indices) = d.client_to_index.get_mut(&id) {
+                        if let Some(position) = indices.iter().position(|index| *index == i) {
+                            indices.remove(position);
+                        }
+                        if indices.is_empty() {
+                            d.client_to_index.remove(&id);
+                        }
+                    }
                     let mut share_bytes = Vec::new();
                     share
                         .serialize_compressed(&mut share_bytes)
                         .map_err(|_| NodeRPCError::SerializationError)?;
                     let json = to_json_raw_value(&share_bytes)
+                        .map_err(|_| NodeRPCError::SerializationError)?;
+                    sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
+                }
+                if let Some(sink) = d.typed_sinks.remove(&id) {
+                    if let Some(indices) = d.client_to_index.get_mut(&id) {
+                        if let Some(position) = indices.iter().position(|index| *index == i) {
+                            indices.remove(position);
+                        }
+                        if indices.is_empty() {
+                            d.client_to_index.remove(&id);
+                        }
+                    }
+                    let typed_share = d.typed_mask_share(i, &share)?;
+                    let json = to_json_raw_value(&typed_share)
                         .map_err(|_| NodeRPCError::SerializationError)?;
                     sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
@@ -285,13 +763,35 @@ pub mod node_rpc {
             d.mask_shares.insert(i, share.clone());
 
             // if reserved index has been added and client has requested the share already, send the share now
-            if let Some(id) = d.index_to_client.get(&i) {
-                if let Some(sink) = d.sinks.get(id) {
+            if let Some(id) = d.index_to_client.get(&i).cloned() {
+                if let Some(sink) = d.sinks.remove(&id) {
+                    if let Some(indices) = d.client_to_index.get_mut(&id) {
+                        if let Some(position) = indices.iter().position(|index| *index == i) {
+                            indices.remove(position);
+                        }
+                        if indices.is_empty() {
+                            d.client_to_index.remove(&id);
+                        }
+                    }
                     let mut share_bytes = Vec::new();
                     share
                         .serialize_compressed(&mut share_bytes)
                         .map_err(|_| NodeRPCError::SerializationError)?;
                     let json = to_json_raw_value(&share_bytes).expect("failed convert to JSON");
+                    sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
+                }
+                if let Some(sink) = d.typed_sinks.remove(&id) {
+                    if let Some(indices) = d.client_to_index.get_mut(&id) {
+                        if let Some(position) = indices.iter().position(|index| *index == i) {
+                            indices.remove(position);
+                        }
+                        if indices.is_empty() {
+                            d.client_to_index.remove(&id);
+                        }
+                    }
+                    let typed_share = d.typed_mask_share(i, share)?;
+                    let json = to_json_raw_value(&typed_share)
+                        .map_err(|_| NodeRPCError::SerializationError)?;
                     sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
             }
@@ -327,10 +827,12 @@ pub mod node_rpc {
     pub struct NodeRPCServerInternal<F: FftField, S: ShareBound<F>> {
         /// Maps reserved indices to the clients that have reserved them.
         index_to_client: HashMap<u64, ClientIdentity>,
+        typed_reservations: HashMap<u64, TypedMaskReservation>,
         /// The inverse mapping of `index_to_client`.
-        client_to_index: HashMap<ClientIdentity, u64>,
+        client_to_index: HashMap<ClientIdentity, VecDeque<u64>>,
         /// Client sinks to send mask shares over Websockets.
         sinks: HashMap<ClientIdentity, SubscriptionSink>,
+        typed_sinks: HashMap<ClientIdentity, SubscriptionSink>,
         /// TODO
         mask_shares: HashMap<u64, S>,
         /// Maps client identities the per-client information stored by the server.
@@ -360,12 +862,43 @@ pub mod node_rpc {
         pub fn new() -> Self {
             Self {
                 index_to_client: HashMap::new(),
+                typed_reservations: HashMap::new(),
                 client_to_index: HashMap::new(),
                 sinks: HashMap::new(),
+                typed_sinks: HashMap::new(),
                 mask_shares: HashMap::new(),
                 clients: HashMap::new(),
                 _phantom: PhantomData,
             }
+        }
+    }
+
+    impl<F: FftField, S: ShareBound<F>> Default for NodeRPCServerInternal<F, S> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<F: FftField, S: ShareBound<F>> NodeRPCServerInternal<F, S> {
+        fn typed_mask_share(
+            &self,
+            reserved_index: u64,
+            share: &S,
+        ) -> Result<TypedMaskShare, NodeRPCError> {
+            let reservation = self
+                .typed_reservations
+                .get(&reserved_index)
+                .ok_or(NodeRPCError::IndexNotAdded)?;
+            let mut share_bytes = Vec::new();
+            share
+                .serialize_compressed(&mut share_bytes)
+                .map_err(|_| NodeRPCError::SerializationError)?;
+            Ok(TypedMaskShare {
+                reserved_index,
+                input_ordinal: reservation.input_ordinal,
+                share_type: reservation.share_type,
+                share_bytes,
+            })
         }
     }
 
@@ -376,7 +909,8 @@ pub mod node_rpc {
 
             let mut d = self.d.lock().await;
 
-            // each client can only request shares once from a node
+            // Each client may have multiple inputs, but only one mask-share request can be
+            // outstanding per node connection.
             if d.sinks.contains_key(&self.id) {
                 pending
                     .reject(ErrorObjectOwned::owned(
@@ -388,45 +922,151 @@ pub mod node_rpc {
                 return Ok(());
             }
 
-            if let Some(i) = d.client_to_index.get(&self.id) {
-                if let Some(share) = d.mask_shares.get(i) {
-                    let mut share_bytes = Vec::new();
-                    match share.serialize_compressed(&mut share_bytes) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            pending
-                                .reject(ErrorObjectOwned::owned(
-                                    ErrorCode::ServerError(SerializationError as i32).code(),
-                                    format!("Serializing share bytes failed: {e}"),
-                                    None::<()>,
-                                ))
-                                .await;
-                            return Ok(());
-                        }
-                    };
-                    let json = match to_json_raw_value(&share_bytes) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            pending
-                                .reject(ErrorObjectOwned::owned(
-                                    ErrorCode::ServerError(SerializationError as i32).code(),
-                                    format!("Converting serialized shares to JSON failed: {e}"),
-                                    None::<()>,
-                                ))
-                                .await;
-                            return Ok(());
-                        }
-                    };
-
-                    let sink = pending.accept().await?;
-                    sink.send(json).await?;
-
-                    return Ok(());
+            let next_index = d
+                .client_to_index
+                .get(&self.id)
+                .and_then(|indices| indices.front().copied());
+            let mut remove_client_indices = d
+                .client_to_index
+                .get(&self.id)
+                .is_some_and(|indices| indices.is_empty());
+            let share = if let Some(i) = next_index {
+                if let Some(share) = d.mask_shares.get(&i).cloned() {
+                    if let Some(indices) = d.client_to_index.get_mut(&self.id) {
+                        indices.pop_front();
+                        remove_client_indices = indices.is_empty();
+                    }
+                    Some(share)
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            if remove_client_indices {
+                d.client_to_index.remove(&self.id);
+            }
+
+            if let Some(share) = share {
+                let mut share_bytes = Vec::new();
+                match share.serialize_compressed(&mut share_bytes) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        pending
+                            .reject(ErrorObjectOwned::owned(
+                                ErrorCode::ServerError(SerializationError as i32).code(),
+                                format!("Serializing share bytes failed: {e}"),
+                                None::<()>,
+                            ))
+                            .await;
+                        return Ok(());
+                    }
+                };
+                let json = match to_json_raw_value(&share_bytes) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        pending
+                            .reject(ErrorObjectOwned::owned(
+                                ErrorCode::ServerError(SerializationError as i32).code(),
+                                format!("Converting serialized shares to JSON failed: {e}"),
+                                None::<()>,
+                            ))
+                            .await;
+                        return Ok(());
+                    }
+                };
+
+                let sink = pending.accept().await?;
+                sink.send(json).await?;
+
+                return Ok(());
             }
 
             let sink = pending.accept().await?;
             d.sinks.insert(self.id.clone(), sink);
+
+            Ok(())
+        }
+
+        async fn receive_typed_mask_share(
+            &self,
+            pending: PendingSubscriptionSink,
+        ) -> SubscriptionResult {
+            use OffChainNodeRPCServerError::*;
+
+            let mut d = self.d.lock().await;
+
+            if d.typed_sinks.contains_key(&self.id) {
+                pending
+                    .reject(ErrorObjectOwned::owned(
+                        ErrorCode::InvalidParams.code(),
+                        format!("Client {:?} already requested typed mask share", self.id),
+                        None::<()>,
+                    ))
+                    .await;
+                return Ok(());
+            }
+
+            let next_index = d
+                .client_to_index
+                .get(&self.id)
+                .and_then(|indices| indices.front().copied());
+            let mut remove_client_indices = d
+                .client_to_index
+                .get(&self.id)
+                .is_some_and(|indices| indices.is_empty());
+            let typed_share = if let Some(i) = next_index {
+                if let Some(share) = d.mask_shares.get(&i).cloned() {
+                    if let Some(indices) = d.client_to_index.get_mut(&self.id) {
+                        indices.pop_front();
+                        remove_client_indices = indices.is_empty();
+                    }
+                    match d.typed_mask_share(i, &share) {
+                        Ok(typed_share) => Some(typed_share),
+                        Err(e) => {
+                            pending
+                                .reject(ErrorObjectOwned::owned(
+                                    ErrorCode::ServerError(SerializationError as i32).code(),
+                                    format!("Serializing typed share failed: {e}"),
+                                    None::<()>,
+                                ))
+                                .await;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if remove_client_indices {
+                d.client_to_index.remove(&self.id);
+            }
+
+            if let Some(typed_share) = typed_share {
+                let json = match to_json_raw_value(&typed_share) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        pending
+                            .reject(ErrorObjectOwned::owned(
+                                ErrorCode::ServerError(SerializationError as i32).code(),
+                                format!("Converting typed share to JSON failed: {e}"),
+                                None::<()>,
+                            ))
+                            .await;
+                        return Ok(());
+                    }
+                };
+
+                let sink = pending.accept().await?;
+                sink.send(json).await?;
+
+                return Ok(());
+            }
+
+            let sink = pending.accept().await?;
+            d.typed_sinks.insert(self.id.clone(), sink);
 
             Ok(())
         }
@@ -504,6 +1144,18 @@ pub trait CoordinatorRPCBase<F: FftField, S: ShareBound<F>> {
     #[subscription(name = "sub_masked_inputs", unsubscribe = "unsub_masked_inputs", item = Event<S::ValueType>)]
     async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
 
+    #[subscription(name = "sub_typed_reserved_indices", unsubscribe = "unsub_typed_reserved_indices", item = TypedMaskReservation)]
+    async fn sub_typed_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
+
+    #[subscription(name = "sub_typed_masked_inputs", unsubscribe = "unsub_typed_masked_inputs", item = TypedMaskedInputEvent<S::ValueType>)]
+    async fn sub_typed_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
+
+    #[method(name = "get_client_io_schema")]
+    async fn get_client_io_schema(&self) -> RpcResult<BoundClientIoSchema>;
+
+    #[method(name = "reserve_mask_indices")]
+    async fn reserve_mask_indices(&self, count: u64) -> RpcResult<Vec<TypedMaskReservation>>;
+
     /// Returns the number of available input masks left. TODO: this involves a race condition
     /// since querying this and reserving an index is not atomic. remove it?
     #[method(name = "available_input_masks")]
@@ -524,6 +1176,12 @@ pub trait CoordinatorRPCBase<F: FftField, S: ShareBound<F>> {
         &self,
         masked_input: ValueWrapper<S::ValueType>,
         reserved_index: u64,
+    ) -> RpcResult<()>;
+
+    #[method(name = "submit_masked_inputs")]
+    async fn submit_masked_inputs(
+        &self,
+        masked_inputs: Vec<TypedMaskedInput<S::ValueType>>,
     ) -> RpcResult<()>;
 
     /// The designated party uses this to transition to the new round `next_round`.
@@ -559,6 +1217,9 @@ pub enum CoordinatorRPCBaseError {
     NotParty = 10,
     SendingFailed = 11,
     NotOutputClient = 12,
+    InvalidClientIoSchema = 13,
+    InvalidReservationCount = 14,
+    UnauthorizedClientIo = 15,
 }
 
 /// The basic server-side information for one client connection to the coordinator RPC interface.
@@ -581,17 +1242,17 @@ pub struct CoordinatorRPCServerSharedBase<T: CanonicalSerialize + CanonicalDeser
     trans_events: HashMap<Round, Vec<(u64, Event<T>)>>,
     reserved_index_events: Vec<(u64, Event<T>)>,
     reserved_index_sinks: Vec<SubscriptionSink>,
+    typed_reserved_index_events: Vec<(u64, TypedMaskReservation)>,
+    typed_reserved_index_sinks: Vec<SubscriptionSink>,
     masked_input_events: Vec<(u64, Event<T>)>,
     masked_input_sinks: Vec<SubscriptionSink>,
+    typed_masked_input_events: Vec<(u64, TypedMaskedInputEvent<T>)>,
+    typed_masked_input_sinks: Vec<SubscriptionSink>,
     n_reserved: u64,
     reserved_indices: Vec<Option<ClientIdentity>>,
     masked_inputs: Vec<Option<T>>,
     /// The current round.
     round: Round,
-    /// The program hash.
-    prog_hash: [u8; 32],
-    /// The `n` value.
-    n: u64,
     /// The `t` value.
     t: u64,
     /// The MPC nodes.
@@ -605,18 +1266,24 @@ pub struct CoordinatorRPCServerSharedBase<T: CanonicalSerialize + CanonicalDeser
     output_sinks: HashMap<ClientIdentity, SubscriptionSink>,
     /// The set of clients that are permitted to call `obtain_output_shares`.
     output_clients: Vec<ClientIdentity>,
+    /// Client IO schemas bound from VM logical client slots to off-chain identities.
+    client_io_schemas: HashMap<ClientIdentity, BoundClientIoSchema>,
+    typed_input_slots: Vec<InputSlotSchema>,
 }
 
 impl<F: FftField, S: ShareBound<F>> CoordinatorRPCServerConnectionBase<F, S> {
-    pub fn new(internal: Arc<Mutex<CoordinatorRPCServerSharedBase<S::ValueType>>>, id: ClientIdentity) -> Self {
+    pub fn new(
+        internal: Arc<Mutex<CoordinatorRPCServerSharedBase<S::ValueType>>>,
+        id: ClientIdentity,
+    ) -> Self {
         Self { d: internal, id }
     }
 }
 
 impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerSharedBase<T> {
     pub fn new(
-        prog_hash: [u8; 32],
-        n: u64,
+        _prog_hash: [u8; 32],
+        _n: u64,
         t: u64,
         initial_mpc_nodes: Vec<ClientIdentity>,
         n_inputs: u64,
@@ -642,21 +1309,77 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
             ]),
             reserved_index_events: vec![],
             reserved_index_sinks: vec![],
+            typed_reserved_index_events: vec![],
+            typed_reserved_index_sinks: vec![],
             masked_input_events: vec![],
             masked_input_sinks: vec![],
+            typed_masked_input_events: vec![],
+            typed_masked_input_sinks: vec![],
             n_reserved: 0,
             reserved_indices: vec![None; n_inputs as usize],
             masked_inputs: vec![None; n_inputs as usize],
             round: Round::Idle,
-            prog_hash,
-            n,
             t,
             mpc_nodes: Some(initial_mpc_nodes),
             clients: HashMap::new(),
             output_shares: HashMap::new(),
             output_sinks: HashMap::new(),
             output_clients,
+            client_io_schemas: HashMap::new(),
+            typed_input_slots: vec![],
         }
+    }
+
+    pub fn new_with_client_io_manifest(
+        _prog_hash: [u8; 32],
+        _n: u64,
+        t: u64,
+        initial_mpc_nodes: Vec<ClientIdentity>,
+        manifest: ClientIoManifest,
+        client_bindings: Vec<(u64, ClientIdentity)>,
+    ) -> Result<Self, CoordinatorError> {
+        let (client_io_schemas, typed_input_slots, output_clients) =
+            build_bound_client_io(manifest, client_bindings)?;
+        let n_inputs = typed_input_slots.len() as u64;
+        Ok(Self {
+            sinks: HashMap::from([
+                (Round::Idle, vec![]),
+                (Round::Preprocessing, vec![]),
+                (Round::InputMaskReservation, vec![]),
+                (Round::InputCollection, vec![]),
+                (Round::MPCExecution, vec![]),
+                (Round::OutputDistribution, vec![]),
+                (Round::ProgramFinished, vec![]),
+            ]),
+            trans_events: HashMap::from([
+                (Round::Preprocessing, vec![]),
+                (Round::InputMaskReservation, vec![]),
+                (Round::InputCollection, vec![]),
+                (Round::MPCExecution, vec![]),
+                (Round::OutputDistribution, vec![]),
+                (Round::ProgramFinished, vec![]),
+            ]),
+            reserved_index_events: vec![],
+            reserved_index_sinks: vec![],
+            typed_reserved_index_events: vec![],
+            typed_reserved_index_sinks: vec![],
+            masked_input_events: vec![],
+            masked_input_sinks: vec![],
+            typed_masked_input_events: vec![],
+            typed_masked_input_sinks: vec![],
+            n_reserved: 0,
+            reserved_indices: vec![None; n_inputs as usize],
+            masked_inputs: vec![None; n_inputs as usize],
+            round: Round::Idle,
+            t,
+            mpc_nodes: Some(initial_mpc_nodes),
+            clients: HashMap::new(),
+            output_shares: HashMap::new(),
+            output_sinks: HashMap::new(),
+            output_clients,
+            client_io_schemas,
+            typed_input_slots,
+        })
     }
 
     pub fn add_client(&mut self, cert: Vec<u8>, thread: JoinHandle<()>, stop_tx: ServerHandle) {
@@ -688,11 +1411,20 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
 
                 return Ok(());
             }
+
+            if round_reached(self.round, round) {
+                if let Some((_, event)) = events.last() {
+                    let json = to_json_raw_value(event).expect("failed convert to JSON");
+                    sink.send(json).await?;
+
+                    return Ok(());
+                }
+            }
         }
 
         self.sinks
             .get_mut(&round)
-            .expect(&format!("BUG: {:?} must be present!", round))
+            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round))
             .push(sink);
         Ok(())
     }
@@ -710,13 +1442,10 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         // check if there are events since the coordinator was reset the last time
         if index != events.len() {
             // send all such events
-            for i in index..events.len() {
-                let event = events[i].1.clone();
-                let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            for (_, event) in events.iter().skip(index) {
+                let json = to_json_raw_value(event).expect("failed convert to JSON");
                 sink.send(json).await?;
             }
-
-            return Ok(());
         }
 
         self.reserved_index_sinks.push(sink);
@@ -736,16 +1465,49 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         // check if there are events since the coordinator was reset the last time
         if index != events.len() {
             // send all such events
-            for i in index..events.len() {
-                let event = events[i].1.clone();
-                let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            for (_, event) in events.iter().skip(index) {
+                let json = to_json_raw_value(event).expect("failed convert to JSON");
                 sink.send(json).await?;
             }
-
-            return Ok(());
         }
 
         self.masked_input_sinks.push(sink);
+        Ok(())
+    }
+
+    async fn subscribe_typed_reserved_indices(
+        &mut self,
+        pending: PendingSubscriptionSink,
+        timestamp: u64,
+    ) -> SubscriptionResult {
+        let sink = pending.accept().await?;
+
+        let events = &self.typed_reserved_index_events;
+        let index = events.partition_point(|e| e.0 < timestamp);
+        for (_, event) in events.iter().skip(index) {
+            let json = to_json_raw_value(event).expect("failed convert to JSON");
+            sink.send(json).await?;
+        }
+
+        self.typed_reserved_index_sinks.push(sink);
+        Ok(())
+    }
+
+    async fn subscribe_typed_masked_inputs(
+        &mut self,
+        pending: PendingSubscriptionSink,
+        timestamp: u64,
+    ) -> SubscriptionResult {
+        let sink = pending.accept().await?;
+
+        let events = &self.typed_masked_input_events;
+        let index = events.partition_point(|e| e.0 < timestamp);
+        for (_, event) in events.iter().skip(index) {
+            let json = to_json_raw_value(event).expect("failed convert to JSON");
+            sink.send(json).await?;
+        }
+
+        self.typed_masked_input_sinks.push(sink);
         Ok(())
     }
 
@@ -757,43 +1519,59 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         let sinks = self
             .sinks
             .get_mut(&round)
-            .expect(&format!("BUG: {:?} must be present!", round));
+            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round));
 
-        // broadcast event to all subscribed RPC clients concurrently
-        let results = futures_util::future::join_all(
-            sinks.iter().map(|sink| {
-                let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                sink.send(json)
-            }),
-        )
-        .await;
-        for result in results {
-            result.map_err(|_| CoordinatorError::JSONError("client disconnected".to_string()))?;
-        }
+        let sinks = std::mem::take(sinks);
 
-        // clear all subscribed RPC clients
-        sinks.clear();
-
-        // add event to event history
+        // Record the round even if one of the existing subscribers has disconnected.
+        // Late subscribers will replay this event from history.
         self.trans_events
             .get_mut(&round)
-            .expect(&format!("BUG: {:?} must be present!", round))
+            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round))
             .push((
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
-                event,
+                event.clone(),
             ));
 
         self.round = round;
+
+        // Broadcast event to all subscribed RPC clients concurrently.
+        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
+            let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            sink.send(json)
+        }))
+        .await;
+        for result in results {
+            if result.is_err() {
+                eprintln!(
+                    "coordinator subscriber disconnected while broadcasting {:?}",
+                    round
+                );
+            }
+        }
 
         Ok(())
     }
 }
 
+fn round_reached(current: Round, requested: Round) -> bool {
+    let mut cursor = Some(current);
+    while let Some(round) = cursor {
+        if round == requested {
+            return true;
+        }
+        cursor = crate::round_before(round);
+    }
+    false
+}
+
 /// The basic shared state can be used as a full-fledged shared state.
-impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> crate::rpc::RPCServerShared for CoordinatorRPCServerSharedBase<T> {
+impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> crate::rpc::RPCServerShared
+    for CoordinatorRPCServerSharedBase<T>
+{
     fn add_client(
         &mut self,
         cert_der: Vec<u8>,
@@ -826,6 +1604,137 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         Ok(d.masked_inputs.len() as u64 - d.n_reserved)
     }
 
+    async fn get_client_io_schema(&self) -> RpcResult<BoundClientIoSchema> {
+        let d = self.d.lock().await;
+        Ok(d.client_io_schemas
+            .get(&self.id)
+            .cloned()
+            .unwrap_or_else(|| default_bound_schema(self.id.clone())))
+    }
+
+    async fn sub_typed_reserved_indices(
+        &self,
+        pending: PendingSubscriptionSink,
+        timestamp: u64,
+    ) -> SubscriptionResult {
+        let mut d = self.d.lock().await;
+        d.subscribe_typed_reserved_indices(pending, timestamp).await
+    }
+
+    async fn sub_typed_masked_inputs(
+        &self,
+        pending: PendingSubscriptionSink,
+        timestamp: u64,
+    ) -> SubscriptionResult {
+        let mut d = self.d.lock().await;
+        d.subscribe_typed_masked_inputs(pending, timestamp).await
+    }
+
+    async fn reserve_mask_indices(&self, count: u64) -> RpcResult<Vec<TypedMaskReservation>> {
+        let mut d = self.d.lock().await;
+
+        if d.round != Round::InputMaskReservation {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(WrongRound as i32).code(),
+                format!(
+                    "Need round {:?}, current round is {:?}",
+                    Round::InputMaskReservation,
+                    d.round
+                ),
+                None::<()>,
+            ));
+        }
+
+        let schema = d.client_io_schemas.get(&self.id).ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                ErrorCode::ServerError(UnauthorizedClientIo as i32).code(),
+                format!("Client {:?} is not bound to a client IO schema", self.id),
+                None::<()>,
+            )
+        })?;
+
+        if count as usize != schema.inputs.len() {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(InvalidReservationCount as i32).code(),
+                format!(
+                    "Client {:?} must reserve exactly {} typed inputs, got {}",
+                    self.id,
+                    schema.inputs.len(),
+                    count
+                ),
+                None::<()>,
+            ));
+        }
+
+        let mut reservations = Vec::with_capacity(count as usize);
+        for (reserved_index, slot) in d.typed_input_slots.iter().enumerate() {
+            if slot.client == self.id {
+                if d.reserved_indices[reserved_index].is_some() {
+                    return Err(ErrorObjectOwned::owned(
+                        ErrorCode::ServerError(IndexAlreadyReserved as i32).code(),
+                        format!("Index {} already reserved.", reserved_index),
+                        None::<()>,
+                    ));
+                }
+                reservations.push(TypedMaskReservation {
+                    client: self.id.clone(),
+                    reserved_index: reserved_index as u64,
+                    input_ordinal: slot.input_ordinal,
+                    share_type: slot.share_type,
+                });
+            }
+        }
+
+        if reservations.len() != count as usize {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(InvalidReservationCount as i32).code(),
+                format!(
+                    "Client {:?} has {} typed inputs in coordinator state, got request for {}",
+                    self.id,
+                    reservations.len(),
+                    count
+                ),
+                None::<()>,
+            ));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for reservation in &reservations {
+            let i = reservation.reserved_index as usize;
+            d.reserved_indices[i] = Some(self.id.clone());
+            d.n_reserved += 1;
+
+            let legacy_event = Event::<S::ValueType>::ReservedInputEvent {
+                client: self.id.clone(),
+                reserved_index: reservation.reserved_index,
+            };
+            d.reserved_index_events.push((now, legacy_event.clone()));
+            d.typed_reserved_index_events
+                .push((now, reservation.clone()));
+
+            let sinks = std::mem::take(&mut d.reserved_index_sinks);
+            for sink in sinks {
+                let json = to_json_raw_value(&legacy_event).expect("failed convert to JSON");
+                if sink.send(json).await.is_ok() {
+                    d.reserved_index_sinks.push(sink);
+                }
+            }
+
+            let typed_sinks = std::mem::take(&mut d.typed_reserved_index_sinks);
+            for sink in typed_sinks {
+                let json = to_json_raw_value(reservation).expect("failed convert to JSON");
+                if sink.send(json).await.is_ok() {
+                    d.typed_reserved_index_sinks.push(sink);
+                }
+            }
+        }
+
+        Ok(reservations)
+    }
+
     async fn reset(&self) -> RpcResult<()> {
         let mut d = self.d.lock().await;
 
@@ -841,12 +1750,13 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
             ));
         }
 
-        if d.round != Round::Idle {
+        if !matches!(d.round, Round::Idle | Round::ProgramFinished) {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(WrongRound as i32).code(),
                 format!(
-                    "Need round {:?}, current round is {:?}",
+                    "Need round {:?} or {:?}, current round is {:?}",
                     Round::Idle,
+                    Round::ProgramFinished,
                     d.round
                 ),
                 None::<()>,
@@ -859,6 +1769,22 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         d.masked_inputs = vec![None; n_inputs as usize];
         d.n_reserved = 0;
         d.reserved_indices = vec![None; n_inputs as usize];
+        d.reserved_index_events.clear();
+        d.reserved_index_sinks.clear();
+        d.typed_reserved_index_events.clear();
+        d.typed_reserved_index_sinks.clear();
+        d.masked_input_events.clear();
+        d.masked_input_sinks.clear();
+        d.typed_masked_input_events.clear();
+        d.typed_masked_input_sinks.clear();
+        d.output_shares.clear();
+        d.output_sinks.clear();
+        for sinks in d.sinks.values_mut() {
+            sinks.clear();
+        }
+        for events in d.trans_events.values_mut() {
+            events.clear();
+        }
 
         Ok(())
     }
@@ -917,28 +1843,59 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
                 }
                 d.masked_inputs[reserved_index] = Some(masked_input.value.clone());
 
+                let masked_input_for_typed = masked_input.clone();
                 let event = Event::MaskedInputEvent {
                     client: self.id.clone(),
                     masked_input,
                     reserved_index: raw_reserved_index,
                 };
-                for sink in &d.masked_input_sinks {
-                    let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                    sink.send(json).await.map_err(|_| {
-                        ErrorObjectOwned::owned(
-                            ErrorCode::ServerError(SendingFailed as i32).code(),
-                            "sending to subscriber failed",
-                            None::<()>,
-                        )
-                    })?;
-                }
+                let typed_event =
+                    d.typed_input_slots
+                        .get(reserved_index)
+                        .map(|slot| TypedMaskedInputEvent {
+                            client: self.id.clone(),
+                            reserved_index: raw_reserved_index,
+                            input_ordinal: slot.input_ordinal,
+                            share_type: slot.share_type,
+                            masked_input: masked_input_for_typed,
+                        });
                 d.masked_input_events.push((
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs(),
-                    event,
+                    event.clone(),
                 ));
+                if let Some(typed_event) = typed_event.clone() {
+                    d.typed_masked_input_events.push((
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        typed_event.clone(),
+                    ));
+                }
+
+                let sinks = std::mem::take(&mut d.masked_input_sinks);
+                for sink in sinks {
+                    let json = to_json_raw_value(&event).expect("failed convert to JSON");
+                    if sink.send(json).await.is_ok() {
+                        d.masked_input_sinks.push(sink);
+                    } else {
+                        eprintln!("coordinator masked-input subscriber disconnected");
+                    }
+                }
+                if let Some(typed_event) = typed_event {
+                    let typed_sinks = std::mem::take(&mut d.typed_masked_input_sinks);
+                    for sink in typed_sinks {
+                        let json = to_json_raw_value(&typed_event).expect("failed convert to JSON");
+                        if sink.send(json).await.is_ok() {
+                            d.typed_masked_input_sinks.push(sink);
+                        } else {
+                            eprintln!("coordinator typed masked-input subscriber disconnected");
+                        }
+                    }
+                }
             }
             None => {
                 return Err(ErrorObjectOwned::owned(
@@ -949,6 +1906,163 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
                     ),
                     None::<()>,
                 ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn submit_masked_inputs(
+        &self,
+        masked_inputs: Vec<TypedMaskedInput<S::ValueType>>,
+    ) -> RpcResult<()> {
+        let mut d = self.d.lock().await;
+
+        if d.round != Round::InputCollection {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(WrongRound as i32).code(),
+                format!(
+                    "Need round {:?}, current round is {:?}",
+                    Round::InputCollection,
+                    d.round
+                ),
+                None::<()>,
+            ));
+        }
+
+        let schema = d.client_io_schemas.get(&self.id).ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                ErrorCode::ServerError(UnauthorizedClientIo as i32).code(),
+                format!("Client {:?} is not bound to a client IO schema", self.id),
+                None::<()>,
+            )
+        })?;
+
+        if masked_inputs.len() != schema.inputs.len() {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(InvalidReservationCount as i32).code(),
+                format!(
+                    "Client {:?} must submit exactly {} typed inputs, got {}",
+                    self.id,
+                    schema.inputs.len(),
+                    masked_inputs.len()
+                ),
+                None::<()>,
+            ));
+        }
+
+        let mut seen_reserved_indices = HashSet::with_capacity(masked_inputs.len());
+        let mut seen_input_ordinals = HashSet::with_capacity(masked_inputs.len());
+        for input in &masked_inputs {
+            if !seen_reserved_indices.insert(input.reserved_index)
+                || !seen_input_ordinals.insert(input.input_ordinal)
+            {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(InvalidReservationCount as i32).code(),
+                    format!(
+                        "Client {:?} submitted duplicate typed input metadata",
+                        self.id
+                    ),
+                    None::<()>,
+                ));
+            }
+
+            let reserved_index = input.reserved_index as usize;
+            if reserved_index >= d.masked_inputs.len() {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
+                    format!(
+                        "The index {} is out of bounds, there are only {} input masks.",
+                        reserved_index,
+                        d.masked_inputs.len()
+                    ),
+                    None::<()>,
+                ));
+            }
+
+            let slot = d.typed_input_slots.get(reserved_index).ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(InvalidClientIoSchema as i32).code(),
+                    format!(
+                        "Index {} is not typed in the client IO schema",
+                        reserved_index
+                    ),
+                    None::<()>,
+                )
+            })?;
+            if slot.client != self.id
+                || slot.input_ordinal != input.input_ordinal
+                || slot.share_type != input.share_type
+            {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(InvalidClientIoSchema as i32).code(),
+                    format!(
+                        "Typed input metadata for index {} does not match coordinator schema",
+                        reserved_index
+                    ),
+                    None::<()>,
+                ));
+            }
+            if d.reserved_indices[reserved_index].as_ref() != Some(&self.id) {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(IndexNotReserved as i32).code(),
+                    format!(
+                        "Cannot submit a masked input for index {}, since it has not been reserved by {:?}",
+                        reserved_index, self.id
+                    ),
+                    None::<()>,
+                ));
+            }
+            if d.masked_inputs[reserved_index].is_some() {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(MaskedInputAlreadySubmitted as i32).code(),
+                    format!(
+                        "Client {:?} has already submitted a masked input for index {}",
+                        self.id, reserved_index
+                    ),
+                    None::<()>,
+                ));
+            }
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for input in masked_inputs {
+            let reserved_index = input.reserved_index as usize;
+            d.masked_inputs[reserved_index] = Some(input.masked_input.value.clone());
+
+            let legacy_event = Event::MaskedInputEvent {
+                client: self.id.clone(),
+                masked_input: input.masked_input.clone(),
+                reserved_index: input.reserved_index,
+            };
+            let typed_event = TypedMaskedInputEvent {
+                client: self.id.clone(),
+                reserved_index: input.reserved_index,
+                input_ordinal: input.input_ordinal,
+                share_type: input.share_type,
+                masked_input: input.masked_input,
+            };
+
+            d.masked_input_events.push((now, legacy_event.clone()));
+            d.typed_masked_input_events.push((now, typed_event.clone()));
+
+            let sinks = std::mem::take(&mut d.masked_input_sinks);
+            for sink in sinks {
+                let json = to_json_raw_value(&legacy_event).expect("failed convert to JSON");
+                if sink.send(json).await.is_ok() {
+                    d.masked_input_sinks.push(sink);
+                }
+            }
+
+            let typed_sinks = std::mem::take(&mut d.typed_masked_input_sinks);
+            for sink in typed_sinks {
+                let json = to_json_raw_value(&typed_event).expect("failed convert to JSON");
+                if sink.send(json).await.is_ok() {
+                    d.typed_masked_input_sinks.push(sink);
+                }
             }
         }
 
@@ -1010,6 +2124,27 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
             ));
         }
 
+        let typed_reservation = if let Some(slot) = d.typed_input_slots.get(i as usize) {
+            if slot.client != self.id {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(UnauthorizedClientIo as i32).code(),
+                    format!(
+                        "Client {:?} cannot reserve typed input index {}, which belongs to {:?}",
+                        self.id, i, slot.client
+                    ),
+                    None::<()>,
+                ));
+            }
+            Some(TypedMaskReservation {
+                client: self.id.clone(),
+                reserved_index: i,
+                input_ordinal: slot.input_ordinal,
+                share_type: slot.share_type,
+            })
+        } else {
+            None
+        };
+
         d.reserved_indices[i as usize] = Some(self.id.clone());
 
         let event = Event::<S::ValueType>::ReservedInputEvent {
@@ -1017,26 +2152,46 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
             reserved_index: i,
         };
 
-        // broadcast reserved index to all subscribed RPC clients
-        for sink in &d.reserved_index_sinks {
-            let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            sink.send(json).await.map_err(|_| {
-                ErrorObjectOwned::owned(
-                    ErrorCode::ServerError(SendingFailed as i32).code(),
-                    "sending to subscriber failed",
-                    None::<()>,
-                )
-            })?;
-        }
-
         d.n_reserved += 1;
         d.reserved_index_events.push((
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            event,
+            event.clone(),
         ));
+        if let Some(typed_reservation) = typed_reservation.clone() {
+            d.typed_reserved_index_events.push((
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                typed_reservation.clone(),
+            ));
+        }
+
+        // Broadcast reserved index to all subscribed RPC clients. Disconnected
+        // subscribers are pruned; late/restarted nodes replay from event history.
+        let sinks = std::mem::take(&mut d.reserved_index_sinks);
+        for sink in sinks {
+            let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            if sink.send(json).await.is_ok() {
+                d.reserved_index_sinks.push(sink);
+            } else {
+                eprintln!("coordinator reserved-index subscriber disconnected");
+            }
+        }
+        if let Some(typed_reservation) = typed_reservation {
+            let typed_sinks = std::mem::take(&mut d.typed_reserved_index_sinks);
+            for sink in typed_sinks {
+                let json = to_json_raw_value(&typed_reservation).expect("failed convert to JSON");
+                if sink.send(json).await.is_ok() {
+                    d.typed_reserved_index_sinks.push(sink);
+                } else {
+                    eprintln!("coordinator typed reserved-index subscriber disconnected");
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1139,13 +2294,9 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         if output_shares.len() >= S::min_shares(d.t as usize) {
             if let Some(sink) = d.output_sinks.get(&client_id) {
                 let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
-                sink.send(json.clone()).await.map_err(|_| {
-                    ErrorObjectOwned::owned(
-                        ErrorCode::ServerError(SendingFailed as i32).code(),
-                        "sending to subscriber failed",
-                        None::<()>,
-                    )
-                })?;
+                if sink.send(json.clone()).await.is_err() {
+                    eprintln!("coordinator output subscriber disconnected");
+                }
             }
         }
         Ok(())
@@ -1218,15 +2369,9 @@ impl<F: FftField, S: ShareBound<F>> crate::rpc::RPCServerConnection
 
 /// The exterior wrapper of the server-side coordinator.
 pub struct OffChainCoordinatorServer<C: crate::rpc::RPCServerConnection> {
-    rpc_server: Option<Arc<Mutex<C::Internal>>>,
-    rpc_coord: Option<Client>,
     addr: Option<String>,
-    port: Option<u16>,
-    server_handle: Option<JoinHandle<()>>,
     timestamp: Option<u64>,
-    t: u64,
-    n_outputs: Option<u64>,
-    key_der: Option<Vec<u8>>,
+    _marker: std::marker::PhantomData<C>,
 }
 
 /// The exterior wrapper of the coordinator, which implements the `Coordinator` trait.
@@ -1264,29 +2409,22 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
         shared: C::Internal,
         addr: &str,
         port: u16,
-        t: u64,
+        _t: u64,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
         let rpc_server_data = Arc::new(Mutex::new(shared));
-        let server_handle =
-            crate::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone())
-                .await?;
+        crate::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone())
+            .await?;
         Ok(Self {
-            rpc_server: Some(rpc_server_data),
-            rpc_coord: None,
             addr: Some(String::from(addr)),
-            port: Some(port),
-            server_handle: Some(server_handle),
             timestamp: Some(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
             ),
-            t,
-            n_outputs: None,
-            key_der: None,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -1357,6 +2495,208 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     fn rpc(&self) -> &Client {
         self.rpc_coord.as_ref().expect("client not started")
     }
+
+    pub async fn get_client_io_schema(&self) -> Result<BoundClientIoSchema, CoordinatorError> {
+        CoordinatorRPCBaseClient::<F, S>::get_client_io_schema(self.rpc())
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
+
+    pub async fn reserve_mask_indices(
+        &self,
+        count: u64,
+    ) -> Result<Vec<TypedMaskReservation>, CoordinatorError> {
+        CoordinatorRPCBaseClient::<F, S>::reserve_mask_indices(self.rpc(), count)
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
+
+    pub async fn submit_masked_inputs(
+        &self,
+        masked_inputs: Vec<TypedMaskedInput<S::ValueType>>,
+    ) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::<F, S>::submit_masked_inputs(self.rpc(), masked_inputs)
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
+
+    pub async fn wait_for_typed_indices(
+        &self,
+        n_inputs: u64,
+    ) -> Result<Vec<TypedMaskReservation>, CoordinatorError> {
+        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_typed_reserved_indices(
+            self.rpc(),
+            self.get_timestamp(),
+        )
+        .await
+        .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        let mut reservations = Vec::with_capacity(n_inputs as usize);
+        for _ in 0..n_inputs {
+            if let Some(Ok(reservation)) = sub.next().await {
+                reservations.push(reservation);
+            } else {
+                return Err(CoordinatorError::JSONError(
+                    "Subscription ended before typed reserved-index event could be received"
+                        .to_string(),
+                ));
+            }
+        }
+        reservations.sort_by_key(|reservation| reservation.input_ordinal);
+        Ok(reservations)
+    }
+
+    pub async fn wait_for_typed_inputs(
+        &self,
+        n_inputs: u64,
+        mask_shares: Vec<S>,
+    ) -> Result<Vec<TypedOutputShare<S>>, CoordinatorError> {
+        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_typed_masked_inputs(
+            self.rpc(),
+            self.get_timestamp(),
+        )
+        .await
+        .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        let mut inputs = Vec::with_capacity(n_inputs as usize);
+        for _ in 0..n_inputs {
+            if let Some(Ok(event)) = sub.next().await {
+                let i = event.reserved_index as usize;
+                let mask_share = &mask_shares[i];
+                let input = S::compute_masked_input(event.masked_input.value, mask_share)
+                    .map_err(|_| CoordinatorError::ShareError)?;
+                inputs.push(TypedOutputShare {
+                    output_ordinal: event.input_ordinal,
+                    share_type: event.share_type,
+                    share: input,
+                });
+            } else {
+                return Err(CoordinatorError::JSONError(
+                    "Subscription ended before typed masked-input event could be received"
+                        .to_string(),
+                ));
+            }
+        }
+        inputs.sort_by_key(|input| input.output_ordinal);
+        Ok(inputs)
+    }
+
+    pub async fn send_typed_output_shares(
+        &self,
+        client_id: ClientIdentity,
+        key: Vec<u8>,
+        envelope: TypedOutputShareEnvelope<S>,
+    ) -> Result<(), CoordinatorError> {
+        let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key)
+            .map_err(|_| CoordinatorError::ParsingPublicKeyFailed)?;
+        let output_shares_bytes = serialize_typed_output_envelope(&envelope)?;
+
+        let mut rng = StdRng::from_os_rng();
+        let (encapsulated_key, ciphertext) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
+            &OpModeS::Base,
+            &client_pk,
+            ENC_INFO,
+            &output_shares_bytes,
+            b"",
+            &mut rng,
+        )
+        .map_err(|_| CoordinatorError::EncryptionError)?;
+        let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
+
+        CoordinatorRPCBaseClient::<F, S>::send_output_shares(self.rpc(), client_id, c)
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+    }
+
+    pub async fn obtain_typed_outputs(&self) -> Result<Vec<TypedClearOutput>, CoordinatorError>
+    where
+        F: PrimeField,
+        S: ShareBound<F, ValueType = F>,
+    {
+        let schema = self.get_client_io_schema().await?;
+        let mut sub = CoordinatorRPCBaseClient::<F, S>::obtain_output_shares(self.rpc())
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+
+        let client_sk = {
+            let der_bytes = self.key_der.clone().unwrap();
+            let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes)
+                .map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
+            let raw_sk = parsed_secret_key.to_bytes();
+
+            <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk)
+                .map_err(|_| CoordinatorError::ParsingPrivateKeyFailed)?
+        };
+
+        while let Some(Ok(enc_output_shares)) = sub.next().await {
+            if enc_output_shares.len() < S::min_shares(self.t as usize) {
+                continue;
+            }
+
+            let mut output_share_sets = Vec::new();
+            for (encapped_key_bytes, c) in enc_output_shares.iter() {
+                let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes)
+                    .map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
+                let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
+                    &OpModeR::Base,
+                    &client_sk,
+                    &encapped_key,
+                    ENC_INFO,
+                    c,
+                    b"",
+                )
+                .map_err(|_| CoordinatorError::DecryptionError)?;
+                let envelope: TypedOutputShareEnvelope<S> =
+                    deserialize_typed_output_envelope(&output_shares_bytes)?;
+
+                if envelope.schema_hash != schema.schema_hash
+                    || envelope.outputs.len() != schema.outputs.len()
+                {
+                    continue;
+                }
+                if envelope
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .any(|(ordinal, output)| {
+                        output.output_ordinal as usize != ordinal
+                            || schema.outputs[ordinal] != output.share_type
+                    })
+                {
+                    continue;
+                }
+                output_share_sets.push(envelope.outputs);
+            }
+
+            let mut outputs = Vec::new();
+            for (ordinal, share_type) in schema.outputs.iter().copied().enumerate() {
+                let shares_i: Vec<_> = output_share_sets
+                    .iter()
+                    .map(|shares| shares[ordinal].share.clone())
+                    .collect();
+                if shares_i.len() < S::min_shares(self.t as usize) {
+                    continue;
+                }
+                if let Ok((_, output_i)) =
+                    S::recover_secret(&shares_i, (4 * self.t + 1) as usize, self.t as usize)
+                {
+                    outputs.push(TypedClearOutput {
+                        output_ordinal: ordinal as u64,
+                        share_type,
+                        value: decode_clear_output(share_type, output_i)?,
+                    });
+                }
+            }
+            if outputs.len() == schema.outputs.len() {
+                return Ok(outputs);
+            }
+        }
+
+        Err(CoordinatorError::JSONError(
+            "Output shares subscription ended before enough typed output shares could be obtained"
+                .to_string(),
+        ))
+    }
 }
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
@@ -1403,8 +2743,8 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
     async fn wait_for_indices(
         &self,
-        n_clients: u64,
-    ) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
+        n_inputs: u64,
+    ) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
         // Wait for reserved index events.
         let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_reserved_indices(
             self.rpc(),
@@ -1413,16 +2753,16 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         .await
         .unwrap();
 
-        let mut map = HashMap::new();
+        let mut map: HashMap<ClientIdentity, Vec<u64>> = HashMap::new();
 
         // Parse reserved index events one after the other.
-        for _ in 0..n_clients {
+        for _ in 0..n_inputs {
             if let Some(Ok(Event::ReservedInputEvent {
                 client,
                 reserved_index,
             })) = sub.next().await
             {
-                map.insert(client, reserved_index);
+                map.entry(client).or_default().push(reserved_index);
             } else {
                 return Err(CoordinatorError::JSONError(
                     "Subscription ended before event could be received".to_string(),
@@ -1435,7 +2775,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
     async fn wait_for_inputs(
         &self,
-        n_clients: u64,
+        n_inputs: u64,
         mask_shares: Vec<S>,
     ) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
         // Wait for masked input events.
@@ -1444,10 +2784,10 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                 .await
                 .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
-        let mut map = HashMap::new();
+        let mut map: HashMap<ClientIdentity, Vec<(u64, S)>> = HashMap::new();
 
         // Parse masked input events one after the other.
-        for _ in 0..n_clients {
+        for _ in 0..n_inputs {
             if let Some(Ok(Event::MaskedInputEvent {
                 client,
                 masked_input,
@@ -1459,7 +2799,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                 let input = S::compute_masked_input(masked_input.value, mask_share)
                     .map_err(|_| CoordinatorError::ShareError)?;
 
-                map.insert(client, vec![input]);
+                map.entry(client).or_default().push((reserved_index, input));
             } else {
                 return Err(CoordinatorError::JSONError(
                     "Subscription ended before event could be received".to_string(),
@@ -1467,7 +2807,17 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
             }
         }
 
-        Ok(map)
+        Ok(map
+            .into_iter()
+            .map(|(client, mut indexed_inputs)| {
+                indexed_inputs.sort_by_key(|(reserved_index, _)| *reserved_index);
+                let inputs = indexed_inputs
+                    .into_iter()
+                    .map(|(_, input)| input)
+                    .collect::<Vec<_>>();
+                (client, inputs)
+            })
+            .collect())
     }
 
     async fn wait_for_round(&self, round: Round) -> Result<(), CoordinatorError> {
@@ -1534,7 +2884,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         // Try to decrypt and reconstruct outputs until it succeeds.
         while let Some(Ok(enc_output_shares)) = sub.next().await {
             if enc_output_shares.len() < S::min_shares(self.t as usize) {
-                panic!("BUG: less than 2t+1 output shares received, coordinator should make sure this does not happen!!!");
+                continue;
             }
 
             let mut output_shares = Vec::new();

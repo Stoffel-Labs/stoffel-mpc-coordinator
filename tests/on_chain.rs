@@ -4,13 +4,13 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{address, Address, FixedBytes, U256};
 use ark_bls12_381::Fr;
 use ark_std::test_rng;
-use stoffel_mpc_coordinator::tests::fake_coord::{
-    FakeShareType, FakeShareValueType, FakeValueType,
-    on_chain::{FakeNodeRPCClient, FakeNodeRPCServer, FakeOnChainCoordinator}
-};
-use stoffel_mpc_coordinator::ShareBound;
 use std::str::FromStr;
 use stoffel_mpc_coordinator::on_chain::{generate_client_sig, ws_connect, OnChainCoordinator};
+use stoffel_mpc_coordinator::tests::fake_coord::{
+    on_chain::{FakeNodeRPCClient, FakeNodeRPCServer, FakeOnChainCoordinator},
+    FakeShareType, FakeShareValueType, FakeValueType,
+};
+use stoffel_mpc_coordinator::ShareBound;
 use stoffel_mpc_coordinator::{Coordinator, Round};
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
@@ -76,10 +76,12 @@ async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
     let client_to_index = coords[0].wait_for_indices(1).await.unwrap();
     assert_eq!(client_to_index.len(), 1);
     assert!(client_to_index.contains_key(&client_addr));
-    for (c, i) in client_to_index {
-        println!("NODE: client {:?} reserved index {:?}", c, i);
-        for node_rpc in node_rpcs.iter_mut() {
-            node_rpc.add_reserved_index(c, i).await.unwrap();
+    for (c, indices) in client_to_index {
+        for i in indices {
+            println!("NODE: client {:?} reserved index {:?}", c, i);
+            for node_rpc in node_rpcs.iter_mut() {
+                node_rpc.add_reserved_index(c, i).await.unwrap();
+            }
         }
     }
     coords[0]
@@ -92,17 +94,8 @@ async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
         .await
         .unwrap();
     for (c, masked_inputs) in client_to_masked_input {
-        for masked_input in masked_inputs {
-            #[cfg(not(feature = "avss"))]
-            println!(
-                "NODE: client {:?} submitted masked input {}",
-                c, masked_input.share[0]
-            );
-            #[cfg(feature = "avss")]
-            println!(
-                "NODE: client {:?} submitted masked input {}",
-                c, masked_input.feldmanshare.share[0]
-            );
+        for _masked_input in masked_inputs {
+            println!("NODE: client {:?} submitted masked input", c);
         }
     }
     coords[0].trigger_round(Round::MPCExecution).await.unwrap();
@@ -178,12 +171,12 @@ async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
 pub async fn coord_creation_block() {
     let anvil = spawn_anvil();
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
-    let t = 1;
-    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
-    let hash = FixedBytes::from_str(
-        "0000000000000000000000000000000000000000000000000000000000000000",
-    )
-    .expect("invalid hash");
+    let t = 1u64;
+    let threshold =
+        U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
+    let hash =
+        FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            .expect("invalid hash");
     let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
     let n_inputs = U256::from(1);
 
@@ -194,7 +187,7 @@ pub async fn coord_creation_block() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![],
-        threshold
+        threshold,
     )
     .await
     .expect("deployment failed");
@@ -210,7 +203,8 @@ pub async fn event_listening() {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
-        let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
+        let threshold =
+            U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -225,12 +219,11 @@ pub async fn event_listening() {
             initial_mpc_nodes.clone(),
             n_inputs,
             vec![],
-            U256::from(threshold)
+            U256::from(threshold),
         )
         .await
         .expect("deployment failed");
-        let coord_instance =
-            StoffelCoordinator::new(*fake_instance.address(), provider.clone());
+        let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
         let coord = FakeOnChainCoordinator::new(coord_instance, t, 1, None).await;
 
         coord.trigger_round(Round::Preprocessing).await.unwrap();
@@ -242,7 +235,8 @@ pub async fn event_listening() {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
-        let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
+        let threshold =
+            U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -257,12 +251,11 @@ pub async fn event_listening() {
             initial_mpc_nodes.clone(),
             n_inputs,
             vec![],
-            U256::from(threshold)
+            U256::from(threshold),
         )
         .await
         .expect("deployment failed");
-        let coord_instance =
-            StoffelCoordinator::new(*fake_instance.address(), provider.clone());
+        let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
         let coord = FakeOnChainCoordinator::new(coord_instance, t, 1, None).await;
 
         tokio::spawn({
@@ -296,11 +289,10 @@ pub async fn start_node_rpc() {
     let anvil = spawn_anvil();
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
     let t = 1;
-    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
-    let hash = FixedBytes::from_str(
-        "0000000000000000000000000000000000000000000000000000000000000000",
-    )
-    .expect("invalid hash");
+    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t));
+    let hash =
+        FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            .expect("invalid hash");
     let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
     let n_inputs = U256::from(1);
 
@@ -311,7 +303,7 @@ pub async fn start_node_rpc() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![],
-        threshold
+        threshold,
     )
     .await
     .expect("deployment failed");
@@ -361,10 +353,9 @@ pub async fn end_to_end() {
         .map(|i| ("127.0.0.1".to_string(), 12351u16 + i as u16))
         .collect();
     let anvil = spawn_anvil();
-    let hash = FixedBytes::from_str(
-        "0000000000000000000000000000000000000000000000000000000000000000",
-    )
-    .expect("invalid hash");
+    let hash =
+        FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            .expect("invalid hash");
     let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
     let n_inputs = U256::from(1);
 
@@ -376,30 +367,28 @@ pub async fn end_to_end() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![ACC[5]],
-        U256::from(n_nodes)
+        U256::from(n_nodes),
     )
     .await
     .expect("deployment failed");
 
     let mut instances = Vec::new();
-    for i in 0..n_nodes {
-        let p = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
+    for sk in SK.iter().take(n_nodes) {
+        let p = ws_connect(&anvil.ws_endpoint(), sk).await;
         instances.push(StoffelCoordinatorInstance::new(*contract.address(), p));
     }
 
     let mut coords = Vec::new();
-    for i in 0..n_nodes {
-        coords.push(FakeOnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
+    for instance in instances.iter().take(n_nodes) {
+        coords.push(FakeOnChainCoordinator::new(instance.clone(), 1, 1, None).await);
     }
 
     let mut rng = test_rng();
     let ids = sample_ids(n);
     let mask_shares =
-        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
-            .unwrap();
+        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
     let output_shares =
-        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
-            .unwrap();
+        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
 
     let mut node_rpcs = Vec::new();
     for i in 0..n_nodes {
@@ -471,10 +460,9 @@ pub async fn reset_and_rerun() {
         .map(|i| ("127.0.0.1".to_string(), 12354u16 + i as u16))
         .collect();
     let anvil = spawn_anvil();
-    let hash = FixedBytes::from_str(
-        "0000000000000000000000000000000000000000000000000000000000000000",
-    )
-    .expect("invalid hash");
+    let hash =
+        FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            .expect("invalid hash");
     let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
     let n_inputs = U256::from(1);
 
@@ -486,20 +474,20 @@ pub async fn reset_and_rerun() {
         initial_mpc_nodes.clone(),
         n_inputs,
         vec![ACC[5]],
-        U256::from(n_nodes)
+        U256::from(n_nodes),
     )
     .await
     .expect("deployment failed");
 
     let mut instances = Vec::new();
-    for i in 0..n_nodes {
-        let p = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
+    for sk in SK.iter().take(n_nodes) {
+        let p = ws_connect(&anvil.ws_endpoint(), sk).await;
         instances.push(StoffelCoordinatorInstance::new(*contract.address(), p));
     }
 
     let mut coords = Vec::new();
-    for i in 0..n_nodes {
-        coords.push(OnChainCoordinator::new(instances[i].clone(), 1, 1, None).await);
+    for instance in instances.iter().take(n_nodes) {
+        coords.push(OnChainCoordinator::new(instance.clone(), 1, 1, None).await);
     }
 
     let mut rng = test_rng();
@@ -535,11 +523,9 @@ pub async fn reset_and_rerun() {
     // Round 1
     let ids = sample_ids(n);
     let mask_shares =
-        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
-            .unwrap();
+        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
     let output_shares =
-        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
-            .unwrap();
+        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
     tokio::join!(
         run_node_round(
             &mut coords,
@@ -572,11 +558,9 @@ pub async fn reset_and_rerun() {
     // Round 2
     let ids = sample_ids(n);
     let mask_shares2 =
-        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
-            .unwrap();
+        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
     let output_shares2 =
-        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
-            .unwrap();
+        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
     tokio::join!(
         run_node_round(
             &mut coords,

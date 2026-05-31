@@ -15,9 +15,6 @@ path = "src/tests/run-coord/bin/main.rs"
 name = "generate-ids"
 path = "src/tests/generate-ids/bin/main.rs"
 
-[features]
-avss = []
-
 [dependencies]
 stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "dev" }
 stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
@@ -31,6 +28,7 @@ ark-bls12-381 = "0.5.0"
 downcast-rs = "2.0.2"
 jsonrpsee = { version = "0.26.0", features = ["full"] }
 serde = "1.0.228"
+stoffel-vm-types = { path = "../StoffelVM/crates/stoffel-vm-types" }
 dyn-clone = "1.0.20"
 ark-ff = "0.5.0"
 ark-ec = "0.5.0"

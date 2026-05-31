@@ -1,5 +1,5 @@
 use crate::{self_signed_certs, CoordinatorError};
-use ark_serialize::{Compress, Validate, CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use jsonrpsee::{
@@ -128,9 +128,12 @@ pub async fn start_coord<T: RPCServerConnection>(
                 };
 
                 let public_key = match X509Certificate::from_der(&cert_der) {
-                    Ok((_remainder, parsed_cert)) => {
-                        parsed_cert.public_key().subject_public_key.data.as_ref().to_vec()
-                    }
+                    Ok((_remainder, parsed_cert)) => parsed_cert
+                        .public_key()
+                        .subject_public_key
+                        .data
+                        .as_ref()
+                        .to_vec(),
                     Err(e) => {
                         tracing::warn!("Failed to parse client X.509 certificate: {}", e);
                         continue;

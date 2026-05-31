@@ -2,16 +2,16 @@ use ark_bls12_381::Fr;
 use ark_std::test_rng;
 use std::sync::Arc;
 use stoffel_mpc_coordinator::self_signed_certs::{client_cert, server_cert};
-use stoffel_mpc_coordinator::Round;
 use stoffel_mpc_coordinator::tests::fake_coord::{
-    FakeShareType, FakeShareValueType,
     off_chain::{
         FakeCoordinatorRPCServerSharedBase, FakeNodeRPCClient, FakeNodeRPCServer,
         FakeOffChainCoordinatorClient, FakeOffChainCoordinatorServer,
-    }
+    },
+    FakeShareType, FakeShareValueType,
 };
-use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffel_mpc_coordinator::Round;
 use stoffel_mpc_coordinator::{Coordinator, ShareBound};
+use stoffelmpc_mpc::common::SecretSharingScheme;
 use tokio::sync::Barrier;
 
 fn sample_ids(n: usize) -> Vec<usize> {
@@ -31,7 +31,8 @@ async fn start_client_server() {
     let addr = "127.0.0.1";
     let port = 12345;
     let t = 1;
-    let server_state = FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+    let server_state =
+        FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
     let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         addr,
@@ -73,16 +74,15 @@ async fn trigger_pp() {
         let t = 1;
         let server_state =
             FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord =
-            FakeOffChainCoordinatorServer::start_coord_from_cert(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert(),
-            )
-            .await
-            .unwrap();
+        let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+            server_state,
+            addr,
+            port,
+            t,
+            server_cert(),
+        )
+        .await
+        .unwrap();
         let timestamp = coord.get_timestamp();
 
         let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
@@ -132,16 +132,15 @@ async fn trigger_pp() {
         let t = 1;
         let server_state =
             FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord =
-            FakeOffChainCoordinatorServer::start_coord_from_cert(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert(),
-            )
-            .await
-            .unwrap();
+        let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+            server_state,
+            addr,
+            port,
+            t,
+            server_cert(),
+        )
+        .await
+        .unwrap();
         let timestamp = coord.get_timestamp();
         let barrier = Arc::new(Barrier::new(2));
 
@@ -234,14 +233,14 @@ async fn end_to_end() {
         let barrier = barrier.clone();
 
         let mut coords: Vec<FakeOffChainCoordinatorClient> = Vec::new();
-        for i in 0..n_nodes {
+        for cert in certs.iter().take(n_nodes) {
             let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
                 timestamp,
                 1,
                 1,
-                certs[i].clone(),
+                cert.clone(),
             )
             .await
             .unwrap();
@@ -298,12 +297,14 @@ async fn end_to_end() {
                 .await
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
-            for (c, i) in &client_to_indices {
-                println!("NODE: client {:?} reserved index {:?}", c, i);
-                for node_rpc in node_rpcs.iter_mut() {
-                    // just received by one node here, but in reality would be received by
-                    // all nodes, so we simulate this here for more nodes
-                    node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+            for (c, indices) in &client_to_indices {
+                for i in indices {
+                    println!("NODE: client {:?} reserved index {:?}", c, i);
+                    for node_rpc in node_rpcs.iter_mut() {
+                        // just received by one node here, but in reality would be received by
+                        // all nodes, so we simulate this here for more nodes
+                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+                    }
                 }
             }
 
@@ -320,22 +321,16 @@ async fn end_to_end() {
                 .await
                 .unwrap();
             for (c, masked_inputs) in client_to_masked_input {
-                for masked_input in masked_inputs {
-                    #[cfg(not(feature = "avss"))]
-                    println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.share[0]
-                    );
-                    #[cfg(feature = "avss")]
-                    println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.feldmanshare.share[0]
-                    );
+                for _masked_input in masked_inputs {
+                    println!("NODE: client {:?} submitted masked input", c);
                 }
             }
             coords[0].trigger_round(Round::MPCExecution).await.unwrap();
             coords[0].wait_for_round(Round::MPCExecution).await.unwrap();
-            coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
+            coords[0]
+                .trigger_round(Round::OutputDistribution)
+                .await
+                .unwrap();
             coords[0]
                 .wait_for_round(Round::OutputDistribution)
                 .await
@@ -468,14 +463,14 @@ async fn end_to_end_fake_coord() {
         let barrier = barrier.clone();
 
         let mut coords = Vec::new();
-        for i in 0..n_nodes {
+        for cert in certs.iter().take(n_nodes) {
             let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
                 timestamp,
                 1,
                 1,
-                certs[i].clone(),
+                cert.clone(),
             )
             .await
             .unwrap();
@@ -522,12 +517,14 @@ async fn end_to_end_fake_coord() {
                 .await
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
-            for (c, i) in &client_to_indices {
-                println!("NODE: client {:?} reserved index {:?}", c, i);
-                for node_rpc in node_rpcs.iter_mut() {
-                    // just received by one node here, but in reality would be received by
-                    // all nodes, so we simulate this here for more nodes
-                    node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+            for (c, indices) in &client_to_indices {
+                for i in indices {
+                    println!("NODE: client {:?} reserved index {:?}", c, i);
+                    for node_rpc in node_rpcs.iter_mut() {
+                        // just received by one node here, but in reality would be received by
+                        // all nodes, so we simulate this here for more nodes
+                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+                    }
                 }
             }
 
@@ -541,17 +538,8 @@ async fn end_to_end_fake_coord() {
                 .await
                 .unwrap();
             for (c, masked_inputs) in client_to_masked_input {
-                for masked_input in masked_inputs {
-                    #[cfg(not(feature = "avss"))]
-                    println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.share[0]
-                    );
-                    #[cfg(feature = "avss")]
-                    println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.feldmanshare.share[0]
-                    );
+                for _masked_input in masked_inputs {
+                    println!("NODE: client {:?} submitted masked input", c);
                 }
             }
             coords[0].start_mpc().await.unwrap();

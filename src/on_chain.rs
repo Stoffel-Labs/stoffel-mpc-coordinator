@@ -93,8 +93,6 @@ pub mod node_rpc {
     pub struct NodeRPCServer<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
         pub(super) rpc_server: Arc<Mutex<NodeRPCServerShared<P, F, S>>>,
         addr: String,
-        port: u16,
-        server_handle: JoinHandle<()>,
     }
 
     /// Exterior representation of an RPC client that interfaces with the node-side RPC interface.
@@ -129,20 +127,19 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Self {
-            let node_rpcs: Vec<Client> = futures_util::future::join_all(
-                addrs.iter().map(|(addr, port)| {
+            let node_rpcs: Vec<Client> =
+                futures_util::future::join_all(addrs.iter().map(|(addr, port)| {
                     crate::self_signed_certs::setup_client(
                         addr,
                         *port,
                         cert_der.clone(),
                         key_der.clone(),
                     )
-                }),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("failed to connect to node RPC");
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to connect to node RPC");
 
             Self {
                 node_rpcs,
@@ -230,7 +227,7 @@ pub mod node_rpc {
             )
             .expect("base nonce does not fit in u64");
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord, base_nonce)));
-            let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(
+            crate::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(
                 addr,
                 port,
                 cert_der,
@@ -242,8 +239,6 @@ pub mod node_rpc {
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
-                port,
-                server_handle,
             }
         }
 
@@ -845,9 +840,9 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
 
     async fn wait_for_indices(
         &self,
-        n_clients: u64,
-    ) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
-        let mut addr_to_i = HashMap::new();
+        n_inputs: u64,
+    ) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
+        let mut addr_to_i: HashMap<ClientIdentity, Vec<u64>> = HashMap::new();
 
         // spawn thread to receive all ReservedInputEvents
         let mut events = self
@@ -867,15 +862,15 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
             _,
         ))) = events.next().await
         {
-            addr_to_i.insert(
-                client,
-                u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"),
-            );
+            addr_to_i
+                .entry(client)
+                .or_default()
+                .push(u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"));
             eprintln!(
                 "[party] Recorded reserved mask index {} for client address {:?}",
                 reservedIndex, client
             );
-            if addr_to_i.len() as u64 == n_clients {
+            if addr_to_i.values().map(Vec::len).sum::<usize>() as u64 == n_inputs {
                 break;
             }
         }
@@ -885,7 +880,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
 
     async fn wait_for_inputs(
         &self,
-        n_clients: u64,
+        n_inputs: u64,
         mask_shares: Vec<S>,
     ) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
         let mut events = match self
@@ -904,8 +899,8 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
             }
         };
 
-        let mut inputs: HashMap<ClientIdentity, Vec<S>> = HashMap::new();
-        for _ in 0..n_clients {
+        let mut inputs: HashMap<ClientIdentity, Vec<(u64, S)>> = HashMap::new();
+        for _ in 0..n_inputs {
             match events.next().await {
                 Some(Ok((
                     StoffelCoordinator::MaskedInputEvent {
@@ -925,7 +920,10 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                     let input = S::compute_masked_input(masked_input_value, mask_share)
                         .map_err(|_| CoordinatorError::ShareError)?;
 
-                    inputs.insert(client, vec![input]);
+                    inputs.entry(client).or_default().push((
+                        u256_to_u64(reservedIndex).ok_or(CoordinatorError::U256ToU64Error)?,
+                        input,
+                    ));
                 }
                 _ => {
                     return Err(CoordinatorError::EthereumError(
@@ -935,7 +933,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                 }
             }
         }
-        Ok(inputs)
+        Ok(inputs
+            .into_iter()
+            .map(|(client, mut indexed_inputs)| {
+                indexed_inputs.sort_by_key(|(reserved_index, _)| *reserved_index);
+                let inputs = indexed_inputs
+                    .into_iter()
+                    .map(|(_, input)| input)
+                    .collect::<Vec<_>>();
+                (client, inputs)
+            })
+            .collect())
     }
 
     async fn wait_for_round(&self, round: Round) -> Result<(), CoordinatorError> {
