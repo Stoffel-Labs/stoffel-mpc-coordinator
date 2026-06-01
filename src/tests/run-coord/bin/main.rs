@@ -158,9 +158,9 @@ async fn main() {
         cert_files
             .iter()
             .map(|cert_file| {
-                let cert_der = fs::read(cert_file).expect("could not read certificate file");
+                let cert_der = fs::read(cert_file).expect(&format!("could not read certificate file {cert_file}"));
                 let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
-                    .expect("Failed to parse X.509 certificate DER");
+                    .expect(&format!("Failed to parse X.509 certificate DER {cert_file}"));
                 parsed_cert
                     .public_key()
                     .subject_public_key
