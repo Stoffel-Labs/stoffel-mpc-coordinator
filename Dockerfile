@@ -1,7 +1,5 @@
 # syntax=docker/dockerfile:1.4
 
-ARG IDS_PATH="ids"
-
 FROM rustlang/rust:nightly-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -20,6 +18,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 
+ARG IDS_PATH="ids"
+
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
@@ -29,6 +29,6 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=builder /build/target/release/run-coord /app/run-coord
-COPY ${IDS_PATH} /app/ids
+COPY $IDS_PATH /app/ids
 
 ENTRYPOINT ["/app/run-coord"]
