@@ -1296,19 +1296,6 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
             ));
         }
 
-        if !matches!(d.round, Round::Idle | Round::ProgramFinished) {
-            return Err(ErrorObjectOwned::owned(
-                ErrorCode::ServerError(WrongRound as i32).code(),
-                format!(
-                    "Need round {:?} or {:?}, current round is {:?}",
-                    Round::Idle,
-                    Round::ProgramFinished,
-                    d.round
-                ),
-                None::<()>,
-            ));
-        }
-
         let n_inputs = d.masked_inputs.len();
 
         d.round = Round::Idle;
