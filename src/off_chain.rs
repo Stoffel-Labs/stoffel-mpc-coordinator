@@ -1747,23 +1747,21 @@ impl<F: FftField, S: ShareBound<F>> crate::rpc::RPCServerConnection
 
 /// The exterior wrapper of the server-side coordinator.
 pub struct OffChainCoordinatorServer<C: crate::rpc::RPCServerConnection> {
-    addr: Option<String>,
-    _port: Option<u16>,
-    timestamp: Option<u64>,
-    _server_handle: Option<JoinHandle<()>>,
-    _marker: std::marker::PhantomData<C>,
+    rpc_server: Arc<Mutex<C::Internal>>,
+    addr: String,
+    port: u16,
+    server_handle: JoinHandle<()>,
+    timestamp: u64,
+    t: u64,
 }
 
-/// The exterior wrapper of the coordinator, which implements the `Coordinator` trait.
-/// Can be used by either an RPC client (MPC node or MPC client) or the RPC server (the
-/// coordinator). Therefore, some values are optional.
 pub struct OffChainCoordinatorClient<F: FftField, S: ShareBound<F>> {
-    rpc_coord: Option<Client>,
-    timestamp: Option<u64>,
+    rpc_coord: Client,
+    timestamp: u64,
     t: u64,
-    n_parties: Option<u64>,
-    n_outputs: Option<u64>,
-    key_der: Option<Vec<u8>>,
+    n_parties: u64,
+    n_outputs: u64,
+    key_der: Vec<u8>,
     _phantom: std::marker::PhantomData<(F, S)>,
 }
 
@@ -1799,25 +1797,24 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
             crate::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone())
                 .await?;
         Ok(Self {
-            addr: Some(String::from(addr)),
-            _port: Some(port),
-            timestamp: Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            ),
-            _server_handle: Some(server_handle),
-            _marker: std::marker::PhantomData,
+            rpc_server: rpc_server_data,
+            addr: String::from(addr),
+            port,
+            server_handle,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            t,
         })
     }
 
     pub fn get_addr(&self) -> String {
-        self.addr.clone().expect("Coordinator server not started")
+        self.addr.clone()
     }
 
     pub fn get_timestamp(&self) -> u64 {
-        self.timestamp.expect("Coordinator server not started")
+        self.timestamp
     }
 }
 
@@ -1880,12 +1877,12 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
             crate::self_signed_certs::setup_client(addr, port, cert_der, key_der.clone()).await?;
 
         Ok(Self {
-            rpc_coord: Some(rpc_coord),
-            timestamp: Some(timestamp),
+            rpc_coord,
+            timestamp,
             t,
-            n_parties: Some(n_parties),
-            n_outputs: Some(n_outputs),
-            key_der: Some(key_der),
+            n_parties,
+            n_outputs,
+            key_der,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -1899,11 +1896,11 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     }
 
     pub fn get_timestamp(&self) -> u64 {
-        self.timestamp.expect("Coordinator server not started")
+        self.timestamp
     }
 
     fn rpc(&self) -> &Client {
-        self.rpc_coord.as_ref().expect("client not started")
+        &self.rpc_coord
     }
 }
 
@@ -2080,7 +2077,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
         // Parse the secret key for decryption.
         let client_sk = {
-            let der_bytes = self.key_der.clone().unwrap();
+            let der_bytes = self.key_der.clone();
             let parsed_secret_key = SecretKey::from_pkcs8_der(&der_bytes)
                 .map_err(|_| CoordinatorError::ParsingDERAsPKCS8Failed)?;
             let raw_sk = parsed_secret_key.to_bytes();
@@ -2117,7 +2114,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                     CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice())
                         .map_err(|_| CoordinatorError::DeserializationError)?;
 
-                if shares.len() as u64 != self.n_outputs.unwrap() {
+                if shares.len() as u64 != self.n_outputs {
                     println!("Some node sent an invalid number of output shares, ignoring.");
                     continue;
                 }
@@ -2125,7 +2122,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                 output_shares.push(shares);
             }
 
-            let outputs: Vec<_> = (0..self.n_outputs.unwrap() as usize)
+            let outputs: Vec<_> = (0..self.n_outputs as usize)
                 .filter_map(|i| {
                     // shares for the ith output
                     let shares_i: Vec<_> = output_shares
@@ -2152,7 +2149,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                 .collect();
 
             // Once all outputs have successfully been reconstructed, return them.
-            if outputs.len() == self.n_outputs.unwrap() as usize {
+            if outputs.len() == self.n_outputs as usize {
                 return Ok(outputs);
             }
         }
