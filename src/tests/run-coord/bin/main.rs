@@ -131,10 +131,7 @@ async fn run_coord<C>(
     )
     .await
     .expect("failed to start coordinator");
-    let timestamp = coord.get_timestamp();
-
     println!("Listening on {}:{}", addr, port);
-    println!("Timestamp: {}", timestamp);
 
     tokio::time::sleep(tokio::time::Duration::MAX).await;
 }
@@ -267,6 +264,10 @@ async fn main() {
             .await;
         }
     }
+
+    println!("Listening on {}:{}", addr, port);
+
+    tokio::time::sleep(tokio::time::Duration::MAX).await;
 }
 
 #[cfg(test)]

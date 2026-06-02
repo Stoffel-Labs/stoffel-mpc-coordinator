@@ -26,7 +26,6 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use CoordinatorRPCBaseError::*;
@@ -804,19 +803,19 @@ pub trait StoffelCoordinatorRPC {
 pub trait CoordinatorRPCBase<F: FftField, S: ShareBound<F>> {
     /// Wait for round `round` to be started.
     #[subscription(name = "sub_round", unsubscribe = "unsub_round", item = Event<S::ValueType>)]
-    async fn sub_round(&self, round: Round, timestamp: u64) -> SubscriptionResult;
+    async fn sub_round(&self, round: Round) -> SubscriptionResult;
 
     #[subscription(name = "sub_reserved_indices", unsubscribe = "unsub_reserved_indices", item = Event<S::ValueType>)]
-    async fn sub_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
+    async fn sub_reserved_indices(&self) -> SubscriptionResult;
 
     #[subscription(name = "sub_masked_inputs", unsubscribe = "unsub_masked_inputs", item = Event<S::ValueType>)]
-    async fn sub_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
+    async fn sub_masked_inputs(&self) -> SubscriptionResult;
 
     #[subscription(name = "sub_assigned_reserved_indices", unsubscribe = "unsub_assigned_reserved_indices", item = AssignedMaskReservation)]
-    async fn sub_assigned_reserved_indices(&self, timestamp: u64) -> SubscriptionResult;
+    async fn sub_assigned_reserved_indices(&self) -> SubscriptionResult;
 
     #[subscription(name = "sub_assigned_masked_inputs", unsubscribe = "unsub_assigned_masked_inputs", item = AssignedMaskedInputEvent<S::ValueType>)]
-    async fn sub_assigned_masked_inputs(&self, timestamp: u64) -> SubscriptionResult;
+    async fn sub_assigned_masked_inputs(&self) -> SubscriptionResult;
 
     /// Returns the number of available input masks left. TODO: this involves a race condition
     /// since querying this and reserving an index is not atomic. remove it?
@@ -891,16 +890,14 @@ pub struct CoordinatorRPCServerConnectionBase<F: FftField, S: ShareBound<F>> {
 pub struct CoordinatorRPCServerSharedBase<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
     // Contains the sinks of clients, which subscribed to the transition to the given round.
     sinks: HashMap<Round, Vec<SubscriptionSink>>,
-    // Stores events that some round has been triggered along with a timestamp when it was
-    // triggered.
-    trans_events: HashMap<Round, Vec<(u64, Event<T>)>>,
-    reserved_index_events: Vec<(u64, Event<T>)>,
+    trans_events: HashMap<Round, Vec<Event<T>>>,
+    reserved_index_events: Vec<Event<T>>,
     reserved_index_sinks: Vec<SubscriptionSink>,
-    assigned_reserved_index_events: Vec<(u64, AssignedMaskReservation)>,
+    assigned_reserved_index_events: Vec<AssignedMaskReservation>,
     assigned_reserved_index_sinks: Vec<SubscriptionSink>,
-    masked_input_events: Vec<(u64, Event<T>)>,
+    masked_input_events: Vec<Event<T>>,
     masked_input_sinks: Vec<SubscriptionSink>,
-    assigned_masked_input_events: Vec<(u64, AssignedMaskedInputEvent<T>)>,
+    assigned_masked_input_events: Vec<AssignedMaskedInputEvent<T>>,
     assigned_masked_input_sinks: Vec<SubscriptionSink>,
     n_reserved: u64,
     reserved_indices: Vec<Option<ClientIdentity>>,
@@ -1052,31 +1049,18 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
     async fn subscribe_oneshot(
         &mut self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
         round: Round,
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
 
         {
             let events = &self.trans_events[&round];
-            let index = events.partition_point(|e| e.0 < timestamp);
 
-            // check if there is an event since the coordinator was reset the last time
-            if index != events.len() {
-                let event = events[index].1.clone();
-                let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            if let Some(event) = events.last() {
+                let json = to_json_raw_value(event).expect("failed convert to JSON");
                 sink.send(json).await?;
 
                 return Ok(());
-            }
-
-            if round_reached(self.round, round) {
-                if let Some((_, event)) = events.last() {
-                    let json = to_json_raw_value(event).expect("failed convert to JSON");
-                    sink.send(json).await?;
-
-                    return Ok(());
-                }
             }
         }
 
@@ -1090,17 +1074,11 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
     async fn subscribe_reserved_indices(
         &mut self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
 
-        let events = &self.reserved_index_events;
-        let index = events.partition_point(|e| e.0 < timestamp);
-
-        // check if there are events since the coordinator was reset the last time
-        if index != events.len() {
-            // send all such events
-            for (_, event) in events.iter().skip(index) {
+        if !self.reserved_index_events.is_empty() {
+            for event in &self.reserved_index_events {
                 let json = to_json_raw_value(event).expect("failed convert to JSON");
                 sink.send(json).await?;
             }
@@ -1113,17 +1091,11 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
     async fn subscribe_masked_inputs(
         &mut self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
 
-        let events = &self.masked_input_events;
-        let index = events.partition_point(|e| e.0 < timestamp);
-
-        // check if there are events since the coordinator was reset the last time
-        if index != events.len() {
-            // send all such events
-            for (_, event) in events.iter().skip(index) {
+        if !self.masked_input_events.is_empty() {
+            for event in &self.masked_input_events {
                 let json = to_json_raw_value(event).expect("failed convert to JSON");
                 sink.send(json).await?;
             }
@@ -1136,13 +1108,10 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
     async fn subscribe_assigned_reserved_indices(
         &mut self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
 
-        let events = &self.assigned_reserved_index_events;
-        let index = events.partition_point(|e| e.0 < timestamp);
-        for (_, event) in events.iter().skip(index) {
+        for event in &self.assigned_reserved_index_events {
             let json = to_json_raw_value(event).expect("failed convert to JSON");
             sink.send(json).await?;
         }
@@ -1154,13 +1123,10 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
     async fn subscribe_assigned_masked_inputs(
         &mut self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
 
-        let events = &self.assigned_masked_input_events;
-        let index = events.partition_point(|e| e.0 < timestamp);
-        for (_, event) in events.iter().skip(index) {
+        for event in &self.assigned_masked_input_events {
             let json = to_json_raw_value(event).expect("failed convert to JSON");
             sink.send(json).await?;
         }
@@ -1185,14 +1151,8 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         // Late subscribers will replay this event from history.
         self.trans_events
             .get_mut(&round)
-            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round))
-            .push((
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                event.clone(),
-            ));
+            .expect(&format!("BUG: {:?} must be present!", round))
+            .push(event.clone());
 
         self.round = round;
 
@@ -1249,11 +1209,10 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         &self,
         pending: PendingSubscriptionSink,
         round: Round,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
-        d.subscribe_oneshot(pending, timestamp, round).await
+        d.subscribe_oneshot(pending, round).await
     }
 
     async fn available_input_masks(&self) -> RpcResult<u64> {
@@ -1265,20 +1224,17 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
     async fn sub_assigned_reserved_indices(
         &self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let mut d = self.d.lock().await;
-        d.subscribe_assigned_reserved_indices(pending, timestamp)
-            .await
+        d.subscribe_assigned_reserved_indices(pending).await
     }
 
     async fn sub_assigned_masked_inputs(
         &self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let mut d = self.d.lock().await;
-        d.subscribe_assigned_masked_inputs(pending, timestamp).await
+        d.subscribe_assigned_masked_inputs(pending).await
     }
 
     async fn reset(&self) -> RpcResult<()> {
@@ -1391,21 +1347,9 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
                             input_ordinal: slot.label,
                             masked_input: masked_input_for_assigned,
                         });
-                d.masked_input_events.push((
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    event.clone(),
-                ));
+                d.masked_input_events.push(event.clone());
                 if let Some(assigned_event) = assigned_event.clone() {
-                    d.assigned_masked_input_events.push((
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        assigned_event.clone(),
-                    ));
+                    d.assigned_masked_input_events.push(assigned_event);
                 }
 
                 let sinks = std::mem::take(&mut d.masked_input_sinks);
@@ -1448,21 +1392,19 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
     async fn sub_reserved_indices(
         &self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
-        d.subscribe_reserved_indices(pending, timestamp).await
+        d.subscribe_reserved_indices(pending).await
     }
 
     async fn sub_masked_inputs(
         &self,
         pending: PendingSubscriptionSink,
-        timestamp: u64,
     ) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
-        d.subscribe_masked_inputs(pending, timestamp).await
+        d.subscribe_masked_inputs(pending).await
     }
 
     async fn reserve_mask_index(&self, i: u64) -> RpcResult<()> {
@@ -1530,21 +1472,10 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         };
 
         d.n_reserved += 1;
-        d.reserved_index_events.push((
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            event.clone(),
-        ));
+        d.reserved_index_events.push(event.clone());
+
         if let Some(assigned_reservation) = assigned_reservation.clone() {
-            d.assigned_reserved_index_events.push((
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                assigned_reservation.clone(),
-            ));
+            d.assigned_reserved_index_events.push(assigned_reservation.clone());
         }
 
         // Broadcast reserved index to all subscribed RPC clients. Disconnected
@@ -1751,13 +1682,11 @@ pub struct OffChainCoordinatorServer<C: crate::rpc::RPCServerConnection> {
     addr: String,
     port: u16,
     server_handle: JoinHandle<()>,
-    timestamp: u64,
     t: u64,
 }
 
 pub struct OffChainCoordinatorClient<F: FftField, S: ShareBound<F>> {
     rpc_coord: Client,
-    timestamp: u64,
     t: u64,
     n_parties: u64,
     n_outputs: u64,
@@ -1788,7 +1717,7 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
         shared: C::Internal,
         addr: &str,
         port: u16,
-        _t: u64,
+        t: u64,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
@@ -1801,10 +1730,6 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
             addr: String::from(addr),
             port,
             server_handle,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
             t,
         })
     }
@@ -1812,17 +1737,12 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
     pub fn get_addr(&self) -> String {
         self.addr.clone()
     }
-
-    pub fn get_timestamp(&self) -> u64 {
-        self.timestamp
-    }
 }
 
 impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     pub async fn start_rpc_client_from_cert(
         addr: &str,
         port: u16,
-        timestamp: u64,
         t: u64,
         n_outputs: u64,
         client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
@@ -1830,7 +1750,6 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         Self::start_rpc_client_with_parties(
             addr,
             port,
-            timestamp,
             t,
             4 * t + 1,
             n_outputs,
@@ -1843,7 +1762,6 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     pub async fn start_rpc_client(
         addr: &str,
         port: u16,
-        timestamp: u64,
         t: u64,
         n_outputs: u64,
         cert_der: Vec<u8>,
@@ -1852,7 +1770,6 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         Self::start_rpc_client_with_parties(
             addr,
             port,
-            timestamp,
             t,
             4 * t + 1,
             n_outputs,
@@ -1866,7 +1783,6 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     pub async fn start_rpc_client_with_parties(
         addr: &str,
         port: u16,
-        timestamp: u64,
         t: u64,
         n_parties: u64,
         n_outputs: u64,
@@ -1878,7 +1794,6 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
 
         Ok(Self {
             rpc_coord,
-            timestamp,
             t,
             n_parties,
             n_outputs,
@@ -1893,10 +1808,6 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         Ok(())
-    }
-
-    pub fn get_timestamp(&self) -> u64 {
-        self.timestamp
     }
 
     fn rpc(&self) -> &Client {
@@ -1951,12 +1862,9 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         n_inputs: u64,
     ) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
         // Wait for reserved index events.
-        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_reserved_indices(
-            self.rpc(),
-            self.get_timestamp(),
-        )
-        .await
-        .unwrap();
+        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_reserved_indices(self.rpc())
+            .await
+            .unwrap();
 
         let mut map: HashMap<ClientIdentity, Vec<u64>> = HashMap::new();
 
@@ -1984,10 +1892,9 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         mask_shares: Vec<S>,
     ) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
         // Wait for masked input events.
-        let mut sub =
-            CoordinatorRPCBaseClient::<F, S>::sub_masked_inputs(self.rpc(), self.get_timestamp())
-                .await
-                .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_masked_inputs(self.rpc())
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         let mut map: HashMap<ClientIdentity, Vec<(u64, S)>> = HashMap::new();
 
@@ -2026,10 +1933,9 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
     }
 
     async fn wait_for_round(&self, round: Round) -> Result<(), CoordinatorError> {
-        let mut sub =
-            CoordinatorRPCBaseClient::<F, S>::sub_round(self.rpc(), round, self.get_timestamp())
-                .await
-                .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_round(self.rpc(), round)
+            .await
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         if let Some(Ok(_)) = sub.next().await {
             Ok(())
@@ -2133,7 +2039,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                     // At least S::min_shares(t) shares are available as checked above.
                     match S::recover_secret(
                         &shares_i,
-                        self.n_parties.unwrap_or(4 * self.t + 1) as usize,
+                        self.n_parties as usize,
                         self.t as usize,
                     ) {
                         Ok((_, output_i)) => Some(output_i),

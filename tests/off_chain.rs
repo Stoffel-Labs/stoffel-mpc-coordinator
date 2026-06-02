@@ -42,12 +42,10 @@ async fn start_client_server() {
     )
     .await
     .unwrap();
-    let timestamp = coord.get_timestamp();
 
     let _ = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
         addr,
         port,
-        timestamp,
         1,
         1,
         client_cert(),
@@ -83,12 +81,10 @@ async fn trigger_pp() {
         )
         .await
         .unwrap();
-        let timestamp = coord.get_timestamp();
 
         let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
-            timestamp,
             1,
             1,
             certs.remove(0),
@@ -98,7 +94,6 @@ async fn trigger_pp() {
         let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
-            timestamp,
             1,
             1,
             certs.remove(0),
@@ -141,13 +136,11 @@ async fn trigger_pp() {
         )
         .await
         .unwrap();
-        let timestamp = coord.get_timestamp();
         let barrier = Arc::new(Barrier::new(2));
 
         let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
-            timestamp,
             1,
             1,
             certs.remove(0),
@@ -157,7 +150,6 @@ async fn trigger_pp() {
         let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
-            timestamp,
             1,
             1,
             certs.remove(0),
@@ -225,7 +217,6 @@ async fn end_to_end() {
     )
     .await
     .unwrap();
-    let timestamp = coord.get_timestamp();
     let barrier = Arc::new(Barrier::new(3));
 
     // MPC node (designated party), also RPC client
@@ -237,7 +228,6 @@ async fn end_to_end() {
             let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
-                timestamp,
                 1,
                 1,
                 cert.clone(),
@@ -364,7 +354,6 @@ async fn end_to_end() {
         let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
             coord_addr,
             coord_port,
-            timestamp,
             1,
             1,
             cert.clone(),
@@ -458,7 +447,6 @@ async fn end_to_end_fake_coord() {
     )
     .await
     .unwrap();
-    let timestamp = coord.get_timestamp();
     let barrier = Arc::new(Barrier::new(3));
 
     // MPC node (designated party), also RPC client
@@ -470,7 +458,6 @@ async fn end_to_end_fake_coord() {
             let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
-                timestamp,
                 1,
                 1,
                 cert.clone(),
@@ -578,7 +565,6 @@ async fn end_to_end_fake_coord() {
         let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
             coord_addr,
             coord_port,
-            timestamp,
             1,
             1,
             cert.clone(),
