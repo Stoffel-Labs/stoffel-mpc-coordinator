@@ -29,7 +29,7 @@ use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use stoffel_vm_types::{
-    compiled_binary::{ClientIoManifest, ClientIoSchema},
+    compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend, MpcCurve},
     core_types::ShareType,
 };
 use tokio::sync::Mutex;
@@ -154,9 +154,57 @@ fn share_type_hash_update(ctx: &mut ring::digest::Context, share_type: ShareType
     }
 }
 
-fn compute_schema_hash(schemas: &[BoundClientIoSchema]) -> [u8; 32] {
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+    use ark_bls12_381::Fr;
+
+    #[test]
+    fn coordinator_state_reads_backend_and_curve_from_client_io_manifest() {
+        let state = CoordinatorRPCServerSharedBase::<Fr>::new_with_client_io_manifest(
+            [0; 32],
+            5,
+            1,
+            vec![vec![1], vec![2], vec![3], vec![4], vec![5]],
+            ClientIoManifest {
+                mpc_backend: MpcBackend::Avss,
+                mpc_curve: MpcCurve::Ed25519,
+                clients: Vec::new(),
+            },
+            Vec::new(),
+        )
+        .expect("manifest should bind without client schemas");
+
+        assert_eq!(state.manifest_mpc_backend(), MpcBackend::Avss);
+        assert_eq!(state.manifest_mpc_curve(), MpcCurve::Ed25519);
+    }
+}
+
+fn manifest_backend_tag(backend: MpcBackend) -> u8 {
+    match backend {
+        MpcBackend::HoneyBadger => 0,
+        MpcBackend::Avss => 1,
+    }
+}
+
+fn manifest_curve_tag(curve: MpcCurve) -> u8 {
+    match curve {
+        MpcCurve::Bls12_381 => 0,
+        MpcCurve::Bn254 => 1,
+        MpcCurve::Curve25519 => 2,
+        MpcCurve::Ed25519 => 3,
+    }
+}
+
+fn compute_schema_hash(
+    backend: MpcBackend,
+    curve: MpcCurve,
+    schemas: &[BoundClientIoSchema],
+) -> [u8; 32] {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    ctx.update(b"StoffelClientIoManifestV1");
+    ctx.update(b"StoffelClientIoManifestV2");
+    ctx.update(&[manifest_backend_tag(backend)]);
+    ctx.update(&[manifest_curve_tag(curve)]);
     let mut ordered = schemas.to_vec();
     ordered.sort_by_key(|schema| schema.client_slot);
     for schema in ordered {
@@ -183,6 +231,8 @@ fn build_bound_client_io(
     manifest: ClientIoManifest,
     bindings: Vec<(u64, ClientIdentity)>,
 ) -> Result<BoundClientIoBuildResult, CoordinatorError> {
+    let backend = manifest.mpc_backend;
+    let curve = manifest.mpc_curve;
     let mut by_slot: HashMap<u64, ClientIoSchema> = HashMap::new();
     for schema in manifest.clients {
         let client_slot = schema.client_slot;
@@ -217,7 +267,7 @@ fn build_bound_client_io(
         )));
     }
 
-    let schema_hash = compute_schema_hash(&bound_schemas);
+    let schema_hash = compute_schema_hash(backend, curve, &bound_schemas);
     let mut map = HashMap::new();
     let mut input_slots = Vec::new();
     let mut output_clients = Vec::new();
@@ -245,7 +295,7 @@ fn build_bound_client_io(
 
 fn default_bound_schema(client: ClientIdentity) -> BoundClientIoSchema {
     BoundClientIoSchema {
-        schema_hash: compute_schema_hash(&[]),
+        schema_hash: compute_schema_hash(MpcBackend::HoneyBadger, MpcCurve::Bls12_381, &[]),
         client,
         client_slot: 0,
         inputs: vec![],
@@ -558,15 +608,10 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= S::min_shares(self.t) {
-                    match S::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
-                        Ok((_, mask)) => {
-                            return Ok(mask);
-                        }
-                        Err(_) => {
-                            return Err(CoordinatorError::MaskReconstructionFailed(
-                                mask_shares.len(),
-                            ));
-                        }
+                    if let Ok((_, mask)) =
+                        S::recover_secret(&mask_shares, self.node_rpcs.len(), self.t)
+                    {
+                        return Ok(mask);
                     }
                 }
             }
@@ -624,13 +669,15 @@ pub mod node_rpc {
                     mask_shares.push(share);
 
                     if mask_shares.len() >= S::min_shares(self.t) {
-                        let metadata = first_metadata.expect("metadata set with first share");
-                        let (_, mask) = S::recover_secret(&mask_shares, 4 * self.t + 1, self.t)
-                            .map_err(|_| {
-                                CoordinatorError::MaskReconstructionFailed(mask_shares.len())
-                            })?;
-                        outputs.push((metadata, mask));
-                        break;
+                        let metadata = first_metadata
+                            .clone()
+                            .expect("metadata set with first share");
+                        if let Ok((_, mask)) =
+                            S::recover_secret(&mask_shares, self.node_rpcs.len(), self.t)
+                        {
+                            outputs.push((metadata, mask));
+                            break;
+                        }
                     }
                 }
 
@@ -1273,6 +1320,8 @@ pub struct CoordinatorRPCServerSharedBase<T: CanonicalSerialize + CanonicalDeser
     /// Client IO schemas bound from VM logical client slots to off-chain identities.
     client_io_schemas: HashMap<ClientIdentity, BoundClientIoSchema>,
     typed_input_slots: Vec<InputSlotSchema>,
+    manifest_mpc_backend: MpcBackend,
+    manifest_mpc_curve: MpcCurve,
 }
 
 impl<F: FftField, S: ShareBound<F>> CoordinatorRPCServerConnectionBase<F, S> {
@@ -1331,6 +1380,8 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
             output_clients,
             client_io_schemas: HashMap::new(),
             typed_input_slots: vec![],
+            manifest_mpc_backend: MpcBackend::HoneyBadger,
+            manifest_mpc_curve: MpcCurve::Bls12_381,
         }
     }
 
@@ -1342,6 +1393,8 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         manifest: ClientIoManifest,
         client_bindings: Vec<(u64, ClientIdentity)>,
     ) -> Result<Self, CoordinatorError> {
+        let manifest_mpc_backend = manifest.mpc_backend;
+        let manifest_mpc_curve = manifest.mpc_curve;
         let (client_io_schemas, typed_input_slots, output_clients) =
             build_bound_client_io(manifest, client_bindings)?;
         let n_inputs = typed_input_slots.len() as u64;
@@ -1383,7 +1436,17 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
             output_clients,
             client_io_schemas,
             typed_input_slots,
+            manifest_mpc_backend,
+            manifest_mpc_curve,
         })
+    }
+
+    pub fn manifest_mpc_backend(&self) -> MpcBackend {
+        self.manifest_mpc_backend
+    }
+
+    pub fn manifest_mpc_curve(&self) -> MpcCurve {
+        self.manifest_mpc_curve
     }
 
     pub fn add_client(&mut self, cert: Vec<u8>, thread: JoinHandle<()>, stop_tx: ServerHandle) {
@@ -2387,6 +2450,7 @@ pub struct OffChainCoordinatorClient<F: FftField, S: ShareBound<F>> {
     rpc_coord: Option<Client>,
     timestamp: Option<u64>,
     t: u64,
+    n_parties: Option<u64>,
     n_outputs: Option<u64>,
     key_der: Option<Vec<u8>>,
     _phantom: std::marker::PhantomData<(F, S)>,
@@ -2455,11 +2519,12 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         n_outputs: u64,
         client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
     ) -> Result<Self, CoordinatorError> {
-        Self::start_rpc_client(
+        Self::start_rpc_client_with_parties(
             addr,
             port,
             timestamp,
             t,
+            4 * t + 1,
             n_outputs,
             client_cert.cert.der().to_vec(),
             client_cert.signing_key.serialize_der(),
@@ -2476,6 +2541,30 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
+        Self::start_rpc_client_with_parties(
+            addr,
+            port,
+            timestamp,
+            t,
+            4 * t + 1,
+            n_outputs,
+            cert_der,
+            key_der,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_rpc_client_with_parties(
+        addr: &str,
+        port: u16,
+        timestamp: u64,
+        t: u64,
+        n_parties: u64,
+        n_outputs: u64,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    ) -> Result<Self, CoordinatorError> {
         let rpc_coord =
             crate::self_signed_certs::setup_client(addr, port, cert_der, key_der.clone()).await?;
 
@@ -2483,6 +2572,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
             rpc_coord: Some(rpc_coord),
             timestamp: Some(timestamp),
             t,
+            n_parties: Some(n_parties),
             n_outputs: Some(n_outputs),
             key_der: Some(key_der),
             _phantom: std::marker::PhantomData,
@@ -2686,9 +2776,11 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
                 if shares_i.len() < S::min_shares(self.t as usize) {
                     continue;
                 }
-                if let Ok((_, output_i)) =
-                    S::recover_secret(&shares_i, (4 * self.t + 1) as usize, self.t as usize)
-                {
+                if let Ok((_, output_i)) = S::recover_secret(
+                    &shares_i,
+                    self.n_parties.unwrap_or(4 * self.t + 1) as usize,
+                    self.t as usize,
+                ) {
                     outputs.push(TypedClearOutput {
                         output_ordinal: ordinal as u64,
                         share_type,
@@ -2935,7 +3027,11 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                         .collect();
 
                     // At least S::min_shares(t) shares are available as checked above.
-                    match S::recover_secret(&shares_i, (4 * self.t + 1) as usize, self.t as usize) {
+                    match S::recover_secret(
+                        &shares_i,
+                        self.n_parties.unwrap_or(4 * self.t + 1) as usize,
+                        self.t as usize,
+                    ) {
                         Ok((_, output_i)) => Some(output_i),
                         Err(_) => {
                             println!(
