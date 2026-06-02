@@ -9,7 +9,7 @@ Deployment derives the program hash, input count, and MPC backend threshold from
 For the off-chain coordinator, generate identities using `./generate-ids ids 2 5` (in the `ids` directory, 2 clients, 5 nodes).
 Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/coord.crt --server-key ids/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/nodes/node0.crt,ids/nodes/node1.crt,ids/nodes/node2.crt,ids/nodes/node3.crt,ids/nodes/node4.crt --output-clients ids/clients/client0.crt,ids/clients/client1.crt`.
 
-For VM-backed typed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
+For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
 
 `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/coord.crt --server-key ids/coord.der --n 5 --t 1 --n-inputs 0 --initial-mpc-nodes ids/nodes/node0.crt,ids/nodes/node1.crt,ids/nodes/node2.crt,ids/nodes/node3.crt,ids/nodes/node4.crt --output-clients ids/clients/client0.crt --program program.stflb --client-bindings 0=ids/clients/client0.crt`
 
@@ -82,7 +82,7 @@ Key behaviors:
 - **Index reservation**: clients call `reserve_mask_index(i)` during `InputMaskReservation`. The event is broadcast to all `sub_reserved_indices` subscribers, including MPC nodes.
 - **Mask-share distribution**: each MPC node runs a `node_rpc::NodeRPCServer`. After learning a client's reserved index from the coordinator, the node delivers its mask share to the client over a dedicated WebSocket subscription authenticated by mTLS. The client collects `2t + 1` shares and reconstructs the mask locally.
 - **Output distribution**: MPC nodes HPKE-encrypt their output shares under the client's P-256 public key and call `send_output_shares`. Once `2t + 1` shares have arrived at the coordinator, they are forwarded to the client's `obtain_output_shares` subscription.
-- **Typed VM IO**: `.stflb` bytecode can carry a client IO manifest built from `ClientStore.take_share*` and client-output calls. Off-chain startup binds VM `client_slot` values to certificate public keys, derives input-mask capacity from the bound input schema, and authorizes output clients from the bound output schema. On-chain contracts/events do not yet carry this schema metadata; equivalent Solidity support is deferred.
+- **Bound VM IO layout**: `.stflb` bytecode can carry a client IO manifest built from `ClientStore.take_share*` and client-output calls. Off-chain startup binds VM `client_slot` values to certificate public keys, derives input-mask capacity from bound input counts, and authorizes output clients from bound output counts. Scalar IO types stay with the SDK/VM manifest and are not interpreted by the coordinator. On-chain contracts/events do not yet carry this layout metadata; equivalent Solidity support is deferred.
 - **Authentication**: all connections use mutual TLS with self-signed certificates. The client's identity is the DER-encoded public key from its certificate, used consistently towards both the coordinator and node RPC servers.
 - **Late-subscriber safety**: subscribers pass the coordinator's startup timestamp so that events fired before the subscription is opened are replayed immediately.
 

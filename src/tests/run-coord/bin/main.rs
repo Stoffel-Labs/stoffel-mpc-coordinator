@@ -1,11 +1,15 @@
 use clap::Parser;
+use std::collections::HashMap;
 use std::fs;
-use stoffel_mpc_coordinator::off_chain::OffChainCoordinatorServer;
+use stoffel_mpc_coordinator::off_chain::{
+    ClientIdentity, InputAssignment, InputSlotAssignment, OffChainCoordinatorServer,
+};
 use stoffel_mpc_coordinator::rpc::RPCServerConnection;
 use stoffel_mpc_coordinator::tests::fake_coord::off_chain::{
     AvssCoordinatorConnection, FakeCoordinatorConnection, FakeCoordinatorRPCServerSharedBase,
 };
-use stoffel_vm_types::compiled_binary::MpcBackend;
+use stoffel_mpc_coordinator::CoordinatorError;
+use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
 
 #[derive(Parser, Debug)]
@@ -43,6 +47,68 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1")]
     addr: String,
+}
+
+type InputAssignmentBuildResult = (InputAssignment, Vec<ClientIdentity>);
+
+fn build_input_assignment(
+    manifest: ClientIoManifest,
+    bindings: Vec<(u64, ClientIdentity)>,
+) -> Result<InputAssignmentBuildResult, CoordinatorError> {
+    let mut by_slot: HashMap<u64, ClientIoSchema> = HashMap::new();
+    for schema in manifest.clients {
+        let client_slot = schema.client_slot;
+        if by_slot.insert(client_slot, schema).is_some() {
+            return Err(CoordinatorError::JSONError(format!(
+                "Duplicate client_slot {client_slot} in client IO manifest"
+            )));
+        }
+    }
+
+    let mut bound_clients = Vec::new();
+    for (client_slot, client) in bindings {
+        let schema = by_slot.remove(&client_slot).ok_or_else(|| {
+            CoordinatorError::JSONError(format!(
+                "No client IO manifest entry for bound client_slot {client_slot}"
+            ))
+        })?;
+        bound_clients.push((
+            client,
+            client_slot,
+            schema.inputs.len() as u64,
+            schema.outputs.len() as u64,
+        ));
+    }
+
+    if !by_slot.is_empty() {
+        let mut unbound_slots = by_slot.keys().copied().collect::<Vec<_>>();
+        unbound_slots.sort_unstable();
+        return Err(CoordinatorError::JSONError(format!(
+            "Client IO manifest slots are not bound to off-chain identities: {unbound_slots:?}"
+        )));
+    }
+
+    let mut seen_clients = std::collections::HashSet::new();
+    let mut input_slots = Vec::new();
+    let mut output_clients = Vec::new();
+    for (client, _client_slot, input_count, output_count) in bound_clients {
+        if !seen_clients.insert(client.clone()) {
+            return Err(CoordinatorError::JSONError(
+                "Client identity is bound to multiple client IO slots".to_string(),
+            ));
+        }
+        if output_count > 0 {
+            output_clients.push(client.clone());
+        }
+        for input_ordinal in 0..input_count {
+            input_slots.push(InputSlotAssignment {
+                client: client.clone(),
+                label: input_ordinal,
+            });
+        }
+    }
+
+    Ok((InputAssignment { input_slots }, output_clients))
 }
 
 async fn run_coord<C>(
@@ -149,18 +215,21 @@ async fn main() {
         } else {
             binding_keys(&args.client_bindings)
         };
-        (
-            mpc_backend,
-            FakeCoordinatorRPCServerSharedBase::new_with_client_io_manifest(
-                hash,
-                n,
-                t,
-                public_keys,
-                binary.client_io_manifest,
-                client_bindings,
-            )
-            .expect("failed to bind client IO manifest"),
+        let (input_assignment, output_clients) =
+            build_input_assignment(binary.client_io_manifest, client_bindings)
+                .expect("failed to bind client IO manifest");
+        let n_inputs = input_assignment.input_slots.len() as u64;
+        let server_state = FakeCoordinatorRPCServerSharedBase::new_with_input_assignment(
+            hash,
+            n,
+            t,
+            public_keys,
+            n_inputs,
+            output_clients,
+            input_assignment,
         )
+        .expect("failed to configure bound client IO");
+        (mpc_backend, server_state)
     } else {
         (
             MpcBackend::HoneyBadger,
@@ -197,5 +266,47 @@ async fn main() {
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stoffel_vm_types::{
+        compiled_binary::{MpcBackend, MpcCurve},
+        core_types::ShareType,
+    };
+
+    #[test]
+    fn input_assignment_ignores_scalar_share_types() {
+        let int_manifest = ClientIoManifest {
+            mpc_backend: MpcBackend::HoneyBadger,
+            mpc_curve: MpcCurve::Bls12_381,
+            clients: vec![ClientIoSchema {
+                client_slot: 0,
+                inputs: vec![ShareType::default_secret_int()],
+                outputs: vec![ShareType::default_secret_int()],
+            }],
+        };
+        let bool_manifest = ClientIoManifest {
+            mpc_backend: MpcBackend::Avss,
+            mpc_curve: MpcCurve::Ed25519,
+            clients: vec![ClientIoSchema {
+                client_slot: 0,
+                inputs: vec![ShareType::try_secret_int(1).expect("valid bool share type")],
+                outputs: vec![ShareType::try_secret_int(1).expect("valid bool share type")],
+            }],
+        };
+
+        let client = vec![7, 8, 9];
+        let (int_layout, int_outputs) =
+            build_input_assignment(int_manifest, vec![(0, client.clone())]).unwrap();
+        let (bool_layout, bool_outputs) =
+            build_input_assignment(bool_manifest, vec![(0, client.clone())]).unwrap();
+
+        assert_eq!(int_layout.input_slots[0].client, client);
+        assert_eq!(int_layout.input_slots[0].label, 0);
+        assert_eq!(int_layout.input_slots.len(), bool_layout.input_slots.len());
+        assert_eq!(int_outputs, bool_outputs);
     }
 }
