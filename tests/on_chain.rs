@@ -94,8 +94,11 @@ async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
         .await
         .unwrap();
     for (c, masked_inputs) in client_to_masked_input {
-        for _masked_input in masked_inputs {
-            println!("NODE: client {:?} submitted masked input", c);
+        for masked_input in masked_inputs {
+            println!(
+                "NODE: client {:?} submitted masked input {:?}",
+                c, masked_input
+            );
         }
     }
     coords[0].trigger_round(Round::MPCExecution).await.unwrap();

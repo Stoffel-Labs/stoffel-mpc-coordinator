@@ -46,9 +46,10 @@ pub mod off_chain {
     pub type FakeOffChainCoordinatorClient = HoneyBadgerOffChainCoordinatorClient;
 
     pub type HoneyBadgerOffChainCoordinatorServer =
-        OffChainCoordinatorServer<FakeCoordinatorConnection>;
+        OffChainCoordinatorServer<HoneyBadgerCoordinatorConnection>;
     pub type AvssOffChainCoordinatorServer = OffChainCoordinatorServer<AvssCoordinatorConnection>;
-    pub type FakeOffChainCoordinatorServer = OffChainCoordinatorServer<FakeCoordinatorConnection>;
+    pub type FakeOffChainCoordinatorServer =
+        OffChainCoordinatorServer<HoneyBadgerCoordinatorConnection>;
     pub type FakeCoordinatorRPCServerSharedBase = CoordinatorRPCServerSharedBase<FakeValueType>;
 
     pub type HoneyBadgerNodeRPCClient =
@@ -63,12 +64,20 @@ pub mod off_chain {
         crate::off_chain::node_rpc::NodeRPCServer<FakeShareValueType, AvssShareType>;
     pub type FakeNodeRPCServer = HoneyBadgerNodeRPCServer;
 
+    pub type HoneyBadgerCoordinatorConnection = CoordinatorConnection<HoneyBadgerShareType>;
+    pub type AvssCoordinatorConnection = CoordinatorConnection<AvssShareType>;
+    pub type FakeCoordinatorConnection = HoneyBadgerCoordinatorConnection;
+
     #[derive(Clone)]
-    pub struct FakeCoordinatorConnection {
-        base: CoordinatorRPCServerConnectionBase<FakeShareValueType, FakeShareType>,
+    pub struct CoordinatorConnection<
+        S: crate::ShareBound<FakeShareValueType, ValueType = FakeShareValueType>,
+    > {
+        base: CoordinatorRPCServerConnectionBase<FakeShareValueType, S>,
     }
 
-    impl crate::rpc::RPCServerConnection for FakeCoordinatorConnection {
+    impl<S: crate::ShareBound<FakeShareValueType, ValueType = FakeShareValueType>>
+        crate::rpc::RPCServerConnection for CoordinatorConnection<S>
+    {
         type Internal = CoordinatorRPCServerSharedBase<FakeValueType>;
 
         fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
@@ -87,57 +96,9 @@ pub mod off_chain {
     }
 
     #[async_trait]
-    impl StoffelCoordinatorRPCServer for FakeCoordinatorConnection {
-        async fn start_preprocessing(&self) -> RpcResult<()> {
-            self.base.transition(Round::Preprocessing).await
-        }
-
-        async fn reserve_input_masks(&self) -> RpcResult<()> {
-            self.base.transition(Round::InputMaskReservation).await
-        }
-
-        async fn collect_inputs(&self) -> RpcResult<()> {
-            self.base.transition(Round::InputCollection).await
-        }
-
-        async fn start_mpc(&self) -> RpcResult<()> {
-            self.base.transition(Round::MPCExecution).await
-        }
-
-        async fn send_output(&self) -> RpcResult<()> {
-            self.base.transition(Round::OutputDistribution).await
-        }
-
-        async fn finalize(&self) -> RpcResult<()> {
-            self.base.transition(Round::ProgramFinished).await
-        }
-    }
-
-    #[derive(Clone)]
-    pub struct AvssCoordinatorConnection {
-        base: CoordinatorRPCServerConnectionBase<FakeShareValueType, AvssShareType>,
-    }
-
-    impl crate::rpc::RPCServerConnection for AvssCoordinatorConnection {
-        type Internal = CoordinatorRPCServerSharedBase<FakeValueType>;
-
-        fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
-            Self {
-                base: CoordinatorRPCServerConnectionBase::new(internal, id),
-            }
-        }
-
-        fn into_rpc(self) -> RpcModule<Self> {
-            let mut rpc = StoffelCoordinatorRPCServer::into_rpc(self.clone());
-            let base_rpc = crate::off_chain::CoordinatorRPCBaseServer::into_rpc(self.base);
-
-            rpc.merge(base_rpc).unwrap();
-            rpc
-        }
-    }
-
-    #[async_trait]
-    impl StoffelCoordinatorRPCServer for AvssCoordinatorConnection {
+    impl<S: crate::ShareBound<FakeShareValueType, ValueType = FakeShareValueType>>
+        StoffelCoordinatorRPCServer for CoordinatorConnection<S>
+    {
         async fn start_preprocessing(&self) -> RpcResult<()> {
             self.base.transition(Round::Preprocessing).await
         }

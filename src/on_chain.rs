@@ -93,6 +93,8 @@ pub mod node_rpc {
     pub struct NodeRPCServer<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
         pub(super) rpc_server: Arc<Mutex<NodeRPCServerShared<P, F, S>>>,
         addr: String,
+        _port: u16,
+        _server_handle: JoinHandle<()>,
     }
 
     /// Exterior representation of an RPC client that interfaces with the node-side RPC interface.
@@ -227,7 +229,7 @@ pub mod node_rpc {
             )
             .expect("base nonce does not fit in u64");
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord, base_nonce)));
-            crate::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(
+            let server_handle = crate::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(
                 addr,
                 port,
                 cert_der,
@@ -239,6 +241,8 @@ pub mod node_rpc {
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
+                _port: port,
+                _server_handle: server_handle,
             }
         }
 

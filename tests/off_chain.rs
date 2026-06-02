@@ -321,8 +321,11 @@ async fn end_to_end() {
                 .await
                 .unwrap();
             for (c, masked_inputs) in client_to_masked_input {
-                for _masked_input in masked_inputs {
-                    println!("NODE: client {:?} submitted masked input", c);
+                for masked_input in masked_inputs {
+                    println!(
+                        "NODE: client {:?} submitted masked input {:?}",
+                        c, masked_input
+                    );
                 }
             }
             coords[0].trigger_round(Round::MPCExecution).await.unwrap();
@@ -538,8 +541,11 @@ async fn end_to_end_fake_coord() {
                 .await
                 .unwrap();
             for (c, masked_inputs) in client_to_masked_input {
-                for _masked_input in masked_inputs {
-                    println!("NODE: client {:?} submitted masked input", c);
+                for masked_input in masked_inputs {
+                    println!(
+                        "NODE: client {:?} submitted masked input {:?}",
+                        c, masked_input
+                    );
                 }
             }
             coords[0].start_mpc().await.unwrap();

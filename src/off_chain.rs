@@ -469,6 +469,8 @@ pub mod node_rpc {
     pub struct NodeRPCServer<F: FftField, S: ShareBound<F>> {
         rpc_server: Arc<Mutex<NodeRPCServerInternal<F, S>>>,
         addr: String,
+        _port: u16,
+        _server_handle: JoinHandle<()>,
     }
 
     /// An object used by an MPC client to connect to the RPC interfaces of many nodes.
@@ -665,7 +667,7 @@ pub mod node_rpc {
             key_der: Vec<u8>,
         ) -> Result<Self, CoordinatorError> {
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new()));
-            crate::rpc::start_coord::<NodeRPCServerImpl<F, S>>(
+            let server_handle = crate::rpc::start_coord::<NodeRPCServerImpl<F, S>>(
                 addr,
                 port,
                 cert_der,
@@ -676,6 +678,8 @@ pub mod node_rpc {
             Ok(Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
+                _port: port,
+                _server_handle: server_handle,
             })
         }
 
@@ -2370,7 +2374,9 @@ impl<F: FftField, S: ShareBound<F>> crate::rpc::RPCServerConnection
 /// The exterior wrapper of the server-side coordinator.
 pub struct OffChainCoordinatorServer<C: crate::rpc::RPCServerConnection> {
     addr: Option<String>,
+    _port: Option<u16>,
     timestamp: Option<u64>,
+    _server_handle: Option<JoinHandle<()>>,
     _marker: std::marker::PhantomData<C>,
 }
 
@@ -2414,16 +2420,19 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
         let rpc_server_data = Arc::new(Mutex::new(shared));
-        crate::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone())
-            .await?;
+        let server_handle =
+            crate::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone())
+                .await?;
         Ok(Self {
             addr: Some(String::from(addr)),
+            _port: Some(port),
             timestamp: Some(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
             ),
+            _server_handle: Some(server_handle),
             _marker: std::marker::PhantomData,
         })
     }
@@ -2883,8 +2892,13 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
         // Try to decrypt and reconstruct outputs until it succeeds.
         while let Some(Ok(enc_output_shares)) = sub.next().await {
-            if enc_output_shares.len() < S::min_shares(self.t as usize) {
-                continue;
+            let min_shares = S::min_shares(self.t as usize);
+            if enc_output_shares.len() < min_shares {
+                return Err(CoordinatorError::SubscriptionError(format!(
+                    "Received {} output shares, but at least {} are required",
+                    enc_output_shares.len(),
+                    min_shares
+                )));
             }
 
             let mut output_shares = Vec::new();
@@ -2920,7 +2934,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                         .map(|shares| shares[i].clone())
                         .collect();
 
-                    // at least 2t+1 shares available as checked previously by the coordinator
+                    // At least S::min_shares(t) shares are available as checked above.
                     match S::recover_secret(&shares_i, (4 * self.t + 1) as usize, self.t as usize) {
                         Ok((_, output_i)) => Some(output_i),
                         Err(_) => {
