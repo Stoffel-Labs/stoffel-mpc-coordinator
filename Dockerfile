@@ -14,7 +14,7 @@ WORKDIR /build
 COPY . /build
 
 WORKDIR /build
-RUN cargo build --release
+RUN cargo build --release && strip target/release/run-coord
 
 FROM debian:bookworm-slim AS runtime
 
