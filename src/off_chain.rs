@@ -1552,6 +1552,15 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
                 .unwrap(),
         };
 
+        #[cfg(feature = "benchmark")]
+        {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            println!("BENCH_ROUND: {:?} ts={}", next_round, ts);
+        }
+
         Ok(())
     }
 

@@ -15,6 +15,9 @@ path = "src/tests/run-coord/bin/main.rs"
 name = "generate-ids"
 path = "src/tests/generate-ids/bin/main.rs"
 
+[features]
+benchmark = []
+
 [dependencies]
 stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "temp/monorepo-network-dep" }
 #stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
