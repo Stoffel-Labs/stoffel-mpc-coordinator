@@ -73,7 +73,6 @@ pub struct AssignedMaskedInputEvent<T: CanonicalSerialize + CanonicalDeserialize
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignedMaskShare {
     pub reserved_index: u64,
-    pub input_ordinal: u64,
     pub share_bytes: Vec<u8>,
 }
 
@@ -128,8 +127,8 @@ pub mod node_rpc {
         #[subscription(name = "sub_receive_mask_share", unsubscribe = "unsub_receive_mask_share", item = Vec<u8>)]
         async fn receive_mask_share(&self) -> SubscriptionResult;
 
-        #[subscription(name = "sub_receive_assigned_mask_share", unsubscribe = "unsub_receive_assigned_mask_share", item = AssignedMaskShare)]
-        async fn receive_assigned_mask_share(&self) -> SubscriptionResult;
+        #[subscription(name = "sub_receive_assigned_mask_shares", unsubscribe = "unsub_receive_assigned_mask_shares", item = Vec<AssignedMaskShare>)]
+        async fn receive_assigned_mask_shares(&self) -> SubscriptionResult;
     }
 
     pub struct NodeRPCServer<F: FftField, S: ShareBound<F>> {
@@ -239,69 +238,83 @@ pub mod node_rpc {
 
         pub async fn receive_assigned_masks(
             &self,
-            count: usize,
         ) -> Result<Vec<(AssignedMaskShare, S::ValueType)>, CoordinatorError> {
-            let mut outputs = Vec::with_capacity(count);
-            for _ in 0..count {
-                let output_count_before = outputs.len();
-                let mut share_futures = JoinSet::new();
+            let mut share_futures = JoinSet::new();
 
-                for rpc in self.node_rpcs.iter() {
-                    let mut sub = rpc
-                        .receive_assigned_mask_share()
-                        .await
-                        .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
-                    share_futures.spawn(async move { sub.next().await });
+            for rpc in self.node_rpcs.iter() {
+                let mut sub = rpc
+                    .receive_assigned_mask_shares()
+                    .await
+                    .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
+                share_futures.spawn(async move { sub.next().await });
+            }
+
+            let mut share_sets: HashMap<u64, (AssignedMaskShare, Vec<S>)> = HashMap::new();
+            let mut expected_indices: Option<Vec<u64>> = None;
+
+            while let Some(share_result) = share_futures.join_next().await {
+                let assigned_shares_option =
+                    share_result.map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
+                let assigned_shares = match assigned_shares_option {
+                    Some(res) => {
+                        res.map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?
+                    }
+                    None => continue,
+                };
+
+                let mut indices = assigned_shares
+                    .iter()
+                    .map(|assigned_share| assigned_share.reserved_index)
+                    .collect::<Vec<_>>();
+                indices.sort_unstable();
+                if let Some(expected_indices) = &expected_indices {
+                    if *expected_indices != indices {
+                        return Err(CoordinatorError::JSONError(
+                            "Assigned mask share indices differ across MPC nodes".to_string(),
+                        ));
+                    }
+                } else {
+                    expected_indices = Some(indices);
                 }
 
-                let mut mask_shares: Vec<S> = Vec::new();
-                let mut first_metadata: Option<AssignedMaskShare> = None;
-
-                while let Some(share_result) = share_futures.join_next().await {
-                    let assigned_share_option = share_result
-                        .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
-                    let assigned_share = match assigned_share_option {
-                        Some(res) => {
-                            res.map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?
-                        }
-                        None => continue,
-                    };
+                for assigned_share in assigned_shares {
                     let share: S = ark_serialize::CanonicalDeserialize::deserialize_compressed(
                         assigned_share.share_bytes.as_slice(),
                     )
                     .map_err(|_| CoordinatorError::DeserializationError)?;
 
-                    if first_metadata.is_none() {
-                        first_metadata = Some(assigned_share.clone());
-                    } else if first_metadata.as_ref().is_some_and(|metadata| {
-                        metadata.reserved_index != assigned_share.reserved_index
-                            || metadata.input_ordinal != assigned_share.input_ordinal
-                    }) {
-                        return Err(CoordinatorError::JSONError(
-                            "Assigned mask share metadata differs across MPC nodes".to_string(),
-                        ));
-                    }
-                    mask_shares.push(share);
-
-                    if mask_shares.len() >= S::min_shares(self.t) {
-                        let metadata = first_metadata
-                            .clone()
-                            .expect("metadata set with first share");
-                        if let Ok((_, mask)) =
-                            S::recover_secret(&mask_shares, self.node_rpcs.len(), self.t)
-                        {
-                            outputs.push((metadata, mask));
-                            break;
-                        }
-                    }
+                    let entry = share_sets
+                        .entry(assigned_share.reserved_index)
+                        .or_insert_with(|| (assigned_share.clone(), Vec::new()));
+                    entry.1.push(share);
                 }
 
-                if outputs.len() == output_count_before {
+                if let Some(expected_indices) = &expected_indices {
+                    if expected_indices.iter().all(|reserved_index| {
+                        share_sets
+                            .get(reserved_index)
+                            .is_some_and(|(_, shares)| shares.len() >= S::min_shares(self.t))
+                    }) {
+                        break;
+                    }
+                }
+            }
+
+            let mut outputs = Vec::with_capacity(share_sets.len());
+            for reserved_index in expected_indices.unwrap_or_default() {
+                let Some((metadata, mask_shares)) = share_sets.remove(&reserved_index) else {
+                    return Err(CoordinatorError::MaskReconstructionFailed(0));
+                };
+                if mask_shares.len() < S::min_shares(self.t) {
                     return Err(CoordinatorError::MaskReconstructionFailed(
                         mask_shares.len(),
                     ));
                 }
+                let (_, mask) = S::recover_secret(&mask_shares, self.node_rpcs.len(), self.t)
+                    .map_err(|_| CoordinatorError::MaskReconstructionFailed(mask_shares.len()))?;
+                outputs.push((metadata, mask));
             }
+            outputs.sort_by_key(|(metadata, _)| metadata.reserved_index);
 
             Ok(outputs)
         }
@@ -402,18 +415,14 @@ pub mod node_rpc {
                     sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
                 if let Some(sink) = d.assigned_sinks.remove(&id) {
-                    if let Some(indices) = d.client_to_index.get_mut(&id) {
-                        if let Some(position) = indices.iter().position(|index| *index == i) {
-                            indices.remove(position);
-                        }
-                        if indices.is_empty() {
-                            d.client_to_index.remove(&id);
-                        }
+                    if let Some(assigned_shares) = d.assigned_mask_shares_for_client(&id)? {
+                        d.client_to_index.remove(&id);
+                        let json = to_json_raw_value(&assigned_shares)
+                            .map_err(|_| NodeRPCError::SerializationError)?;
+                        sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
+                    } else {
+                        d.assigned_sinks.insert(id.clone(), sink);
                     }
-                    let assigned_share = d.assigned_mask_share(i, &share)?;
-                    let json = to_json_raw_value(&assigned_share)
-                        .map_err(|_| NodeRPCError::SerializationError)?;
-                    sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
             }
 
@@ -446,18 +455,14 @@ pub mod node_rpc {
                     sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
                 if let Some(sink) = d.assigned_sinks.remove(&id) {
-                    if let Some(indices) = d.client_to_index.get_mut(&id) {
-                        if let Some(position) = indices.iter().position(|index| *index == i) {
-                            indices.remove(position);
-                        }
-                        if indices.is_empty() {
-                            d.client_to_index.remove(&id);
-                        }
+                    if let Some(assigned_shares) = d.assigned_mask_shares_for_client(&id)? {
+                        d.client_to_index.remove(&id);
+                        let json = to_json_raw_value(&assigned_shares)
+                            .map_err(|_| NodeRPCError::SerializationError)?;
+                        sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
+                    } else {
+                        d.assigned_sinks.insert(id.clone(), sink);
                     }
-                    let assigned_share = d.assigned_mask_share(i, share)?;
-                    let json = to_json_raw_value(&assigned_share)
-                        .map_err(|_| NodeRPCError::SerializationError)?;
-                    sink.send(json).await.map_err(|_| NodeRPCError::JSONError)?;
                 }
             }
 
@@ -550,8 +555,7 @@ pub mod node_rpc {
             reserved_index: u64,
             share: &S,
         ) -> Result<AssignedMaskShare, NodeRPCError> {
-            let reservation = self
-                .assigned_reservations
+            self.assigned_reservations
                 .get(&reserved_index)
                 .ok_or(NodeRPCError::IndexNotAdded)?;
             let mut share_bytes = Vec::new();
@@ -560,9 +564,28 @@ pub mod node_rpc {
                 .map_err(|_| NodeRPCError::SerializationError)?;
             Ok(AssignedMaskShare {
                 reserved_index,
-                input_ordinal: reservation.input_ordinal,
                 share_bytes,
             })
+        }
+
+        fn assigned_mask_shares_for_client(
+            &self,
+            id: &ClientIdentity,
+        ) -> Result<Option<Vec<AssignedMaskShare>>, NodeRPCError> {
+            let Some(indices) = self.client_to_index.get(id) else {
+                return Ok(Some(Vec::new()));
+            };
+
+            let mut assigned_shares = Vec::with_capacity(indices.len());
+            for i in indices {
+                let Some(share) = self.mask_shares.get(i) else {
+                    return Ok(None);
+                };
+                assigned_shares.push(self.assigned_mask_share(*i, share)?);
+            }
+            assigned_shares.sort_by_key(|assigned_share| assigned_share.reserved_index);
+
+            Ok(Some(assigned_shares))
         }
     }
 
@@ -652,7 +675,7 @@ pub mod node_rpc {
             Ok(())
         }
 
-        async fn receive_assigned_mask_share(
+        async fn receive_assigned_mask_shares(
             &self,
             pending: PendingSubscriptionSink,
         ) -> SubscriptionResult {
@@ -664,58 +687,39 @@ pub mod node_rpc {
                 pending
                     .reject(ErrorObjectOwned::owned(
                         ErrorCode::InvalidParams.code(),
-                        format!("Client {:?} already requested assigned mask share", self.id),
+                        format!(
+                            "Client {:?} already requested assigned mask shares",
+                            self.id
+                        ),
                         None::<()>,
                     ))
                     .await;
                 return Ok(());
             }
 
-            let next_index = d
-                .client_to_index
-                .get(&self.id)
-                .and_then(|indices| indices.front().copied());
-            let mut remove_client_indices = d
-                .client_to_index
-                .get(&self.id)
-                .is_some_and(|indices| indices.is_empty());
-            let assigned_share = if let Some(i) = next_index {
-                if let Some(share) = d.mask_shares.get(&i).cloned() {
-                    if let Some(indices) = d.client_to_index.get_mut(&self.id) {
-                        indices.pop_front();
-                        remove_client_indices = indices.is_empty();
-                    }
-                    match d.assigned_mask_share(i, &share) {
-                        Ok(assigned_share) => Some(assigned_share),
-                        Err(e) => {
-                            pending
-                                .reject(ErrorObjectOwned::owned(
-                                    ErrorCode::ServerError(SerializationError as i32).code(),
-                                    format!("Serializing assigned share failed: {e}"),
-                                    None::<()>,
-                                ))
-                                .await;
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    None
+            let assigned_shares = match d.assigned_mask_shares_for_client(&self.id) {
+                Ok(assigned_shares) => assigned_shares,
+                Err(e) => {
+                    pending
+                        .reject(ErrorObjectOwned::owned(
+                            ErrorCode::ServerError(SerializationError as i32).code(),
+                            format!("Serializing assigned shares failed: {e}"),
+                            None::<()>,
+                        ))
+                        .await;
+                    return Ok(());
                 }
-            } else {
-                None
             };
-            if remove_client_indices {
-                d.client_to_index.remove(&self.id);
-            }
 
-            if let Some(assigned_share) = assigned_share {
-                let json = match to_json_raw_value(&assigned_share) {
+            if let Some(assigned_shares) = assigned_shares {
+                d.client_to_index.remove(&self.id);
+                let json = match to_json_raw_value(&assigned_shares) {
                     Ok(j) => j,
                     Err(e) => {
                         pending
                             .reject(ErrorObjectOwned::owned(
                                 ErrorCode::ServerError(SerializationError as i32).code(),
-                                format!("Converting assigned share to JSON failed: {e}"),
+                                format!("Converting assigned shares to JSON failed: {e}"),
                                 None::<()>,
                             ))
                             .await;
@@ -1510,6 +1514,8 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         }
 
         let assigned_reservation = if let Some(slot) = d.input_assignments.get(i as usize) {
+            // The duplicate-reservation check above only proves the index is free; assigned input
+            // slots also need to be reserved by the client they were bound to.
             if slot.client != self.id {
                 return Err(ErrorObjectOwned::owned(
                     ErrorCode::ServerError(UnauthorizedClientIo as i32).code(),
