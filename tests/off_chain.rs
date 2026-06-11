@@ -47,6 +47,7 @@ async fn start_client_server() {
         addr,
         port,
         1,
+        5,
         1,
         client_cert(),
     )
@@ -86,6 +87,7 @@ async fn trigger_pp() {
             addr,
             port,
             1,
+            5,
             1,
             certs.remove(0),
         )
@@ -95,6 +97,7 @@ async fn trigger_pp() {
             addr,
             port,
             1,
+            5,
             1,
             certs.remove(0),
         )
@@ -142,6 +145,7 @@ async fn trigger_pp() {
             addr,
             port,
             1,
+            5,
             1,
             certs.remove(0),
         )
@@ -151,6 +155,7 @@ async fn trigger_pp() {
             addr,
             port,
             1,
+            5,
             1,
             certs.remove(0),
         )
@@ -229,6 +234,7 @@ async fn end_to_end() {
                 coord_addr,
                 coord_port,
                 1,
+                n as u64,
                 1,
                 cert.clone(),
             )
@@ -355,12 +361,14 @@ async fn end_to_end() {
             coord_addr,
             coord_port,
             1,
+            n as u64,
             1,
             cert.clone(),
         )
         .await
         .unwrap();
         let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+            n as usize,
             t as usize,
             node_rpc_addrs.clone(),
             cert.clone(),
@@ -459,6 +467,7 @@ async fn end_to_end_fake_coord() {
                 coord_addr,
                 coord_port,
                 1,
+                n as u64,
                 1,
                 cert.clone(),
             )
@@ -566,12 +575,14 @@ async fn end_to_end_fake_coord() {
             coord_addr,
             coord_port,
             1,
+            n as u64,
             1,
             cert.clone(),
         )
         .await
         .unwrap();
         let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+            n as usize,
             t as usize,
             node_rpc_addrs.clone(),
             cert.clone(),

@@ -141,6 +141,8 @@ pub mod node_rpc {
     pub struct NodeRPCClient<F: FftField, S: ShareBound<F>> {
         /// The per-node client handles for each connection to a node.
         node_rpcs: Vec<Client>,
+        /// Total number of MPC nodes in the network (used for share reconstruction).
+        n: usize,
         /// The threshold value.
         t: usize,
         _phantom: PhantomData<(F, S)>,
@@ -148,11 +150,13 @@ pub mod node_rpc {
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCClient<F, S> {
         pub async fn start_rpc_client_from_cert(
+            n: usize,
             t: usize,
             addrs: Vec<(String, u16)>,
             client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
         ) -> Result<Self, CoordinatorError> {
             Self::start_rpc_client(
+                n,
                 t,
                 addrs,
                 client_cert.cert.der().to_vec(),
@@ -163,6 +167,7 @@ pub mod node_rpc {
 
         /// Connects to a list of MPC nodes via Websockets over TLS.
         pub async fn start_rpc_client(
+            n: usize,
             t: usize,
             addrs: Vec<(String, u16)>,
             cert_der: Vec<u8>,
@@ -183,6 +188,7 @@ pub mod node_rpc {
 
             Ok(Self {
                 node_rpcs,
+                n,
                 t,
                 _phantom: PhantomData,
             })
@@ -223,7 +229,7 @@ pub mod node_rpc {
 
                 if mask_shares.len() >= S::min_shares(self.t) {
                     if let Ok((_, mask)) =
-                        S::recover_secret(&mask_shares, self.node_rpcs.len(), self.t)
+                        S::recover_secret(&mask_shares, self.n, self.t)
                     {
                         return Ok(mask);
                     }
@@ -1744,6 +1750,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         addr: &str,
         port: u16,
         t: u64,
+        n_parties: u64,
         n_outputs: u64,
         client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
     ) -> Result<Self, CoordinatorError> {
@@ -1751,7 +1758,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
             addr,
             port,
             t,
-            4 * t + 1,
+            n_parties,
             n_outputs,
             client_cert.cert.der().to_vec(),
             client_cert.signing_key.serialize_der(),
@@ -1763,6 +1770,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         addr: &str,
         port: u16,
         t: u64,
+        n_parties: u64,
         n_outputs: u64,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
@@ -1771,7 +1779,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
             addr,
             port,
             t,
-            4 * t + 1,
+            n_parties,
             n_outputs,
             cert_der,
             key_der,

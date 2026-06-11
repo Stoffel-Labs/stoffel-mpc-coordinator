@@ -195,7 +195,7 @@ pub async fn coord_creation_block() {
     .await
     .expect("deployment failed");
     let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-    let coord = FakeOnChainCoordinator::new(coord_instance, t, 1, None).await;
+    let coord = FakeOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
     assert_eq!(coord.contract_block, 1);
 }
 
@@ -227,7 +227,7 @@ pub async fn event_listening() {
         .await
         .expect("deployment failed");
         let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-        let coord = FakeOnChainCoordinator::new(coord_instance, t, 1, None).await;
+        let coord = FakeOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
 
         coord.trigger_round(Round::Preprocessing).await.unwrap();
         coord.wait_for_round(Round::Preprocessing).await.unwrap();
@@ -259,7 +259,7 @@ pub async fn event_listening() {
         .await
         .expect("deployment failed");
         let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-        let coord = FakeOnChainCoordinator::new(coord_instance, t, 1, None).await;
+        let coord = FakeOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
 
         tokio::spawn({
             let coord = coord.clone();
@@ -291,6 +291,7 @@ pub async fn start_node_rpc() {
     ];
     let anvil = spawn_anvil();
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
+    let n = 5;
     let t = 1;
     let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t));
     let hash =
@@ -327,6 +328,7 @@ pub async fn start_node_rpc() {
         node_rpcs.push(node_rpc);
     }
     let _ = FakeNodeRPCClient::start_rpc_client_from_cert(
+        n,
         t,
         node_rpc_addrs.clone(),
         stoffel_mpc_coordinator::self_signed_certs::client_cert(),
@@ -383,7 +385,7 @@ pub async fn end_to_end() {
 
     let mut coords = Vec::new();
     for instance in instances.iter().take(n_nodes) {
-        coords.push(FakeOnChainCoordinator::new(instance.clone(), 1, 1, None).await);
+        coords.push(FakeOnChainCoordinator::new(instance.clone(), n as u64, 1, 1, None).await);
     }
 
     let mut rng = test_rng();
@@ -409,12 +411,14 @@ pub async fn end_to_end() {
     let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
     let mut client_coord = FakeOnChainCoordinator::new(
         client_instance,
+        n as u64,
         t,
         1,
         Some(certs[5].signing_key.serialize_der()),
     )
     .await;
     let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+        n,
         t as usize,
         node_rpc_addrs.clone(),
         certs[5].clone(),
@@ -490,7 +494,7 @@ pub async fn reset_and_rerun() {
 
     let mut coords = Vec::new();
     for instance in instances.iter().take(n_nodes) {
-        coords.push(OnChainCoordinator::new(instance.clone(), 1, 1, None).await);
+        coords.push(OnChainCoordinator::new(instance.clone(), n as u64, 1, 1, None).await);
     }
 
     let mut rng = test_rng();
@@ -511,12 +515,14 @@ pub async fn reset_and_rerun() {
     let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
     let mut client_coord = FakeOnChainCoordinator::new(
         client_instance,
+        n as u64,
         t,
         1,
         Some(certs[5].signing_key.serialize_der()),
     )
     .await;
     let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+        n,
         t as usize,
         node_rpc_addrs.clone(),
         certs[5].clone(),

@@ -36,6 +36,7 @@ pub type ClientIdentity = Address;
 pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
     coord: StoffelCoordinatorInstance<P>,
     pub contract_block: u64,
+    n: u64,
     t: u64,
     n_outputs: Option<u64>,
     key_der: Option<Vec<u8>>,
@@ -100,6 +101,7 @@ pub mod node_rpc {
     /// Exterior representation of an RPC client that interfaces with the node-side RPC interface.
     pub struct NodeRPCClient<F: FftField, S: ShareBound<F>> {
         node_rpcs: Vec<Client>,
+        n: usize,
         t: usize,
         _marker: std::marker::PhantomData<(F, S)>,
     }
@@ -107,11 +109,13 @@ pub mod node_rpc {
     impl<F: FftField, S: ShareBound<F>> NodeRPCClient<F, S> {
         /// Start an RPC client from a certificate generated using rcgen.
         pub async fn start_rpc_client_from_cert(
+            n: usize,
             t: usize,
             addrs: Vec<(String, u16)>,
             client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
         ) -> Self {
             Self::start_rpc_client(
+                n,
                 t,
                 addrs,
                 client_cert.cert.der().to_vec(),
@@ -124,6 +128,7 @@ pub mod node_rpc {
         /// The information is the same as for `start_rpc_client_from_cert`, but the format
         /// differs.
         pub async fn start_rpc_client(
+            n: usize,
             t: usize,
             addrs: Vec<(String, u16)>,
             cert_der: Vec<u8>,
@@ -145,6 +150,7 @@ pub mod node_rpc {
 
             Self {
                 node_rpcs,
+                n,
                 t,
                 _marker: std::marker::PhantomData,
             }
@@ -174,7 +180,7 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= S::min_shares(self.t) {
-                    match S::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
+                    match S::recover_secret(&mask_shares, self.n, self.t) {
                         Ok((_, mask)) => {
                             return Ok(mask);
                         }
@@ -603,6 +609,7 @@ pub async fn ws_connect(
 pub async fn setup_coord<T, F: FftField, S: ShareBound<F>>(
     eth: T,
     contract_addr: Address,
+    n: u64,
     t: u64,
     n_outputs: u64,
     key_der: Option<Vec<u8>>,
@@ -611,7 +618,7 @@ where
     T: Provider + WalletProvider + Clone,
 {
     let coord_instance = StoffelCoordinator::new(contract_addr, eth.clone());
-    OnChainCoordinator::new(coord_instance, t, n_outputs, key_der).await
+    OnChainCoordinator::new(coord_instance, n, t, n_outputs, key_der).await
 }
 
 impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
@@ -619,6 +626,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
 {
     pub async fn new(
         coord: StoffelCoordinatorInstance<P>,
+        n: u64,
         t: u64,
         n_outputs: u64,
         key_der: Option<Vec<u8>>,
@@ -627,6 +635,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
         Self {
             coord,
             contract_block,
+            n,
             t,
             n_outputs: Some(n_outputs),
             key_der,
@@ -1145,10 +1154,10 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                         .map(|shares| shares[i].clone())
                         .collect();
 
-                    // at least 2t+1 shares available as checked previously by the coordinator
+                    // enough shares available as checked by the coordinator
                     match S::recover_secret(
                         shares_i.as_slice(),
-                        (4 * self.t + 1) as usize,
+                        self.n as usize,
                         self.t as usize,
                     ) {
                         Ok((_, output_i)) => Some(output_i),
