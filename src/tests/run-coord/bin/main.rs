@@ -268,10 +268,6 @@ async fn main() {
             .await;
         }
     }
-
-    println!("Listening on {}:{}", addr, port);
-
-    tokio::time::sleep(tokio::time::Duration::MAX).await;
 }
 
 #[cfg(test)]
