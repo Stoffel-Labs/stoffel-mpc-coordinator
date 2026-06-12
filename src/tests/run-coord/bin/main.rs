@@ -124,7 +124,7 @@ async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
 ) where
     C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase<T>>,
 {
-    let coord = OffChainCoordinatorServer::<C>::start_coord(
+    let _coord = OffChainCoordinatorServer::<C>::start_coord(
         server_state,
         addr,
         port,

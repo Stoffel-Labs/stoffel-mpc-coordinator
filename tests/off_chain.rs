@@ -33,7 +33,7 @@ async fn start_client_server() {
     let t = 1;
     let server_state =
         HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-    let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         addr,
         port,
@@ -73,7 +73,7 @@ async fn trigger_pp() {
         let t = 1;
         let server_state =
             HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
             server_state,
             addr,
             port,
@@ -130,7 +130,7 @@ async fn trigger_pp() {
         let t = 1;
         let server_state =
             HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
             server_state,
             addr,
             port,
@@ -213,7 +213,7 @@ async fn end_to_end() {
         1,
         vec![public_keys[5].clone()],
     );
-    let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         coord_addr,
         coord_port,
@@ -446,7 +446,7 @@ async fn end_to_end_fake_coord() {
         1,
         vec![public_keys[5].clone()],
     );
-    let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         coord_addr,
         coord_port,

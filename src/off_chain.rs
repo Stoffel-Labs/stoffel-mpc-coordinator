@@ -1181,16 +1181,6 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
     }
 }
 
-fn round_reached(current: Round, requested: Round) -> bool {
-    let mut cursor = Some(current);
-    while let Some(round) = cursor {
-        if round == requested {
-            return true;
-        }
-        cursor = crate::round_before(round);
-    }
-    false
-}
 
 /// The basic shared state can be used as a full-fledged shared state.
 impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> crate::rpc::RPCServerShared
