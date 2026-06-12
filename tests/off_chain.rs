@@ -4,10 +4,10 @@ use std::sync::Arc;
 use stoffel_mpc_coordinator::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator::tests::fake_coord::{
     off_chain::{
-        FakeCoordinatorRPCServerSharedBase, FakeNodeRPCClient, FakeNodeRPCServer,
-        FakeOffChainCoordinatorClient, FakeOffChainCoordinatorServer,
+        HoneyBadgerCoordinatorRPCServerSharedBase, HoneyBadgerNodeRPCClient, HoneyBadgerNodeRPCServer,
+        HoneyBadgerOffChainCoordinatorClient, HoneyBadgerOffChainCoordinatorServer,
     },
-    FakeShareType, FakeShareValueType,
+    HoneyBadgerShareType, HoneyBadgerShareValueType,
 };
 use stoffel_mpc_coordinator::Round;
 use stoffel_mpc_coordinator::{Coordinator, ShareBound};
@@ -32,8 +32,8 @@ async fn start_client_server() {
     let port = 12345;
     let t = 1;
     let server_state =
-        FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-    let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+        HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+    let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         addr,
         port,
@@ -43,7 +43,7 @@ async fn start_client_server() {
     .await
     .unwrap();
 
-    let _ = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+    let _ = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
         addr,
         port,
         1,
@@ -72,8 +72,8 @@ async fn trigger_pp() {
         let port = 12346;
         let t = 1;
         let server_state =
-            FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+            HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+        let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
             server_state,
             addr,
             port,
@@ -83,7 +83,7 @@ async fn trigger_pp() {
         .await
         .unwrap();
 
-        let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let node0 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
             1,
@@ -93,7 +93,7 @@ async fn trigger_pp() {
         )
         .await
         .unwrap();
-        let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let node1 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
             1,
@@ -129,8 +129,8 @@ async fn trigger_pp() {
         let port = 12347;
         let t = 1;
         let server_state =
-            FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+            HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+        let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
             server_state,
             addr,
             port,
@@ -141,7 +141,7 @@ async fn trigger_pp() {
         .unwrap();
         let barrier = Arc::new(Barrier::new(2));
 
-        let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let node0 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
             1,
@@ -151,7 +151,7 @@ async fn trigger_pp() {
         )
         .await
         .unwrap();
-        let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let node1 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
             1,
@@ -190,7 +190,7 @@ async fn end_to_end() {
 
     let n = 5;
     let t = 1;
-    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12349u16 + i as u16))
         .collect();
@@ -205,7 +205,7 @@ async fn end_to_end() {
     let correct_output = Fr::from(31415);
     let coord_addr = "127.0.0.1";
     let coord_port = 12348;
-    let server_state = FakeCoordinatorRPCServerSharedBase::new(
+    let server_state = HoneyBadgerCoordinatorRPCServerSharedBase::new(
         [0u8; 32],
         n,
         t,
@@ -213,7 +213,7 @@ async fn end_to_end() {
         1,
         vec![public_keys[5].clone()],
     );
-    let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+    let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         coord_addr,
         coord_port,
@@ -228,9 +228,9 @@ async fn end_to_end() {
     tokio::spawn({
         let barrier = barrier.clone();
 
-        let mut coords: Vec<FakeOffChainCoordinatorClient> = Vec::new();
+        let mut coords: Vec<HoneyBadgerOffChainCoordinatorClient> = Vec::new();
         for cert in certs.iter().take(n_nodes) {
-            let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
                 1,
@@ -247,7 +247,7 @@ async fn end_to_end() {
         // node here, but we use 3 RPC nodes to make the process work
         let mut rng = test_rng();
         let ids = sample_ids(n as usize);
-        let mask_shares = FakeShareType::compute_shares(
+        let mask_shares = HoneyBadgerShareType::compute_shares(
             correct_mask,
             n as usize,
             t as usize,
@@ -255,7 +255,7 @@ async fn end_to_end() {
             &mut rng,
         )
         .unwrap();
-        let output_shares = FakeShareType::compute_shares(
+        let output_shares = HoneyBadgerShareType::compute_shares(
             correct_output,
             n as usize,
             t as usize,
@@ -266,7 +266,7 @@ async fn end_to_end() {
 
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {
-            let mut node_rpc = FakeNodeRPCServer::start_from_cert(
+            let mut node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
@@ -357,7 +357,7 @@ async fn end_to_end() {
     tokio::spawn({
         let barrier = barrier.clone();
         let cert = certs[5].clone();
-        let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let mut coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             coord_addr,
             coord_port,
             1,
@@ -367,7 +367,7 @@ async fn end_to_end() {
         )
         .await
         .unwrap();
-        let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+        let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
             n as usize,
             t as usize,
             node_rpc_addrs.clone(),
@@ -422,7 +422,7 @@ async fn end_to_end_fake_coord() {
 
     let n: usize = 5;
     let t = 1u64;
-    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12353u16 + i as u16))
         .collect();
@@ -438,7 +438,7 @@ async fn end_to_end_fake_coord() {
 
     let coord_addr = "127.0.0.1";
     let coord_port = 12352;
-    let server_state = FakeCoordinatorRPCServerSharedBase::new(
+    let server_state = HoneyBadgerCoordinatorRPCServerSharedBase::new(
         [0u8; 32],
         5,
         t,
@@ -446,7 +446,7 @@ async fn end_to_end_fake_coord() {
         1,
         vec![public_keys[5].clone()],
     );
-    let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+    let coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         coord_addr,
         coord_port,
@@ -463,7 +463,7 @@ async fn end_to_end_fake_coord() {
 
         let mut coords = Vec::new();
         for cert in certs.iter().take(n_nodes) {
-            let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
                 1,
@@ -481,15 +481,15 @@ async fn end_to_end_fake_coord() {
         let mut rng = test_rng();
         let ids = sample_ids(n);
         let mask_shares =
-            FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+            HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
                 .unwrap();
         let output_shares =
-            FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+            HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
                 .unwrap();
 
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {
-            let mut node_rpc = FakeNodeRPCServer::start_from_cert(
+            let mut node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
@@ -571,7 +571,7 @@ async fn end_to_end_fake_coord() {
     tokio::spawn({
         let barrier = barrier.clone();
         let cert = certs[5].clone();
-        let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let mut coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             coord_addr,
             coord_port,
             1,
@@ -581,8 +581,8 @@ async fn end_to_end_fake_coord() {
         )
         .await
         .unwrap();
-        let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
-            n as usize,
+        let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
+            n,
             t as usize,
             node_rpc_addrs.clone(),
             cert.clone(),

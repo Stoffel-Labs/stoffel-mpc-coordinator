@@ -7,8 +7,8 @@ use ark_std::test_rng;
 use std::str::FromStr;
 use stoffel_mpc_coordinator::on_chain::{generate_client_sig, ws_connect, OnChainCoordinator};
 use stoffel_mpc_coordinator::tests::fake_coord::{
-    on_chain::{FakeNodeRPCClient, FakeNodeRPCServer, FakeOnChainCoordinator},
-    FakeShareType, FakeShareValueType, FakeValueType,
+    on_chain::{HoneyBadgerNodeRPCClient, HoneyBadgerNodeRPCServer, HoneyBadgerOnChainCoordinator},
+    HoneyBadgerShareType, HoneyBadgerShareValueType, HoneyBadgerValueType,
 };
 use stoffel_mpc_coordinator::ShareBound;
 use stoffel_mpc_coordinator::{Coordinator, Round};
@@ -53,10 +53,10 @@ fn spawn_anvil() -> AnvilInstance {
 }
 
 async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
-    coords: &mut [FakeOnChainCoordinator<P>],
-    node_rpcs: &mut [FakeNodeRPCServer<P>],
-    mask_shares: Vec<FakeShareType>,
-    output_shares: Vec<FakeShareType>,
+    coords: &mut [HoneyBadgerOnChainCoordinator<P>],
+    node_rpcs: &mut [HoneyBadgerNodeRPCServer<P>],
+    mask_shares: Vec<HoneyBadgerShareType>,
+    output_shares: Vec<HoneyBadgerShareType>,
     client_addr: Address,
     public_key: Vec<u8>,
 ) {
@@ -135,12 +135,12 @@ async fn run_node_round<P: Provider + WalletProvider + Clone + 'static>(
 }
 
 async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
-    coord: &mut FakeOnChainCoordinator<P>,
-    rpc_client: &FakeNodeRPCClient,
+    coord: &mut HoneyBadgerOnChainCoordinator<P>,
+    rpc_client: &HoneyBadgerNodeRPCClient,
     client_addr: Address,
     client_sk: &str,
-    correct_mask: FakeValueType,
-    correct_output: FakeValueType,
+    correct_mask: HoneyBadgerValueType,
+    correct_output: HoneyBadgerValueType,
 ) {
     let _ = coord.wait_for_round(Round::Preprocessing).await;
     let _ = coord.wait_for_round(Round::InputMaskReservation).await;
@@ -160,7 +160,7 @@ async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
         .unwrap();
     assert_eq!(mask, correct_mask);
     let _ = coord.wait_for_round(Round::InputCollection).await;
-    let masked_input = mask + FakeValueType::from(1337);
+    let masked_input = mask + HoneyBadgerValueType::from(1337);
     coord.send_masked_input(masked_input, 0).await.unwrap();
     let _ = coord.wait_for_round(Round::MPCExecution).await;
     let _ = coord.wait_for_round(Round::OutputDistribution).await;
@@ -176,7 +176,7 @@ pub async fn coord_creation_block() {
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
     let t = 1u64;
     let threshold =
-        U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
+        U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize));
     let hash =
         FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
             .expect("invalid hash");
@@ -195,7 +195,7 @@ pub async fn coord_creation_block() {
     .await
     .expect("deployment failed");
     let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-    let coord = FakeOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
+    let coord = HoneyBadgerOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
     assert_eq!(coord.contract_block, 1);
 }
 
@@ -207,7 +207,7 @@ pub async fn event_listening() {
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
         let threshold =
-            U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
+            U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -227,7 +227,7 @@ pub async fn event_listening() {
         .await
         .expect("deployment failed");
         let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-        let coord = FakeOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
+        let coord = HoneyBadgerOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
 
         coord.trigger_round(Round::Preprocessing).await.unwrap();
         coord.wait_for_round(Round::Preprocessing).await.unwrap();
@@ -239,7 +239,7 @@ pub async fn event_listening() {
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
         let threshold =
-            U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize));
+            U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -259,7 +259,7 @@ pub async fn event_listening() {
         .await
         .expect("deployment failed");
         let coord_instance = StoffelCoordinator::new(*fake_instance.address(), provider.clone());
-        let coord = FakeOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
+        let coord = HoneyBadgerOnChainCoordinator::new(coord_instance, 5, t, 1, None).await;
 
         tokio::spawn({
             let coord = coord.clone();
@@ -293,7 +293,7 @@ pub async fn start_node_rpc() {
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
     let n = 5;
     let t = 1;
-    let threshold = U256::from(<FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t));
+    let threshold = U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t));
     let hash =
         FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
             .expect("invalid hash");
@@ -318,7 +318,7 @@ pub async fn start_node_rpc() {
         let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
         let instance = StoffelCoordinatorInstance::new(*contract.address(), provider.clone());
 
-        let node_rpc = FakeNodeRPCServer::start_from_cert(
+        let node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
             &node_rpc_addrs[i].0,
             node_rpc_addrs[i].1,
             instance.clone(),
@@ -327,7 +327,7 @@ pub async fn start_node_rpc() {
         .await;
         node_rpcs.push(node_rpc);
     }
-    let _ = FakeNodeRPCClient::start_rpc_client_from_cert(
+    let _ = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
         n,
         t,
         node_rpc_addrs.clone(),
@@ -353,7 +353,7 @@ pub async fn end_to_end() {
 
     let n = 5;
     let t = 1u64;
-    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12351u16 + i as u16))
         .collect();
@@ -385,19 +385,19 @@ pub async fn end_to_end() {
 
     let mut coords = Vec::new();
     for instance in instances.iter().take(n_nodes) {
-        coords.push(FakeOnChainCoordinator::new(instance.clone(), n as u64, 1, 1, None).await);
+        coords.push(HoneyBadgerOnChainCoordinator::new(instance.clone(), n as u64, 1, 1, None).await);
     }
 
     let mut rng = test_rng();
     let ids = sample_ids(n);
     let mask_shares =
-        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
     let output_shares =
-        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
 
     let mut node_rpcs = Vec::new();
     for i in 0..n_nodes {
-        let node_rpc = FakeNodeRPCServer::start_from_cert(
+        let node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
             &node_rpc_addrs[i].0,
             node_rpc_addrs[i].1,
             instances[i].clone(),
@@ -409,7 +409,7 @@ pub async fn end_to_end() {
 
     let client_provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
     let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
-    let mut client_coord = FakeOnChainCoordinator::new(
+    let mut client_coord = HoneyBadgerOnChainCoordinator::new(
         client_instance,
         n as u64,
         t,
@@ -417,7 +417,7 @@ pub async fn end_to_end() {
         Some(certs[5].signing_key.serialize_der()),
     )
     .await;
-    let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+    let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
         n,
         t as usize,
         node_rpc_addrs.clone(),
@@ -462,7 +462,7 @@ pub async fn reset_and_rerun() {
 
     let n = 5;
     let t = 1u64;
-    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12354u16 + i as u16))
         .collect();
@@ -501,7 +501,7 @@ pub async fn reset_and_rerun() {
 
     let mut node_rpcs = Vec::new();
     for i in 0..n_nodes {
-        let node_rpc = FakeNodeRPCServer::start_from_cert(
+        let node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
             &node_rpc_addrs[i].0,
             node_rpc_addrs[i].1,
             instances[i].clone(),
@@ -513,7 +513,7 @@ pub async fn reset_and_rerun() {
 
     let client_provider = ws_connect(&anvil.ws_endpoint(), SK[5]).await;
     let client_instance = StoffelCoordinatorInstance::new(*contract.address(), client_provider);
-    let mut client_coord = FakeOnChainCoordinator::new(
+    let mut client_coord = HoneyBadgerOnChainCoordinator::new(
         client_instance,
         n as u64,
         t,
@@ -521,7 +521,7 @@ pub async fn reset_and_rerun() {
         Some(certs[5].signing_key.serialize_der()),
     )
     .await;
-    let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+    let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
         n,
         t as usize,
         node_rpc_addrs.clone(),
@@ -532,9 +532,9 @@ pub async fn reset_and_rerun() {
     // Round 1
     let ids = sample_ids(n);
     let mask_shares =
-        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
     let output_shares =
-        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
     tokio::join!(
         run_node_round(
             &mut coords,
@@ -567,9 +567,9 @@ pub async fn reset_and_rerun() {
     // Round 2
     let ids = sample_ids(n);
     let mask_shares2 =
-        FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
     let output_shares2 =
-        FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
     tokio::join!(
         run_node_round(
             &mut coords,

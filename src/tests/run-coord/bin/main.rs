@@ -5,12 +5,15 @@ use stoffel_mpc_coordinator::off_chain::{
     ClientIdentity, InputAssignment, InputSlotAssignment, OffChainCoordinatorServer,
 };
 use stoffel_mpc_coordinator::rpc::RPCServerConnection;
+use stoffel_mpc_coordinator::off_chain::CoordinatorRPCServerSharedBase;
+use stoffel_mpc_coordinator::tests::fake_coord::{AvssValueType, HoneyBadgerValueType};
 use stoffel_mpc_coordinator::tests::fake_coord::off_chain::{
-    AvssCoordinatorConnection, FakeCoordinatorConnection, FakeCoordinatorRPCServerSharedBase,
+    AvssCoordinatorConnection, HoneyBadgerCoordinatorConnection
 };
 use stoffel_mpc_coordinator::CoordinatorError;
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -111,15 +114,15 @@ fn build_input_assignment(
     Ok((InputAssignment { input_slots }, output_clients))
 }
 
-async fn run_coord<C>(
-    server_state: FakeCoordinatorRPCServerSharedBase,
+async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
+    server_state: CoordinatorRPCServerSharedBase<T>,
     addr: &str,
     port: u16,
     t: u64,
     server_cert_der: Vec<u8>,
     server_key_der: Vec<u8>,
 ) where
-    C: RPCServerConnection<Internal = FakeCoordinatorRPCServerSharedBase>,
+    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase<T>>,
 {
     let coord = OffChainCoordinatorServer::<C>::start_coord(
         server_state,
@@ -216,7 +219,7 @@ async fn main() {
             build_input_assignment(binary.client_io_manifest, client_bindings)
                 .expect("failed to bind client IO manifest");
         let n_inputs = input_assignment.input_slots.len() as u64;
-        let server_state = FakeCoordinatorRPCServerSharedBase::new_with_input_assignment(
+        let server_state = CoordinatorRPCServerSharedBase::new_with_input_assignment(
             hash,
             n,
             t,
@@ -230,7 +233,7 @@ async fn main() {
     } else {
         (
             MpcBackend::HoneyBadger,
-            FakeCoordinatorRPCServerSharedBase::new(
+            CoordinatorRPCServerSharedBase::new(
                 hash,
                 n,
                 t,
@@ -242,7 +245,7 @@ async fn main() {
     };
     match mpc_backend {
         MpcBackend::HoneyBadger => {
-            run_coord::<FakeCoordinatorConnection>(
+            run_coord::<HoneyBadgerValueType, HoneyBadgerCoordinatorConnection>(
                 server_state,
                 addr,
                 port,
@@ -253,7 +256,7 @@ async fn main() {
             .await;
         }
         MpcBackend::Avss => {
-            run_coord::<AvssCoordinatorConnection>(
+            run_coord::<AvssValueType, AvssCoordinatorConnection>(
                 server_state,
                 addr,
                 port,

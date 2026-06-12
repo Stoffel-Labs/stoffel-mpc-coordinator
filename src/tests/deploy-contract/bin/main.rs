@@ -7,7 +7,7 @@ use alloy_primitives::{Address, FixedBytes, Keccak256, U256};
 use clap::Parser;
 use std::{env, str::FromStr};
 use stoffel_mpc_coordinator::{
-    tests::fake_coord::{AvssShareType, FakeShareValueType, HoneyBadgerShareType},
+    tests::fake_coord::{AvssShareType, AvssShareValueType, HoneyBadgerShareType, HoneyBadgerShareValueType},
     ShareBound,
 };
 use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
@@ -99,10 +99,10 @@ async fn main() {
     );
     let threshold = match binary.client_io_manifest.mpc_backend {
         MpcBackend::HoneyBadger => U256::from(<HoneyBadgerShareType as ShareBound<
-            FakeShareValueType,
+            HoneyBadgerShareValueType,
         >>::min_shares(t as usize)),
         MpcBackend::Avss => {
-            U256::from(<AvssShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize))
+            U256::from(<AvssShareType as ShareBound<AvssShareValueType>>::min_shares(t as usize))
         }
     };
 
