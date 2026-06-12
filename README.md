@@ -11,7 +11,7 @@ Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 00
 
 For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
 
-`cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 0 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
+`cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
 
 The off-chain coordinator also selects the MPC share backend from the `.stflb` manifest. Compile
 programs with `stoffel --mpc-backend honeybadger -b program.stfl` or

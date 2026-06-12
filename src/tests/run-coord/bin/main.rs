@@ -37,7 +37,7 @@ struct Args {
     t: u64,
 
     #[arg(long)]
-    n_inputs: u64,
+    n_inputs: Option<u64>,
 
     #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     output_clients: Vec<String>,
@@ -231,6 +231,7 @@ async fn main() {
         .expect("failed to configure bound client IO");
         (mpc_backend, server_state)
     } else {
+        let n_inputs = args.n_inputs.expect("--n-inputs is required when --program is not provided");
         (
             MpcBackend::HoneyBadger,
             CoordinatorRPCServerSharedBase::new(
@@ -238,7 +239,7 @@ async fn main() {
                 n,
                 t,
                 public_keys,
-                args.n_inputs,
+                n_inputs,
                 output_client_keys,
             ),
         )
