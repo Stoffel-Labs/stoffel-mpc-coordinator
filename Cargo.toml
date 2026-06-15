@@ -6,25 +6,35 @@ edition = "2021"
 [[bin]]
 name = "deploy-contract"
 path = "src/tests/deploy-contract/bin/main.rs"
+required-features = ["on-chain"]
 
 [[bin]]
 name = "run-coord"
 path = "src/tests/run-coord/bin/main.rs"
+required-features = ["off-chain"]
 
 [[bin]]
 name = "generate-ids"
 path = "src/tests/generate-ids/bin/main.rs"
 
 [features]
+default = ["on-chain", "off-chain"]
 benchmark = []
+on-chain = [
+    "dep:alloy",
+    "dep:alloy-primitives",
+    "dep:stoffel-solidity-bindings",
+    "dep:stoffel-solidity-bindings-test",
+]
+off-chain = []
 
 [dependencies]
 stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "temp/monorepo-network-dep" }
 #stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
-stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars" }
-stoffel-solidity-bindings-test = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars" }
-alloy = { version = "1.5.2", features = ["full", "node-bindings"] }
-alloy-primitives = "1.5.4"
+stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars", optional = true }
+stoffel-solidity-bindings-test = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars", optional = true }
+alloy = { version = "1.5.2", features = ["full", "node-bindings"], optional = true }
+alloy-primitives = { version = "1.5.4", optional = true }
 clap = { version = "4.5.56", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
 ark-bls12-381 = "0.5.0"
@@ -54,3 +64,11 @@ hpke = "0.13.0"
 rand = "0.9.2"
 p256 = "0.13.2"
 tracing = "0.1"
+
+[[test]]
+name = "off_chain"
+required-features = ["off-chain"]
+
+[[test]]
+name = "on_chain"
+required-features = ["on-chain"]

@@ -18,9 +18,11 @@ pub mod self_signed_certs;
 pub mod rpc;
 
 /// The on-chain coordinator.
+#[cfg(feature = "on-chain")]
 pub mod on_chain;
 
 /// The off-chain coordinator.
+#[cfg(feature = "off-chain")]
 pub mod off_chain;
 
 /// Things for testing the coordinator when deployed, using Docker, for example.

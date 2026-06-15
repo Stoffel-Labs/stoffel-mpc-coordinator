@@ -3,7 +3,9 @@ use ark_bls12_381::Fr;
 use ark_bls12_381::G1Projective;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+#[cfg(feature = "on-chain")]
 use crate::on_chain::node_rpc::NodeRPCClient;
+#[cfg(feature = "on-chain")]
 use crate::on_chain::node_rpc::NodeRPCServer;
 
 pub type HoneyBadgerShareValueType = Fr;
@@ -15,6 +17,7 @@ pub type AvssShareValueType = Fr;
 pub type AvssValueType = Fr;
 pub type AvssShareType = FeldmanShamirShare<AvssShareValueType, AvssShareGroupType>;
 
+#[cfg(feature = "on-chain")]
 pub mod on_chain {
     use super::*;
     use crate::on_chain::OnChainCoordinator;
@@ -28,6 +31,7 @@ pub mod on_chain {
     pub type AvssNodeRPCServer<P> = NodeRPCServer<P, AvssShareValueType, AvssShareType>;
 }
 
+#[cfg(feature = "off-chain")]
 pub mod off_chain {
     use super::*;
     use crate::{
