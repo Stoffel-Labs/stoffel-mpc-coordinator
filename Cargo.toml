@@ -16,7 +16,7 @@ name = "generate-ids"
 path = "src/tests/generate-ids/bin/main.rs"
 
 [dependencies]
-stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "temp/monorepo-network-dep" }
+stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "temp/reverted-stuff-monorepo-network-dep" }
 #stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
 stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars" }
 stoffel-solidity-bindings-test = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars" }
