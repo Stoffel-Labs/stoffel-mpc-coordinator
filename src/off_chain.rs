@@ -1057,6 +1057,17 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         pending: PendingSubscriptionSink,
         round: Round,
     ) -> SubscriptionResult {
+        if !self.trans_events.contains_key(&round) {
+            pending
+                .reject(ErrorObjectOwned::owned(
+                    ErrorCode::InvalidParams.code(),
+                    format!("Cannot subscribe to round {:?}", round),
+                    None::<()>,
+                ))
+                .await;
+            return Ok(());
+        }
+
         let sink = pending.accept().await?;
 
         {
