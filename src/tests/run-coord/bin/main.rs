@@ -287,6 +287,7 @@ mod tests {
                 inputs: vec![ShareType::default_secret_int()],
                 outputs: vec![ShareType::default_secret_int()],
             }],
+            ..Default::default()
         };
         let bool_manifest = ClientIoManifest {
             mpc_backend: MpcBackend::Avss,
@@ -296,6 +297,7 @@ mod tests {
                 inputs: vec![ShareType::try_secret_int(1).expect("valid bool share type")],
                 outputs: vec![ShareType::try_secret_int(1).expect("valid bool share type")],
             }],
+            ..Default::default()
         };
 
         let client = vec![7, 8, 9];
