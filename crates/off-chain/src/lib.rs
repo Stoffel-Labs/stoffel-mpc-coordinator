@@ -1696,10 +1696,14 @@ impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServ
 
 /// The exterior wrapper of the server-side coordinator.
 pub struct OffChainCoordinatorServer<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> {
+    #[allow(dead_code)]
     rpc_server: Arc<Mutex<C::Internal>>,
     addr: String,
+    #[allow(dead_code)]
     port: u16,
+    #[allow(dead_code)]
     server_handle: JoinHandle<()>,
+    #[allow(dead_code)]
     t: u64,
 }
 
