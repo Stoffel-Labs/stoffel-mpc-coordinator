@@ -1,19 +1,19 @@
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
+use stoffel_mpc_coordinator::off_chain::CoordinatorRPCServerSharedBase;
 use stoffel_mpc_coordinator::off_chain::{
     ClientIdentity, InputAssignment, InputSlotAssignment, OffChainCoordinatorServer,
 };
 use stoffel_mpc_coordinator::rpc::RPCServerConnection;
-use stoffel_mpc_coordinator::off_chain::CoordinatorRPCServerSharedBase;
-use stoffel_mpc_coordinator::tests::fake_coord::{AvssValueType, HoneyBadgerValueType};
 use stoffel_mpc_coordinator::tests::fake_coord::off_chain::{
-    AvssCoordinatorConnection, HoneyBadgerCoordinatorConnection
+    AvssCoordinatorConnection, HoneyBadgerCoordinatorConnection,
 };
+use stoffel_mpc_coordinator::tests::fake_coord::{AvssValueType, HoneyBadgerValueType};
 use stoffel_mpc_coordinator::CoordinatorError;
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -158,9 +158,12 @@ async fn main() {
         cert_files
             .iter()
             .map(|cert_file| {
-                let cert_der = fs::read(cert_file).expect(&format!("could not read certificate file {cert_file}"));
+                let cert_der = fs::read(cert_file)
+                    .unwrap_or_else(|_| panic!("could not read certificate file {cert_file}"));
                 let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
-                    .expect(&format!("Failed to parse X.509 certificate DER {cert_file}"));
+                    .unwrap_or_else(|_| {
+                        panic!("Failed to parse X.509 certificate DER {cert_file}")
+                    });
                 parsed_cert
                     .public_key()
                     .subject_public_key
@@ -231,7 +234,9 @@ async fn main() {
         .expect("failed to configure bound client IO");
         (mpc_backend, server_state)
     } else {
-        let n_inputs = args.n_inputs.expect("--n-inputs is required when --program is not provided");
+        let n_inputs = args
+            .n_inputs
+            .expect("--n-inputs is required when --program is not provided");
         (
             MpcBackend::HoneyBadger,
             CoordinatorRPCServerSharedBase::new(

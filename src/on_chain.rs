@@ -1155,11 +1155,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                         .collect();
 
                     // enough shares available as checked by the coordinator
-                    match S::recover_secret(
-                        shares_i.as_slice(),
-                        self.n as usize,
-                        self.t as usize,
-                    ) {
+                    match S::recover_secret(shares_i.as_slice(), self.n as usize, self.t as usize) {
                         Ok((_, output_i)) => Some(output_i),
                         Err(_) => {
                             println!(

@@ -228,9 +228,7 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= S::min_shares(self.t) {
-                    if let Ok((_, mask)) =
-                        S::recover_secret(&mask_shares, self.n, self.t)
-                    {
+                    if let Ok((_, mask)) = S::recover_secret(&mask_shares, self.n, self.t) {
                         return Ok(mask);
                     }
                 }
@@ -1168,7 +1166,7 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         // Late subscribers will replay this event from history.
         self.trans_events
             .get_mut(&round)
-            .expect(&format!("BUG: {:?} must be present!", round))
+            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round))
             .push(event.clone());
 
         self.round = round;
@@ -1191,7 +1189,6 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         Ok(())
     }
 }
-
 
 /// The basic shared state can be used as a full-fledged shared state.
 impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> crate::rpc::RPCServerShared
@@ -1396,19 +1393,13 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         Ok(())
     }
 
-    async fn sub_reserved_indices(
-        &self,
-        pending: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
+    async fn sub_reserved_indices(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
         d.subscribe_reserved_indices(pending).await
     }
 
-    async fn sub_masked_inputs(
-        &self,
-        pending: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
+    async fn sub_masked_inputs(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
         d.subscribe_masked_inputs(pending).await
@@ -1482,7 +1473,8 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         d.reserved_index_events.push(event.clone());
 
         if let Some(assigned_reservation) = assigned_reservation.clone() {
-            d.assigned_reserved_index_events.push(assigned_reservation.clone());
+            d.assigned_reserved_index_events
+                .push(assigned_reservation.clone());
         }
 
         // Broadcast reserved index to all subscribed RPC clients. Disconnected
@@ -1753,6 +1745,22 @@ impl<C: crate::rpc::RPCServerConnection> OffChainCoordinatorServer<C> {
     pub fn get_addr(&self) -> String {
         self.addr.clone()
     }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn threshold(&self) -> u64 {
+        self.t
+    }
+
+    pub fn shared_state(&self) -> Arc<Mutex<C::Internal>> {
+        self.rpc_server.clone()
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.server_handle.is_finished()
+    }
 }
 
 impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
@@ -1785,16 +1793,8 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
-        Self::start_rpc_client_with_parties(
-            addr,
-            port,
-            t,
-            n_parties,
-            n_outputs,
-            cert_der,
-            key_der,
-        )
-        .await
+        Self::start_rpc_client_with_parties(addr, port, t, n_parties, n_outputs, cert_der, key_der)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2055,11 +2055,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                         .collect();
 
                     // At least S::min_shares(t) shares are available as checked above.
-                    match S::recover_secret(
-                        &shares_i,
-                        self.n_parties as usize,
-                        self.t as usize,
-                    ) {
+                    match S::recover_secret(&shares_i, self.n_parties as usize, self.t as usize) {
                         Ok((_, output_i)) => Some(output_i),
                         Err(_) => {
                             println!(

@@ -2,6 +2,15 @@
 name = "stoffel-mpc-coordinator"
 version = "0.1.0"
 edition = "2021"
+authors = ["Stoffel Labs Inc <contact@stoffelmpc.com>"]
+homepage = "https://stoffelmpc.com"
+repository = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"
+documentation = "https://docs.rs/stoffel-mpc-coordinator"
+categories = ["cryptography", "network-programming"]
+keywords = ["mpc", "coordinator", "cryptography", "json-rpc", "ethereum"]
+license = "Apache-2.0"
+readme = "README.md"
+description = "Coordinator library for Stoffel MPC workflows with on-chain and off-chain transports"
 
 [[bin]]
 name = "deploy-contract"
@@ -31,8 +40,8 @@ off-chain = []
 [dependencies]
 stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main" }
 stoffelnet = "0.1.0"
-stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars", optional = true }
-stoffel-solidity-bindings-test = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "use-immutable-vars", optional = true }
+stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", rev = "269fadfade9ad33cf2b3fb05b927a08ac95dc43a", optional = true }
+stoffel-solidity-bindings-test = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", rev = "269fadfade9ad33cf2b3fb05b927a08ac95dc43a", optional = true }
 alloy = { version = "1.5.2", features = ["full", "node-bindings"], optional = true }
 alloy-primitives = { version = "1.5.4", optional = true }
 clap = { version = "4.5.56", features = ["derive"] }
