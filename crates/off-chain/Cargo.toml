@@ -1,0 +1,32 @@
+[package]
+name = "stoffel-mpc-coordinator-off-chain"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+benchmark = []
+
+[dependencies]
+stoffel-mpc-coordinator-shared = { version = "0.1.0", path = "../coord-shared" }
+ark-ff = "0.5.0"
+ark-serialize = "0.5.0"
+ark-bls12-381 = "0.5.0"
+async-trait = "0.1.89"
+futures-util = "0.3.31"
+hpke = "0.13.0"
+jsonrpsee = { version = "0.26.0", features = ["full"] }
+p256 = "0.13.2"
+rand = "0.9.2"
+rcgen = "0.14.7"
+serde = "1.0.228"
+tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
+tracing = "0.1"
+
+[dev-dependencies]
+stoffel-mpc-coordinator-off-chain = { path = "." }
+ark-std = "0.5.0"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
+
+[[test]]
+name = "off_chain"
