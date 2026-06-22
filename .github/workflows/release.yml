@@ -1,0 +1,143 @@
+name: Publish coordinator libraries
+
+on:
+  push:
+    tags:
+      - "stoffel-mpc-coordinator-libs-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. stoffel-mpc-coordinator-libs-v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # Library crates to publish, listed leaf-first. cargo resolves the actual
+  # dependency order, so off-chain (which depends on shared) is safe to list
+  # after it. Add "stoffel-mpc-coordinator-on-chain" here once its Solidity
+  # bindings no longer come from git and it drops publish = false.
+  PUBLISH_CRATES: "stoffel-mpc-coordinator-shared stoffel-mpc-coordinator-off-chain"
+
+jobs:
+  publish:
+    name: Publish library crates to crates.io
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve release ref
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+            echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"
+          else
+            tag="${GITHUB_REF_NAME}"
+            echo "ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+          fi
+          version="${tag#stoffel-mpc-coordinator-libs-v}"
+          if [ "$version" = "$tag" ]; then
+            echo "Tag '$tag' is not of the form 'stoffel-mpc-coordinator-libs-v<version>'"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      # Fails fast if a selected crate is at the wrong version, is missing
+      # description/license (crates.io rejects those), or is publish=false.
+      - name: Validate selected crates
+        env:
+          VERSION: ${{ steps.ref.outputs.version }}
+          PUBLISH_CRATES: ${{ env.PUBLISH_CRATES }}
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, os, sys
+          want = os.environ["VERSION"]
+          crates = os.environ["PUBLISH_CRATES"].split()
+          md = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+          by_name = {p["name"]: p for p in md["packages"]}
+          errs = []
+          for c in crates:
+              p = by_name.get(c)
+              if p is None:
+                  errs.append(f"{c}: not a workspace member"); continue
+              if p["version"] != want:
+                  errs.append(f"{c}: version {p['version']} != tag {want}")
+              if not p.get("description"):
+                  errs.append(f"{c}: missing `description` (crates.io requires it)")
+              if not p.get("license") and not p.get("license_file"):
+                  errs.append(f"{c}: missing `license` (crates.io requires it)")
+              if p.get("publish") == []:
+                  errs.append(f"{c}: marked publish=false")
+          if errs:
+              sys.exit("Cannot publish:\n  " + "\n  ".join(errs))
+          print(f"OK: {', '.join(crates)} all at {want} with required metadata")
+          PY
+
+      - name: Check tag commit is contained in main
+        run: |
+          git fetch origin main
+          git branch -r --contains "$GITHUB_SHA" | grep -q 'origin/main'
+
+      # Packages and verifies both crates together (off-chain against the
+      # about-to-be-published shared, via cargo's registry overlay). No token.
+      - name: Verify packaging (dry run)
+        run: |
+          args=""
+          for c in $PUBLISH_CRATES; do args="$args -p $c"; done
+          cargo publish --dry-run $args
+
+      - name: Determine which crates still need publishing
+        id: plan
+        run: |
+          args=""
+          for c in $PUBLISH_CRATES; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "coordinator-release-ci (+https://github.com/${{ github.repository }})" \
+              "https://crates.io/api/v1/crates/$c/${{ steps.ref.outputs.version }}")"
+            echo "$c@${{ steps.ref.outputs.version }} -> HTTP $code"
+            if [ "$code" != "200" ]; then args="$args -p $c"; fi
+          done
+          echo "pkg_args=$args" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to crates.io
+        if: steps.plan.outputs.pkg_args != ''
+        run: cargo publish ${{ steps.plan.outputs.pkg_args }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes_file="$(mktemp)"
+          {
+            echo "Coordinator libraries ${{ steps.ref.outputs.tag }} (version ${{ steps.ref.outputs.version }})."
+            echo
+            echo "Crates:"
+            for c in $PUBLISH_CRATES; do
+              echo "- $c: https://crates.io/crates/$c/${{ steps.ref.outputs.version }}"
+            done
+          } > "$notes_file"
+
+          if gh release view "${{ steps.ref.outputs.tag }}" >/dev/null 2>&1; then
+            gh release edit "${{ steps.ref.outputs.tag }}" \
+              --title "${{ steps.ref.outputs.tag }}" --notes-file "$notes_file"
+          else
+            gh release create "${{ steps.ref.outputs.tag }}" \
+              --title "${{ steps.ref.outputs.tag }}" --notes-file "$notes_file"
+          fi
