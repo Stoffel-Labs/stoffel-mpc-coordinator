@@ -175,8 +175,9 @@ pub async fn coord_creation_block() {
     let anvil = spawn_anvil();
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
     let t = 1u64;
-    let threshold =
-        U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize));
+    let threshold = U256::from(<HoneyBadgerShareType as ShareBound<
+        HoneyBadgerShareValueType,
+    >>::min_shares(t as usize));
     let hash =
         FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
             .expect("invalid hash");
@@ -206,8 +207,9 @@ pub async fn event_listening() {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
-        let threshold =
-            U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize));
+        let threshold = U256::from(<HoneyBadgerShareType as ShareBound<
+            HoneyBadgerShareValueType,
+        >>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -238,8 +240,9 @@ pub async fn event_listening() {
         let anvil = spawn_anvil();
         let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
         let t = 1;
-        let threshold =
-            U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize));
+        let threshold = U256::from(<HoneyBadgerShareType as ShareBound<
+            HoneyBadgerShareValueType,
+        >>::min_shares(t as usize));
         let hash = FixedBytes::from_str(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -293,7 +296,9 @@ pub async fn start_node_rpc() {
     let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
     let n = 5;
     let t = 1;
-    let threshold = U256::from(<HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t));
+    let threshold = U256::from(<HoneyBadgerShareType as ShareBound<
+        HoneyBadgerShareValueType,
+    >>::min_shares(t));
     let hash =
         FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000")
             .expect("invalid hash");
@@ -353,7 +358,8 @@ pub async fn end_to_end() {
 
     let n = 5;
     let t = 1u64;
-    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
+    let n_nodes =
+        <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12351u16 + i as u16))
         .collect();
@@ -385,15 +391,18 @@ pub async fn end_to_end() {
 
     let mut coords = Vec::new();
     for instance in instances.iter().take(n_nodes) {
-        coords.push(HoneyBadgerOnChainCoordinator::new(instance.clone(), n as u64, 1, 1, None).await);
+        coords
+            .push(HoneyBadgerOnChainCoordinator::new(instance.clone(), n as u64, 1, 1, None).await);
     }
 
     let mut rng = test_rng();
     let ids = sample_ids(n);
     let mask_shares =
-        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+            .unwrap();
     let output_shares =
-        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+            .unwrap();
 
     let mut node_rpcs = Vec::new();
     for i in 0..n_nodes {
@@ -462,7 +471,8 @@ pub async fn reset_and_rerun() {
 
     let n = 5;
     let t = 1u64;
-    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
+    let n_nodes =
+        <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12354u16 + i as u16))
         .collect();
@@ -532,9 +542,11 @@ pub async fn reset_and_rerun() {
     // Round 1
     let ids = sample_ids(n);
     let mask_shares =
-        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+            .unwrap();
     let output_shares =
-        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+            .unwrap();
     tokio::join!(
         run_node_round(
             &mut coords,
@@ -567,9 +579,11 @@ pub async fn reset_and_rerun() {
     // Round 2
     let ids = sample_ids(n);
     let mask_shares2 =
-        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+            .unwrap();
     let output_shares2 =
-        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng).unwrap();
+        HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+            .unwrap();
     tokio::join!(
         run_node_round(
             &mut coords,

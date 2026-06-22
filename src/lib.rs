@@ -1,15 +1,18 @@
-// The coordinator is generic over the share type `S` used to represent shares in the underlying
-// MPC protocol. Concretely, `S` must implement `ShareBound`, which is `SecretSharingScheme` from
-// mpc-protocols plus some additional bounds to make the code work.
-// Every struct and trait in this library that touches shares is parametrized as `<F: FftField, S: ShareBound<F>>`;
-// the generic type `F` comes directly from the definition of `SecretSharingScheme`.
-//
-// Two share types are already contained and can be selected by choosing the concrete `S`
-// at coordinator startup:
-//
-// * **`RobustShare<F>`**: the plain Shamir share used by HoneyBadger MPC.
-// * **`FeldmanShamirShare<F, G>`**: a Shamir share augmented with group elements that
-// enable verifiable secret sharing.
+//! Coordinator primitives for Stoffel MPC workflows.
+//!
+//! The coordinator is generic over the share type `S` used to represent shares in the underlying
+//! MPC protocol. Concretely, `S` must implement [`ShareBound`], which is
+//! `stoffelcrypto`'s `SecretSharingScheme` plus additional bounds required by the coordinator.
+//! Every struct and trait in this library that touches shares is parametrized as
+//! `<F: FftField, S: ShareBound<F>>`; the generic type `F` comes directly from the definition of
+//! `SecretSharingScheme`.
+//!
+//! Two share types are already supported and can be selected by choosing the concrete `S` at
+//! coordinator startup:
+//!
+//! * **`RobustShare<F>`**: the plain Shamir share used by HoneyBadger MPC.
+//! * **`FeldmanShamirShare<F, G>`**: a Shamir share augmented with group elements that enable
+//!   verifiable secret sharing.
 
 /// Self-signed certificates used for tests.
 pub mod self_signed_certs;

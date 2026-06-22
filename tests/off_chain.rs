@@ -4,8 +4,9 @@ use std::sync::Arc;
 use stoffel_mpc_coordinator::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator::tests::fake_coord::{
     off_chain::{
-        HoneyBadgerCoordinatorRPCServerSharedBase, HoneyBadgerNodeRPCClient, HoneyBadgerNodeRPCServer,
-        HoneyBadgerOffChainCoordinatorClient, HoneyBadgerOffChainCoordinatorServer,
+        HoneyBadgerCoordinatorRPCServerSharedBase, HoneyBadgerNodeRPCClient,
+        HoneyBadgerNodeRPCServer, HoneyBadgerOffChainCoordinatorClient,
+        HoneyBadgerOffChainCoordinatorServer,
     },
     HoneyBadgerShareType, HoneyBadgerShareValueType,
 };
@@ -190,7 +191,8 @@ async fn end_to_end() {
 
     let n = 5;
     let t = 1;
-    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
+    let n_nodes =
+        <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12349u16 + i as u16))
         .collect();
@@ -234,7 +236,7 @@ async fn end_to_end() {
                 coord_addr,
                 coord_port,
                 1,
-                n as u64,
+                n,
                 1,
                 cert.clone(),
             )
@@ -361,7 +363,7 @@ async fn end_to_end() {
             coord_addr,
             coord_port,
             1,
-            n as u64,
+            n,
             1,
             cert.clone(),
         )
@@ -422,7 +424,8 @@ async fn end_to_end_fake_coord() {
 
     let n: usize = 5;
     let t = 1u64;
-    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
+    let n_nodes =
+        <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12353u16 + i as u16))
         .collect();
@@ -483,9 +486,14 @@ async fn end_to_end_fake_coord() {
         let mask_shares =
             HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
                 .unwrap();
-        let output_shares =
-            HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
-                .unwrap();
+        let output_shares = HoneyBadgerShareType::compute_shares(
+            correct_output,
+            n,
+            t as usize,
+            Some(&ids),
+            &mut rng,
+        )
+        .unwrap();
 
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {

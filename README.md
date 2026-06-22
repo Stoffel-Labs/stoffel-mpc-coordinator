@@ -1,4 +1,19 @@
-# Deploying the coordinator
+# Stoffel MPC Coordinator Library
+
+`stoffel-mpc-coordinator` provides coordinator primitives for Stoffel MPC workflows. It manages the full protocol lifecycle: preprocessing, input-mask reservation, input collection, MPC execution, and output distribution.
+
+The crate supports two coordinator transports:
+
+- **On-chain**: Ethereum smart-contract coordination via Alloy and the Stoffel Solidity bindings.
+- **Off-chain**: secure JSON-RPC over mutual TLS for local or non-chain deployments.
+
+Default features enable both transports. Use `--no-default-features --features off-chain` or `--no-default-features --features on-chain` to build only one transport.
+
+## Package status
+
+This is a `0.1.0` release-prep crate. It currently depends on Stoffel git dependencies that need to be published or converted to registry dependencies before a crates.io publish can succeed.
+
+## Deploying the coordinator
 
 Start Anvil using `anvil`.
 
@@ -6,7 +21,7 @@ Install a mock on-chain coordinator with
 `DEPLOY_SK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' cargo run --bin deploy-contract -- --eth-node-addr ws://127.0.0.1:8545 --program program.stflb --t 1 --initial-mpc-nodes 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC,0x90F79bf6EB2c4f870365E785982E1f101E93b906,0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65 --output-clients 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`.
 Deployment derives the program hash, input count, and MPC backend threshold from the compiled program manifest.
 
-For the off-chain coordinator, generate identities using `./src/tests/generate-ids/generate-ids ids 2 5` (output directory `ids`, 2 clients, 5 nodes).
+For the off-chain coordinator, generate identities using `cargo run --bin generate-ids -- ids 2 5` (output directory `ids`, 2 clients, 5 nodes).
 Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt,ids/pub/clients/client1.crt`.
 
 For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
@@ -17,9 +32,9 @@ The off-chain coordinator also selects the MPC share backend from the `.stflb` m
 programs with `stoffel --mpc-backend honeybadger -b program.stfl` or
 `stoffel --mpc-backend avss -b program.stfl`. Legacy/no-program startup defaults to HoneyBadger.
 
-# Stoffel MPC Coordinator Library
+## Library overview
 
-This library provides an MPC coordinator that manages the full protocol workflow: preprocessing, input-mask reservation, input collection, MPC execution, and output distribution. It supports both an **on-chain** deployment backed by an Ethereum smart contract and an **off-chain** deployment over secure JSON-RPC, and is generic over the share type used by the underlying MPC protocol.
+This library is generic over the share type used by the underlying MPC protocol.
 
 ## Share Types
 
