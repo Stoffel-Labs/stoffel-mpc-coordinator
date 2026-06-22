@@ -2,21 +2,45 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", dev ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", dev ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The on-chain feature pulls in alloy "full" plus a few git dependencies,
+      # so cold builds are slow. Cache the registry, git deps, and target dir.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      # Installs forge/cast/anvil/chisel onto PATH. The on_chain tests call
+      # alloy's `Anvil::new().spawn()`, which executes the `anvil` binary, so
+      # anvil must be present before `cargo test`. The tests launch and tear
+      # down their own anvil instances (default mnemonic, matching the dev keys
+      # hard-coded in tests/on_chain.rs), so nothing needs to be started here.
+      - name: Install Foundry (provides anvil)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Verify anvil is on PATH
+        run: anvil --version
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Default features are on-chain + off-chain, so this runs both the
+      # off_chain and on_chain test binaries; the latter spins up anvil.
+      - name: Run tests
+        run: cargo test --verbose
