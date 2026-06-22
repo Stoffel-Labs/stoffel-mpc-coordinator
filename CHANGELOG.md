@@ -13,4 +13,4 @@
 
 ### Known limitations
 
-- crates.io publishing is blocked until git dependencies on Stoffel crates are replaced with registry dependencies or those dependencies are otherwise published in a compatible form.
+- crates.io publishing is blocked until the pinned Stoffel Solidity SDK binding crates are published or removed from the public dependency graph.
