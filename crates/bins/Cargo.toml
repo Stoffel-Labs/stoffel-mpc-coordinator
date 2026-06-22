@@ -1,0 +1,43 @@
+[package]
+name = "stoffel-mpc-coordinator-bins"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stoffel Labs Inc <contact@stoffelmpc.com>"]
+homepage = "https://stoffelmpc.com"
+repository = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"
+documentation = "https://docs.rs/stoffel-mpc-coordinator"
+categories = ["cryptography", "network-programming"]
+keywords = ["mpc", "coordinator", "cryptography", "json-rpc", "ethereum"]
+license = "Apache-2.0"
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "run-coord"
+path = "src/bin/run-coord.rs"
+
+[[bin]]
+name = "deploy-contract"
+path = "src/bin/deploy-contract.rs"
+
+[[bin]]
+name = "generate-ids"
+path = "src/bin/generate-ids.rs"
+
+[dependencies]
+stoffel-mpc-coordinator-shared = { version = "0.1.0", path = "../coord-shared" }
+stoffel-mpc-coordinator-off-chain = { path = "../off-chain" }
+stoffel-vm-types = "0.1.0"
+alloy = { version = "1.5.2", features = ["full", "node-bindings"] }
+alloy-primitives = { version = "1.5.4" }
+stoffel-solidity-bindings-test = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", rev = "269fadfade9ad33cf2b3fb05b927a08ac95dc43a" }
+ark-bls12-381 = "0.5.0"
+ark-ff = "0.5.0"
+ark-serialize = "0.5.0"
+clap = { version = "4.5.56", features = ["derive"] }
+hex = "0.4.3"
+rcgen = "0.14.7"
+rustls = "0.23.36"
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "time"] }
+x509-parser = "0.18.1"
