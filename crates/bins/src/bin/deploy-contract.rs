@@ -7,7 +7,9 @@ use alloy_primitives::{Address, FixedBytes, Keccak256, U256};
 use clap::Parser;
 use std::{env, str::FromStr};
 use stoffel_mpc_coordinator_shared::{
-    tests::fake_coord::{AvssShareType, AvssShareValueType, HoneyBadgerShareType, HoneyBadgerShareValueType},
+    tests::fake_coord::{
+        AvssShareType, AvssShareValueType, HoneyBadgerShareType, HoneyBadgerShareValueType,
+    },
     ShareBound,
 };
 use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;

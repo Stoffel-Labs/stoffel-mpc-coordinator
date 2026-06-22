@@ -1,7 +1,3 @@
-use stoffel_mpc_coordinator_shared::tests::fake_coord::{
-    AvssShareType, AvssShareValueType, AvssValueType,
-    HoneyBadgerShareType, HoneyBadgerShareValueType, HoneyBadgerValueType,
-};
 use crate::{
     CoordinatorRPCBaseServer, CoordinatorRPCServerConnectionBase, CoordinatorRPCServerSharedBase,
     OffChainCoordinatorClient, OffChainCoordinatorServer, StoffelCoordinatorRPCServer,
@@ -11,8 +7,12 @@ use ark_ff::FftField;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, RpcModule};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use stoffel_mpc_coordinator_shared::tests::fake_coord::{
+    AvssShareType, AvssShareValueType, AvssValueType, HoneyBadgerShareType,
+    HoneyBadgerShareValueType, HoneyBadgerValueType,
+};
 use stoffel_mpc_coordinator_shared::Round;
+use tokio::sync::Mutex;
 
 pub type HoneyBadgerOffChainCoordinatorClient =
     OffChainCoordinatorClient<HoneyBadgerShareValueType, HoneyBadgerShareType>;
@@ -28,13 +28,11 @@ pub type AvssCoordinatorRPCServerSharedBase = CoordinatorRPCServerSharedBase<Avs
 
 pub type HoneyBadgerNodeRPCClient =
     crate::node_rpc::NodeRPCClient<HoneyBadgerShareValueType, HoneyBadgerShareType>;
-pub type AvssNodeRPCClient =
-    crate::node_rpc::NodeRPCClient<AvssShareValueType, AvssShareType>;
+pub type AvssNodeRPCClient = crate::node_rpc::NodeRPCClient<AvssShareValueType, AvssShareType>;
 
 pub type HoneyBadgerNodeRPCServer =
     crate::node_rpc::NodeRPCServer<HoneyBadgerShareValueType, HoneyBadgerShareType>;
-pub type AvssNodeRPCServer =
-    crate::node_rpc::NodeRPCServer<AvssShareValueType, AvssShareType>;
+pub type AvssNodeRPCServer = crate::node_rpc::NodeRPCServer<AvssShareValueType, AvssShareType>;
 
 #[derive(Clone)]
 pub struct CoordinatorConnection<F: FftField, S: stoffel_mpc_coordinator_shared::ShareBound<F>> {
@@ -43,8 +41,7 @@ pub struct CoordinatorConnection<F: FftField, S: stoffel_mpc_coordinator_shared:
 
 pub type HoneyBadgerCoordinatorConnection =
     CoordinatorConnection<HoneyBadgerShareValueType, HoneyBadgerShareType>;
-pub type AvssCoordinatorConnection =
-    CoordinatorConnection<AvssShareValueType, AvssShareType>;
+pub type AvssCoordinatorConnection = CoordinatorConnection<AvssShareValueType, AvssShareType>;
 
 impl<S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>>
     stoffel_mpc_coordinator_shared::rpc::RPCServerConnection for CoordinatorConnection<Fr, S>
@@ -66,8 +63,8 @@ impl<S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>>
 }
 
 #[async_trait]
-impl<S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>>
-    StoffelCoordinatorRPCServer for CoordinatorConnection<Fr, S>
+impl<S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>> StoffelCoordinatorRPCServer
+    for CoordinatorConnection<Fr, S>
 {
     async fn start_preprocessing(&self) -> RpcResult<()> {
         self.base.transition(Round::Preprocessing).await
