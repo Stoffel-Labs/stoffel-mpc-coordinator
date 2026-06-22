@@ -1,4 +1,3 @@
-use stoffel_mpc_coordinator_shared::{Coordinator, CoordinatorError, Round, ShareBound};
 use alloy::providers::WalletProvider;
 use alloy::{
     network::EthereumWallet,
@@ -21,6 +20,7 @@ use p256::{pkcs8::DecodePrivateKey, SecretKey};
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
 use std::str::FromStr;
+use stoffel_mpc_coordinator_shared::{Coordinator, CoordinatorError, Round, ShareBound};
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorErrors;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
@@ -65,9 +65,11 @@ pub mod node_rpc {
     use tokio::sync::Mutex;
 
     use super::ClientIdentity;
-    use stoffel_mpc_coordinator_shared::{rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound};
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
+    use stoffel_mpc_coordinator_shared::{
+        rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound,
+    };
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
     use tokio::task::JoinHandle;
     use tokio::task::JoinSet;
@@ -236,12 +238,10 @@ pub mod node_rpc {
             )
             .expect("base nonce does not fit in u64");
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord, base_nonce)));
-            let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<NodeRPCServerConnection<P, F, S>>(
-                addr,
-                port,
-                cert_der,
-                key_der,
-                rpc_server_data.clone(),
+            let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<
+                NodeRPCServerConnection<P, F, S>,
+            >(
+                addr, port, cert_der, key_der, rpc_server_data.clone()
             )
             .await
             .expect("failed to start node RPC server");
@@ -367,7 +367,8 @@ pub mod node_rpc {
     }
 
     impl<P: Provider + WalletProvider + Clone + 'static, F: FftField, S: ShareBound<F>>
-        stoffel_mpc_coordinator_shared::rpc::RPCServerConnection for NodeRPCServerConnection<P, F, S>
+        stoffel_mpc_coordinator_shared::rpc::RPCServerConnection
+        for NodeRPCServerConnection<P, F, S>
     {
         type Internal = NodeRPCServerShared<P, F, S>;
 
@@ -1154,11 +1155,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                         .collect();
 
                     // enough shares available as checked by the coordinator
-                    match S::recover_secret(
-                        shares_i.as_slice(),
-                        self.n as usize,
-                        self.t as usize,
-                    ) {
+                    match S::recover_secret(shares_i.as_slice(), self.n as usize, self.t as usize) {
                         Ok((_, output_i)) => Some(output_i),
                         Err(_) => {
                             println!(

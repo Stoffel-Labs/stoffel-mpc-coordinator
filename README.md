@@ -11,7 +11,7 @@ Default features enable both transports. Use `--no-default-features --features o
 
 ## Package status
 
-This is a `0.1.0` release-prep crate. It currently depends on Stoffel git dependencies that need to be published or converted to registry dependencies before a crates.io publish can succeed.
+This is a `0.1.0` release-prep crate. It currently depends on the pinned Stoffel Solidity SDK binding crates, which need to be published or removed from the public dependency graph before a crates.io publish can succeed.
 
 ## Deploying the coordinator
 

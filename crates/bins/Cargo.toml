@@ -9,7 +9,8 @@ documentation = "https://docs.rs/stoffel-mpc-coordinator"
 categories = ["cryptography", "network-programming"]
 keywords = ["mpc", "coordinator", "cryptography", "json-rpc", "ethereum"]
 license = "Apache-2.0"
-readme = "README.md"
+readme = "../../README.md"
+description = "Deployment and local coordinator binaries for Stoffel MPC coordinator workflows"
 publish = false
 
 [[bin]]

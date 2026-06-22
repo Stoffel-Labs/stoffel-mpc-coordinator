@@ -1,10 +1,5 @@
 pub mod tests;
 
-use stoffel_mpc_coordinator_shared::{
-    round_before,
-    rpc::{ClientInfo, ValueWrapper},
-    Coordinator, CoordinatorError, Round, ShareBound,
-};
 use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use async_trait::async_trait;
@@ -28,6 +23,11 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use stoffel_mpc_coordinator_shared::{
+    round_before,
+    rpc::{ClientInfo, ValueWrapper},
+    Coordinator, CoordinatorError, Round, ShareBound,
+};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use CoordinatorRPCBaseError::*;
@@ -91,7 +91,6 @@ pub struct InputAssignment {
 /// The node-side RPC interface.
 pub mod node_rpc {
     use super::{AssignedMaskReservation, AssignedMaskShare, ClientIdentity};
-    use stoffel_mpc_coordinator_shared::{rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound};
     use ark_ff::FftField;
     use async_trait::async_trait;
     use jsonrpsee::{
@@ -107,6 +106,9 @@ pub mod node_rpc {
     use std::collections::{HashMap, VecDeque};
     use std::marker::PhantomData;
     use std::sync::Arc;
+    use stoffel_mpc_coordinator_shared::{
+        rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound,
+    };
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
     use tokio::task::JoinSet;
@@ -230,9 +232,7 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= S::min_shares(self.t) {
-                    if let Ok((_, mask)) =
-                        S::recover_secret(&mask_shares, self.n, self.t)
-                    {
+                    if let Ok((_, mask)) = S::recover_secret(&mask_shares, self.n, self.t) {
                         return Ok(mask);
                     }
                 }
@@ -349,12 +349,10 @@ pub mod node_rpc {
             key_der: Vec<u8>,
         ) -> Result<Self, CoordinatorError> {
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new()));
-            let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<NodeRPCServerImpl<F, S>>(
-                addr,
-                port,
-                cert_der,
-                key_der,
-                rpc_server_data.clone(),
+            let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<
+                NodeRPCServerImpl<F, S>,
+            >(
+                addr, port, cert_der, key_der, rpc_server_data.clone()
             )
             .await?;
             Ok(Self {
@@ -485,7 +483,9 @@ pub mod node_rpc {
         id: Vec<u8>,
     }
 
-    impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServerConnection for NodeRPCServerImpl<F, S> {
+    impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServerConnection
+        for NodeRPCServerImpl<F, S>
+    {
         type Internal = NodeRPCServerInternal<F, S>;
 
         fn new(internal: Arc<Mutex<Self::Internal>>, id: Vec<u8>) -> Self {
@@ -517,7 +517,9 @@ pub mod node_rpc {
         _phantom: PhantomData<F>,
     }
 
-    impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServerShared for NodeRPCServerInternal<F, S> {
+    impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServerShared
+        for NodeRPCServerInternal<F, S>
+    {
         fn add_client(
             &mut self,
             cert_der: Vec<u8>,
@@ -1170,7 +1172,7 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         // Late subscribers will replay this event from history.
         self.trans_events
             .get_mut(&round)
-            .expect(&format!("BUG: {:?} must be present!", round))
+            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round))
             .push(event.clone());
 
         self.round = round;
@@ -1194,10 +1196,9 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
     }
 }
 
-
 /// The basic shared state can be used as a full-fledged shared state.
-impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> stoffel_mpc_coordinator_shared::rpc::RPCServerShared
-    for CoordinatorRPCServerSharedBase<T>
+impl<T: CanonicalSerialize + CanonicalDeserialize + Clone>
+    stoffel_mpc_coordinator_shared::rpc::RPCServerShared for CoordinatorRPCServerSharedBase<T>
 {
     fn add_client(
         &mut self,
@@ -1398,19 +1399,13 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         Ok(())
     }
 
-    async fn sub_reserved_indices(
-        &self,
-        pending: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
+    async fn sub_reserved_indices(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
         d.subscribe_reserved_indices(pending).await
     }
 
-    async fn sub_masked_inputs(
-        &self,
-        pending: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
+    async fn sub_masked_inputs(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
         let mut d = self.d.lock().await;
 
         d.subscribe_masked_inputs(pending).await
@@ -1484,7 +1479,8 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         d.reserved_index_events.push(event.clone());
 
         if let Some(assigned_reservation) = assigned_reservation.clone() {
-            d.assigned_reserved_index_events.push(assigned_reservation.clone());
+            d.assigned_reserved_index_events
+                .push(assigned_reservation.clone());
         }
 
         // Broadcast reserved index to all subscribed RPC clients. Disconnected
@@ -1744,9 +1740,14 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
         let rpc_server_data = Arc::new(Mutex::new(shared));
-        let server_handle =
-            stoffel_mpc_coordinator_shared::rpc::start_coord::<C>(addr, port, cert_der, key_der, rpc_server_data.clone())
-                .await?;
+        let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<C>(
+            addr,
+            port,
+            cert_der,
+            key_der,
+            rpc_server_data.clone(),
+        )
+        .await?;
         Ok(Self {
             rpc_server: rpc_server_data,
             addr: String::from(addr),
@@ -1791,16 +1792,8 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
-        Self::start_rpc_client_with_parties(
-            addr,
-            port,
-            t,
-            n_parties,
-            n_outputs,
-            cert_der,
-            key_der,
-        )
-        .await
+        Self::start_rpc_client_with_parties(addr, port, t, n_parties, n_outputs, cert_der, key_der)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1813,8 +1806,13 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
-        let rpc_coord =
-            stoffel_mpc_coordinator_shared::self_signed_certs::setup_client(addr, port, cert_der, key_der.clone()).await?;
+        let rpc_coord = stoffel_mpc_coordinator_shared::self_signed_certs::setup_client(
+            addr,
+            port,
+            cert_der,
+            key_der.clone(),
+        )
+        .await?;
 
         Ok(Self {
             rpc_coord,
@@ -2061,11 +2059,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                         .collect();
 
                     // At least S::min_shares(t) shares are available as checked above.
-                    match S::recover_secret(
-                        &shares_i,
-                        self.n_parties as usize,
-                        self.t as usize,
-                    ) {
+                    match S::recover_secret(&shares_i, self.n_parties as usize, self.t as usize) {
                         Ok((_, output_i)) => Some(output_i),
                         Err(_) => {
                             println!(
