@@ -1,60 +1,101 @@
+use ark_ff::FftField;
 use ark_bls12_381::Fr;
-use stoffelmpc_mpc::common::SecretSharingScheme;
-#[cfg(feature = "avss")]
-use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
-#[cfg(feature = "avss")]
 use ark_bls12_381::G1Projective;
-#[cfg(not(feature = "avss"))]
+use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+#[cfg(feature = "on-chain")]
+use crate::on_chain::node_rpc::NodeRPCClient;
+#[cfg(feature = "on-chain")]
+use crate::on_chain::node_rpc::NodeRPCServer;
 
-pub type FakeShareValueType = Fr;
+pub type HoneyBadgerShareValueType = Fr;
+pub type HoneyBadgerValueType = Fr;
+pub type HoneyBadgerShareType = RobustShare<HoneyBadgerShareValueType>;
 
-#[cfg(not(feature = "avss"))]
-pub type FakeShareType = RobustShare<FakeShareValueType>;
+pub type AvssShareGroupType = G1Projective;
+pub type AvssShareValueType = Fr;
+pub type AvssValueType = Fr;
+pub type AvssShareType = FeldmanShamirShare<AvssShareValueType, AvssShareGroupType>;
 
-#[cfg(feature = "avss")]
-pub type FakeShareGroupType = G1Projective;
-#[cfg(feature = "avss")]
-pub type FakeShareType = FeldmanShamirShare<FakeShareValueType, FakeShareGroupType>;
-
-pub type FakeValueType = <FakeShareType as SecretSharingScheme<FakeShareValueType>>::SecretType;
-
+#[cfg(feature = "on-chain")]
 pub mod on_chain {
     use super::*;
     use crate::on_chain::OnChainCoordinator;
 
-    pub type FakeOnChainCoordinator<P> = OnChainCoordinator<P, FakeShareValueType, FakeShareType>;
+    pub type HoneyBadgerOnChainCoordinator<P> = OnChainCoordinator<P, HoneyBadgerShareValueType, HoneyBadgerShareType>;
+    pub type HoneyBadgerNodeRPCClient = NodeRPCClient<HoneyBadgerShareValueType, HoneyBadgerShareType>;
+    pub type HoneyBadgerNodeRPCServer<P> = NodeRPCServer<P, HoneyBadgerShareValueType, HoneyBadgerShareType>;
 
-    pub type FakeNodeRPCClient = crate::on_chain::node_rpc::NodeRPCClient<FakeShareValueType, FakeShareType>;
-    pub type FakeNodeRPCServer<P> = crate::on_chain::node_rpc::NodeRPCServer<P, FakeShareValueType, FakeShareType>;
+    pub type AvssOnChainCoordinator<P> = OnChainCoordinator<P, AvssShareValueType, AvssShareType>;
+    pub type AvssNodeRPCClient = NodeRPCClient<AvssShareValueType, AvssShareType>;
+    pub type AvssNodeRPCServer<P> = NodeRPCServer<P, AvssShareValueType, AvssShareType>;
 }
 
+#[cfg(feature = "off-chain")]
 pub mod off_chain {
     use super::*;
-    use crate::{Round, off_chain::{ClientIdentity, OffChainCoordinatorClient, OffChainCoordinatorServer, CoordinatorRPCServerSharedBase, CoordinatorRPCServerConnectionBase, StoffelCoordinatorRPCServer, CoordinatorRPCBaseServer}};
+    use crate::{
+        off_chain::{
+            ClientIdentity, CoordinatorRPCBaseServer, CoordinatorRPCServerConnectionBase,
+            CoordinatorRPCServerSharedBase, OffChainCoordinatorClient, OffChainCoordinatorServer,
+            StoffelCoordinatorRPCServer,
+        },
+        Round,
+    };
+    use async_trait::async_trait;
+    use jsonrpsee::{core::RpcResult, RpcModule};
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use jsonrpsee::{RpcModule, core::RpcResult};
-    use async_trait::async_trait;
 
-    pub type FakeOffChainCoordinatorClient = OffChainCoordinatorClient<FakeShareValueType, FakeShareType>;
-    pub type FakeOffChainCoordinatorServer = OffChainCoordinatorServer<FakeCoordinatorConnection>;
-    pub type FakeCoordinatorRPCServerSharedBase = CoordinatorRPCServerSharedBase<FakeValueType>;
+    pub type HoneyBadgerOffChainCoordinatorClient =
+        OffChainCoordinatorClient<HoneyBadgerShareValueType, HoneyBadgerShareType>;
+    pub type AvssOffChainCoordinatorClient =
+        OffChainCoordinatorClient<HoneyBadgerShareValueType, AvssShareType>;
 
-    pub type FakeNodeRPCClient = crate::off_chain::node_rpc::NodeRPCClient<FakeShareValueType, FakeShareType>;
-    pub type FakeNodeRPCServer = crate::off_chain::node_rpc::NodeRPCServer<FakeShareValueType, FakeShareType>;
+    pub type HoneyBadgerOffChainCoordinatorServer =
+        OffChainCoordinatorServer<HoneyBadgerCoordinatorConnection>;
+    pub type HoneyBadgerCoordinatorRPCServerSharedBase = CoordinatorRPCServerSharedBase<HoneyBadgerValueType>;
+    pub type AvssOffChainCoordinatorServer = OffChainCoordinatorServer<AvssCoordinatorConnection>;
+    pub type AvssCoordinatorRPCServerSharedBase = CoordinatorRPCServerSharedBase<AvssValueType>;
 
+    pub type HoneyBadgerNodeRPCClient =
+        crate::off_chain::node_rpc::NodeRPCClient<HoneyBadgerShareValueType, HoneyBadgerShareType>;
+    pub type AvssNodeRPCClient =
+        crate::off_chain::node_rpc::NodeRPCClient<AvssShareValueType, AvssShareType>;
+
+    pub type HoneyBadgerNodeRPCServer =
+        crate::off_chain::node_rpc::NodeRPCServer<HoneyBadgerShareValueType, HoneyBadgerShareType>;
+    pub type AvssNodeRPCServer =
+        crate::off_chain::node_rpc::NodeRPCServer<AvssShareValueType, AvssShareType>;
+
+    /// Below is shown how to define your own off-chain coordinator. `CoordinatorRPCServerConnectionBase` is the data
+    /// that is stored on the coordinator and shared among connections to all coordinator clients, i.e., MPC clients
+    /// or MPC nodes. For a new off-chain coordinator, a struct for a connection like `CoordinatorConnection` needs to
+    /// be defined. This should probably contain a `CoordinatorRPCServerConnectionBase` object, but
+    /// can also contain other per-connection data.
+    /// The connection struct then needs to implement the `RPCServerConnection` and `StoffelCoordinatorRPCServer` traits.
+    ///
+    /// A connection struct for the fake coordinators.
     #[derive(Clone)]
-    pub struct FakeCoordinatorConnection {
-        base: CoordinatorRPCServerConnectionBase<FakeShareValueType, FakeShareType>,
+    pub struct CoordinatorConnection<F: FftField, S: crate::ShareBound<F>> {
+        base: CoordinatorRPCServerConnectionBase<F, S>,
     }
 
-    impl crate::rpc::RPCServerConnection for FakeCoordinatorConnection {
-        type Internal = CoordinatorRPCServerSharedBase<FakeValueType>;
+    /// The two trait implementations below are for the fake coordinator. Since there are two
+    /// variants for HB and AVSS, which both have the same types for share values and secret
+    /// values, we have one implementation per trait and instantiate them for HB and AVSS.
+    pub type HoneyBadgerCoordinatorConnection = CoordinatorConnection<HoneyBadgerShareValueType, HoneyBadgerShareType>;
+    pub type AvssCoordinatorConnection = CoordinatorConnection<AvssShareValueType, AvssShareType>;
+
+
+    impl<S: crate::ShareBound<Fr, ValueType = Fr>>
+        crate::rpc::RPCServerConnection for CoordinatorConnection<Fr, S>
+    {
+        type Internal = CoordinatorRPCServerSharedBase<Fr>;
 
         fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
             Self {
-                base: CoordinatorRPCServerConnectionBase::new(internal, id)
+                base: CoordinatorRPCServerConnectionBase::new(internal, id),
             }
         }
 
@@ -68,7 +109,9 @@ pub mod off_chain {
     }
 
     #[async_trait]
-    impl StoffelCoordinatorRPCServer for FakeCoordinatorConnection {
+    impl<S: crate::ShareBound<Fr, ValueType = Fr>>
+        StoffelCoordinatorRPCServer for CoordinatorConnection<Fr, S>
+    {
         async fn start_preprocessing(&self) -> RpcResult<()> {
             self.base.transition(Round::Preprocessing).await
         }

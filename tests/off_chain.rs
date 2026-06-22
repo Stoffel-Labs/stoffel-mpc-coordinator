@@ -2,16 +2,16 @@ use ark_bls12_381::Fr;
 use ark_std::test_rng;
 use std::sync::Arc;
 use stoffel_mpc_coordinator::self_signed_certs::{client_cert, server_cert};
-use stoffel_mpc_coordinator::Round;
 use stoffel_mpc_coordinator::tests::fake_coord::{
-    FakeShareType, FakeShareValueType,
     off_chain::{
-        FakeCoordinatorRPCServerSharedBase, FakeNodeRPCClient, FakeNodeRPCServer,
-        FakeOffChainCoordinatorClient, FakeOffChainCoordinatorServer,
-    }
+        HoneyBadgerCoordinatorRPCServerSharedBase, HoneyBadgerNodeRPCClient, HoneyBadgerNodeRPCServer,
+        HoneyBadgerOffChainCoordinatorClient, HoneyBadgerOffChainCoordinatorServer,
+    },
+    HoneyBadgerShareType, HoneyBadgerShareValueType,
 };
-use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffel_mpc_coordinator::Round;
 use stoffel_mpc_coordinator::{Coordinator, ShareBound};
+use stoffelmpc_mpc::common::SecretSharingScheme;
 use tokio::sync::Barrier;
 
 fn sample_ids(n: usize) -> Vec<usize> {
@@ -31,8 +31,9 @@ async fn start_client_server() {
     let addr = "127.0.0.1";
     let port = 12345;
     let t = 1;
-    let server_state = FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-    let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+    let server_state =
+        HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         addr,
         port,
@@ -41,13 +42,12 @@ async fn start_client_server() {
     )
     .await
     .unwrap();
-    let timestamp = coord.get_timestamp();
 
-    let _ = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+    let _ = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
         addr,
         port,
-        timestamp,
         1,
+        5,
         1,
         client_cert(),
     )
@@ -72,34 +72,32 @@ async fn trigger_pp() {
         let port = 12346;
         let t = 1;
         let server_state =
-            FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord =
-            FakeOffChainCoordinatorServer::start_coord_from_cert(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert(),
-            )
-            .await
-            .unwrap();
-        let timestamp = coord.get_timestamp();
-
-        let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+            HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+        let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+            server_state,
             addr,
             port,
-            timestamp,
+            t,
+            server_cert(),
+        )
+        .await
+        .unwrap();
+
+        let node0 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
+            addr,
+            port,
             1,
+            5,
             1,
             certs.remove(0),
         )
         .await
         .unwrap();
-        let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let node1 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
-            timestamp,
             1,
+            5,
             1,
             certs.remove(0),
         )
@@ -131,35 +129,33 @@ async fn trigger_pp() {
         let port = 12347;
         let t = 1;
         let server_state =
-            FakeCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
-        let coord =
-            FakeOffChainCoordinatorServer::start_coord_from_cert(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert(),
-            )
-            .await
-            .unwrap();
-        let timestamp = coord.get_timestamp();
-        let barrier = Arc::new(Barrier::new(2));
-
-        let node0 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+            HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+        let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+            server_state,
             addr,
             port,
-            timestamp,
+            t,
+            server_cert(),
+        )
+        .await
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let node0 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
+            addr,
+            port,
             1,
+            5,
             1,
             certs.remove(0),
         )
         .await
         .unwrap();
-        let node1 = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let node1 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             addr,
             port,
-            timestamp,
             1,
+            5,
             1,
             certs.remove(0),
         )
@@ -194,7 +190,7 @@ async fn end_to_end() {
 
     let n = 5;
     let t = 1;
-    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12349u16 + i as u16))
         .collect();
@@ -209,7 +205,7 @@ async fn end_to_end() {
     let correct_output = Fr::from(31415);
     let coord_addr = "127.0.0.1";
     let coord_port = 12348;
-    let server_state = FakeCoordinatorRPCServerSharedBase::new(
+    let server_state = HoneyBadgerCoordinatorRPCServerSharedBase::new(
         [0u8; 32],
         n,
         t,
@@ -217,7 +213,7 @@ async fn end_to_end() {
         1,
         vec![public_keys[5].clone()],
     );
-    let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         coord_addr,
         coord_port,
@@ -226,22 +222,21 @@ async fn end_to_end() {
     )
     .await
     .unwrap();
-    let timestamp = coord.get_timestamp();
     let barrier = Arc::new(Barrier::new(3));
 
     // MPC node (designated party), also RPC client
     tokio::spawn({
         let barrier = barrier.clone();
 
-        let mut coords: Vec<FakeOffChainCoordinatorClient> = Vec::new();
-        for i in 0..n_nodes {
-            let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let mut coords: Vec<HoneyBadgerOffChainCoordinatorClient> = Vec::new();
+        for cert in certs.iter().take(n_nodes) {
+            let coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
-                timestamp,
                 1,
+                n as u64,
                 1,
-                certs[i].clone(),
+                cert.clone(),
             )
             .await
             .unwrap();
@@ -252,7 +247,7 @@ async fn end_to_end() {
         // node here, but we use 3 RPC nodes to make the process work
         let mut rng = test_rng();
         let ids = sample_ids(n as usize);
-        let mask_shares = FakeShareType::compute_shares(
+        let mask_shares = HoneyBadgerShareType::compute_shares(
             correct_mask,
             n as usize,
             t as usize,
@@ -260,7 +255,7 @@ async fn end_to_end() {
             &mut rng,
         )
         .unwrap();
-        let output_shares = FakeShareType::compute_shares(
+        let output_shares = HoneyBadgerShareType::compute_shares(
             correct_output,
             n as usize,
             t as usize,
@@ -271,7 +266,7 @@ async fn end_to_end() {
 
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {
-            let mut node_rpc = FakeNodeRPCServer::start_from_cert(
+            let mut node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
@@ -298,12 +293,14 @@ async fn end_to_end() {
                 .await
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
-            for (c, i) in &client_to_indices {
-                println!("NODE: client {:?} reserved index {:?}", c, i);
-                for node_rpc in node_rpcs.iter_mut() {
-                    // just received by one node here, but in reality would be received by
-                    // all nodes, so we simulate this here for more nodes
-                    node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+            for (c, indices) in &client_to_indices {
+                for i in indices {
+                    println!("NODE: client {:?} reserved index {:?}", c, i);
+                    for node_rpc in node_rpcs.iter_mut() {
+                        // just received by one node here, but in reality would be received by
+                        // all nodes, so we simulate this here for more nodes
+                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+                    }
                 }
             }
 
@@ -321,21 +318,18 @@ async fn end_to_end() {
                 .unwrap();
             for (c, masked_inputs) in client_to_masked_input {
                 for masked_input in masked_inputs {
-                    #[cfg(not(feature = "avss"))]
                     println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.share[0]
-                    );
-                    #[cfg(feature = "avss")]
-                    println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.feldmanshare.share[0]
+                        "NODE: client {:?} submitted masked input {:?}",
+                        c, masked_input
                     );
                 }
             }
             coords[0].trigger_round(Round::MPCExecution).await.unwrap();
             coords[0].wait_for_round(Round::MPCExecution).await.unwrap();
-            coords[0].trigger_round(Round::OutputDistribution).await.unwrap();
+            coords[0]
+                .trigger_round(Round::OutputDistribution)
+                .await
+                .unwrap();
             coords[0]
                 .wait_for_round(Round::OutputDistribution)
                 .await
@@ -363,17 +357,18 @@ async fn end_to_end() {
     tokio::spawn({
         let barrier = barrier.clone();
         let cert = certs[5].clone();
-        let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let mut coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             coord_addr,
             coord_port,
-            timestamp,
             1,
+            n as u64,
             1,
             cert.clone(),
         )
         .await
         .unwrap();
-        let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+        let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
+            n as usize,
             t as usize,
             node_rpc_addrs.clone(),
             cert.clone(),
@@ -427,7 +422,7 @@ async fn end_to_end_fake_coord() {
 
     let n: usize = 5;
     let t = 1u64;
-    let n_nodes = <FakeShareType as ShareBound<FakeShareValueType>>::min_shares(t as usize);
+    let n_nodes = <HoneyBadgerShareType as ShareBound<HoneyBadgerShareValueType>>::min_shares(t as usize);
     let node_rpc_addrs: Vec<(String, u16)> = (0..n_nodes)
         .map(|i| ("127.0.0.1".to_string(), 12353u16 + i as u16))
         .collect();
@@ -443,7 +438,7 @@ async fn end_to_end_fake_coord() {
 
     let coord_addr = "127.0.0.1";
     let coord_port = 12352;
-    let server_state = FakeCoordinatorRPCServerSharedBase::new(
+    let server_state = HoneyBadgerCoordinatorRPCServerSharedBase::new(
         [0u8; 32],
         5,
         t,
@@ -451,7 +446,7 @@ async fn end_to_end_fake_coord() {
         1,
         vec![public_keys[5].clone()],
     );
-    let coord = FakeOffChainCoordinatorServer::start_coord_from_cert(
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         coord_addr,
         coord_port,
@@ -460,7 +455,6 @@ async fn end_to_end_fake_coord() {
     )
     .await
     .unwrap();
-    let timestamp = coord.get_timestamp();
     let barrier = Arc::new(Barrier::new(3));
 
     // MPC node (designated party), also RPC client
@@ -468,14 +462,14 @@ async fn end_to_end_fake_coord() {
         let barrier = barrier.clone();
 
         let mut coords = Vec::new();
-        for i in 0..n_nodes {
-            let coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        for cert in certs.iter().take(n_nodes) {
+            let coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
                 coord_addr,
                 coord_port,
-                timestamp,
                 1,
+                n as u64,
                 1,
-                certs[i].clone(),
+                cert.clone(),
             )
             .await
             .unwrap();
@@ -487,15 +481,15 @@ async fn end_to_end_fake_coord() {
         let mut rng = test_rng();
         let ids = sample_ids(n);
         let mask_shares =
-            FakeShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
+            HoneyBadgerShareType::compute_shares(correct_mask, n, t as usize, Some(&ids), &mut rng)
                 .unwrap();
         let output_shares =
-            FakeShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
+            HoneyBadgerShareType::compute_shares(correct_output, n, t as usize, Some(&ids), &mut rng)
                 .unwrap();
 
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {
-            let mut node_rpc = FakeNodeRPCServer::start_from_cert(
+            let mut node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
@@ -522,12 +516,14 @@ async fn end_to_end_fake_coord() {
                 .await
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
-            for (c, i) in &client_to_indices {
-                println!("NODE: client {:?} reserved index {:?}", c, i);
-                for node_rpc in node_rpcs.iter_mut() {
-                    // just received by one node here, but in reality would be received by
-                    // all nodes, so we simulate this here for more nodes
-                    node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+            for (c, indices) in &client_to_indices {
+                for i in indices {
+                    println!("NODE: client {:?} reserved index {:?}", c, i);
+                    for node_rpc in node_rpcs.iter_mut() {
+                        // just received by one node here, but in reality would be received by
+                        // all nodes, so we simulate this here for more nodes
+                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+                    }
                 }
             }
 
@@ -542,15 +538,9 @@ async fn end_to_end_fake_coord() {
                 .unwrap();
             for (c, masked_inputs) in client_to_masked_input {
                 for masked_input in masked_inputs {
-                    #[cfg(not(feature = "avss"))]
                     println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.share[0]
-                    );
-                    #[cfg(feature = "avss")]
-                    println!(
-                        "NODE: client {:?} submitted masked input {}",
-                        c, masked_input.feldmanshare.share[0]
+                        "NODE: client {:?} submitted masked input {:?}",
+                        c, masked_input
                     );
                 }
             }
@@ -581,17 +571,18 @@ async fn end_to_end_fake_coord() {
     tokio::spawn({
         let barrier = barrier.clone();
         let cert = certs[5].clone();
-        let mut coord = FakeOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let mut coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
             coord_addr,
             coord_port,
-            timestamp,
             1,
+            n as u64,
             1,
             cert.clone(),
         )
         .await
         .unwrap();
-        let rpc_client = FakeNodeRPCClient::start_rpc_client_from_cert(
+        let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
+            n,
             t as usize,
             node_rpc_addrs.clone(),
             cert.clone(),

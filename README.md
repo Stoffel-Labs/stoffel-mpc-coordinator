@@ -3,10 +3,19 @@
 Start Anvil using `anvil`.
 
 Install a mock on-chain coordinator with
-`DEPLOY_SK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' cargo run --bin deploy-contract -- --eth-node-addr ws://127.0.0.1:8545 --hash 0000000000000000000000000000000000000000000000000000000000000000 --t 1 --n-inputs 2 --initial-mpc-nodes 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC,0x90F79bf6EB2c4f870365E785982E1f101E93b906,0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65`.
+`DEPLOY_SK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' cargo run --bin deploy-contract -- --eth-node-addr ws://127.0.0.1:8545 --program program.stflb --t 1 --initial-mpc-nodes 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC,0x90F79bf6EB2c4f870365E785982E1f101E93b906,0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65 --output-clients 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`.
+Deployment derives the program hash, input count, and MPC backend threshold from the compiled program manifest.
 
-For the off-chain coordinator, generate identities using `./generate-ids ids 2 5` (in the `ids` directory, 2 clients, 5 nodes).
-Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/coord.crt --server-key ids/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/nodes/node0.crt,ids/nodes/node1.crt,ids/nodes/node2.crt,ids/nodes/node3.crt,ids/nodes/node4.crt --output-clients ids/clients/client0.crt,ids/clients/client1.crt`.
+For the off-chain coordinator, generate identities using `./src/tests/generate-ids/generate-ids ids 2 5` (output directory `ids`, 2 clients, 5 nodes).
+Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt,ids/pub/clients/client1.crt`.
+
+For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
+
+`cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
+
+The off-chain coordinator also selects the MPC share backend from the `.stflb` manifest. Compile
+programs with `stoffel --mpc-backend honeybadger -b program.stfl` or
+`stoffel --mpc-backend avss -b program.stfl`. Legacy/no-program startup defaults to HoneyBadger.
 
 # Stoffel MPC Coordinator Library
 
@@ -20,11 +29,12 @@ The coordinator is parameterized as `<F: FftField, S: ShareBound<F>>`, where `S`
 - **`CanonicalSerialize` / `CanonicalDeserialize`**: shares are transmitted as compressed bytes over JSON-RPC.
 - **`Clone`, `Send`, `'static`**: required for use across async Tokio tasks.
 
-Two concrete share types are provided and selected at compile time:
+Two concrete share types are provided. Off-chain startup selects between them from the running
+program manifest when `--program` is provided:
 
-| Feature flag | Share type | Description |
+| Manifest backend | Share type | Description |
 |---|---|---|
-| (default) | `RobustShare<F>` | Plain Shamir share used by HoneyBadger MPC |
+| `honeybadger` | `RobustShare<F>` | Plain Shamir share used by HoneyBadger MPC |
 | `avss` | `FeldmanShamirShare<F, G>` | Shamir share with group-element commitments for verifiable secret sharing |
 
 To add a new share type, implement `ShareBound<F>` for it, paying particular attention to `compute_masked_input`, which subtracts a mask share from a masked input while preserving any per-share metadata.
@@ -72,6 +82,7 @@ Key behaviors:
 - **Index reservation**: clients call `reserve_mask_index(i)` during `InputMaskReservation`. The event is broadcast to all `sub_reserved_indices` subscribers, including MPC nodes.
 - **Mask-share distribution**: each MPC node runs a `node_rpc::NodeRPCServer`. After learning a client's reserved index from the coordinator, the node delivers its mask share to the client over a dedicated WebSocket subscription authenticated by mTLS. The client collects `2t + 1` shares and reconstructs the mask locally.
 - **Output distribution**: MPC nodes HPKE-encrypt their output shares under the client's P-256 public key and call `send_output_shares`. Once `2t + 1` shares have arrived at the coordinator, they are forwarded to the client's `obtain_output_shares` subscription.
+- **Bound VM IO layout**: `.stflb` bytecode can carry a client IO manifest built from `ClientStore.take_share*` and client-output calls. Off-chain startup binds VM `client_slot` values to certificate public keys, derives input-mask capacity from bound input counts, and authorizes output clients from bound output counts. Scalar IO types stay with the SDK/VM manifest and are not interpreted by the coordinator. On-chain contracts/events do not yet carry this layout metadata; equivalent Solidity support is deferred.
 - **Authentication**: all connections use mutual TLS with self-signed certificates. The client's identity is the DER-encoded public key from its certificate, used consistently towards both the coordinator and node RPC servers.
 - **Late-subscriber safety**: subscribers pass the coordinator's startup timestamp so that events fired before the subscription is opened are replayed immediately.
 
@@ -87,4 +98,3 @@ The off-chain coordinator is split into two RPC trait layers:
 - **HPKE encryption**: output shares are encrypted.
 - **Threshold**: secret reconstruction requires `2t + 1` shares; both the coordinator and clients enforce this before forwarding or accepting outputs.
 - **Testing utilities**: `self_signed_certs` provides `server_cert()` / `client_cert()` helpers. `setup_test()` installs the default `rustls` crypto provider required before any TLS connections are made in tests.
-

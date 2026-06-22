@@ -36,6 +36,7 @@ pub type ClientIdentity = Address;
 pub struct OnChainCoordinator<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
     coord: StoffelCoordinatorInstance<P>,
     pub contract_block: u64,
+    n: u64,
     t: u64,
     n_outputs: Option<u64>,
     key_der: Option<Vec<u8>>,
@@ -93,13 +94,14 @@ pub mod node_rpc {
     pub struct NodeRPCServer<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> {
         pub(super) rpc_server: Arc<Mutex<NodeRPCServerShared<P, F, S>>>,
         addr: String,
-        port: u16,
-        server_handle: JoinHandle<()>,
+        _port: u16,
+        _server_handle: JoinHandle<()>,
     }
 
     /// Exterior representation of an RPC client that interfaces with the node-side RPC interface.
     pub struct NodeRPCClient<F: FftField, S: ShareBound<F>> {
         node_rpcs: Vec<Client>,
+        n: usize,
         t: usize,
         _marker: std::marker::PhantomData<(F, S)>,
     }
@@ -107,11 +109,13 @@ pub mod node_rpc {
     impl<F: FftField, S: ShareBound<F>> NodeRPCClient<F, S> {
         /// Start an RPC client from a certificate generated using rcgen.
         pub async fn start_rpc_client_from_cert(
+            n: usize,
             t: usize,
             addrs: Vec<(String, u16)>,
             client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
         ) -> Self {
             Self::start_rpc_client(
+                n,
                 t,
                 addrs,
                 client_cert.cert.der().to_vec(),
@@ -124,28 +128,29 @@ pub mod node_rpc {
         /// The information is the same as for `start_rpc_client_from_cert`, but the format
         /// differs.
         pub async fn start_rpc_client(
+            n: usize,
             t: usize,
             addrs: Vec<(String, u16)>,
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Self {
-            let node_rpcs: Vec<Client> = futures_util::future::join_all(
-                addrs.iter().map(|(addr, port)| {
+            let node_rpcs: Vec<Client> =
+                futures_util::future::join_all(addrs.iter().map(|(addr, port)| {
                     crate::self_signed_certs::setup_client(
                         addr,
                         *port,
                         cert_der.clone(),
                         key_der.clone(),
                     )
-                }),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("failed to connect to node RPC");
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to connect to node RPC");
 
             Self {
                 node_rpcs,
+                n,
                 t,
                 _marker: std::marker::PhantomData,
             }
@@ -175,7 +180,7 @@ pub mod node_rpc {
                 mask_shares.push(share);
 
                 if mask_shares.len() >= S::min_shares(self.t) {
-                    match S::recover_secret(&mask_shares, 4 * self.t + 1, self.t) {
+                    match S::recover_secret(&mask_shares, self.n, self.t) {
                         Ok((_, mask)) => {
                             return Ok(mask);
                         }
@@ -242,8 +247,8 @@ pub mod node_rpc {
             Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
-                port,
-                server_handle,
+                _port: port,
+                _server_handle: server_handle,
             }
         }
 
@@ -604,6 +609,7 @@ pub async fn ws_connect(
 pub async fn setup_coord<T, F: FftField, S: ShareBound<F>>(
     eth: T,
     contract_addr: Address,
+    n: u64,
     t: u64,
     n_outputs: u64,
     key_der: Option<Vec<u8>>,
@@ -612,7 +618,7 @@ where
     T: Provider + WalletProvider + Clone,
 {
     let coord_instance = StoffelCoordinator::new(contract_addr, eth.clone());
-    OnChainCoordinator::new(coord_instance, t, n_outputs, key_der).await
+    OnChainCoordinator::new(coord_instance, n, t, n_outputs, key_der).await
 }
 
 impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
@@ -620,6 +626,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
 {
     pub async fn new(
         coord: StoffelCoordinatorInstance<P>,
+        n: u64,
         t: u64,
         n_outputs: u64,
         key_der: Option<Vec<u8>>,
@@ -628,6 +635,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
         Self {
             coord,
             contract_block,
+            n,
             t,
             n_outputs: Some(n_outputs),
             key_der,
@@ -845,9 +853,9 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
 
     async fn wait_for_indices(
         &self,
-        n_clients: u64,
-    ) -> Result<HashMap<ClientIdentity, u64>, CoordinatorError> {
-        let mut addr_to_i = HashMap::new();
+        n_inputs: u64,
+    ) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
+        let mut addr_to_i: HashMap<ClientIdentity, Vec<u64>> = HashMap::new();
 
         // spawn thread to receive all ReservedInputEvents
         let mut events = self
@@ -867,15 +875,15 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
             _,
         ))) = events.next().await
         {
-            addr_to_i.insert(
-                client,
-                u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"),
-            );
+            addr_to_i
+                .entry(client)
+                .or_default()
+                .push(u256_to_u64(reservedIndex).expect("conversion from U256 to u64 failed"));
             eprintln!(
                 "[party] Recorded reserved mask index {} for client address {:?}",
                 reservedIndex, client
             );
-            if addr_to_i.len() as u64 == n_clients {
+            if addr_to_i.values().map(Vec::len).sum::<usize>() as u64 == n_inputs {
                 break;
             }
         }
@@ -885,7 +893,7 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
 
     async fn wait_for_inputs(
         &self,
-        n_clients: u64,
+        n_inputs: u64,
         mask_shares: Vec<S>,
     ) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
         let mut events = match self
@@ -904,8 +912,8 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
             }
         };
 
-        let mut inputs: HashMap<ClientIdentity, Vec<S>> = HashMap::new();
-        for _ in 0..n_clients {
+        let mut inputs: HashMap<ClientIdentity, Vec<(u64, S)>> = HashMap::new();
+        for _ in 0..n_inputs {
             match events.next().await {
                 Some(Ok((
                     StoffelCoordinator::MaskedInputEvent {
@@ -925,7 +933,10 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                     let input = S::compute_masked_input(masked_input_value, mask_share)
                         .map_err(|_| CoordinatorError::ShareError)?;
 
-                    inputs.insert(client, vec![input]);
+                    inputs.entry(client).or_default().push((
+                        u256_to_u64(reservedIndex).ok_or(CoordinatorError::U256ToU64Error)?,
+                        input,
+                    ));
                 }
                 _ => {
                     return Err(CoordinatorError::EthereumError(
@@ -935,7 +946,17 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                 }
             }
         }
-        Ok(inputs)
+        Ok(inputs
+            .into_iter()
+            .map(|(client, mut indexed_inputs)| {
+                indexed_inputs.sort_by_key(|(reserved_index, _)| *reserved_index);
+                let inputs = indexed_inputs
+                    .into_iter()
+                    .map(|(_, input)| input)
+                    .collect::<Vec<_>>();
+                (client, inputs)
+            })
+            .collect())
     }
 
     async fn wait_for_round(&self, round: Round) -> Result<(), CoordinatorError> {
@@ -1133,10 +1154,10 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
                         .map(|shares| shares[i].clone())
                         .collect();
 
-                    // at least 2t+1 shares available as checked previously by the coordinator
+                    // enough shares available as checked by the coordinator
                     match S::recover_secret(
                         shares_i.as_slice(),
-                        (4 * self.t + 1) as usize,
+                        self.n as usize,
                         self.t as usize,
                     ) {
                         Ok((_, output_i)) => Some(output_i),
