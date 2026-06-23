@@ -38,7 +38,7 @@ jobs:
         run: anvil --version
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
 
       # Default features are on-chain + off-chain, so this runs both the
       # off_chain and on_chain test binaries; the latter spins up anvil.
