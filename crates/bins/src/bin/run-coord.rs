@@ -1,5 +1,5 @@
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
 use std::fs;
 use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
@@ -14,6 +14,14 @@ use stoffel_mpc_coordinator_shared::tests::fake_coord::{AvssValueType, HoneyBadg
 use stoffel_mpc_coordinator_shared::CoordinatorError;
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
+
+#[derive(ValueEnum, Clone, Debug, Default)]
+#[clap(rename_all = "lower")]
+enum Backend {
+    #[default]
+    HoneyBadger,
+    Avss,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -50,6 +58,9 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1")]
     addr: String,
+
+    #[arg(long, default_value = "honeybadger")]
+    backend: Backend,
 }
 
 type InputAssignmentBuildResult = (InputAssignment, Vec<ClientIdentity>);
@@ -237,8 +248,12 @@ async fn main() {
         let n_inputs = args
             .n_inputs
             .expect("--n-inputs is required when --program is not provided");
+        let mpc_backend = match args.backend {
+            Backend::HoneyBadger => MpcBackend::HoneyBadger,
+            Backend::Avss => MpcBackend::Avss,
+        };
         (
-            MpcBackend::HoneyBadger,
+            mpc_backend,
             CoordinatorRPCServerSharedBase::new(
                 hash,
                 n,
