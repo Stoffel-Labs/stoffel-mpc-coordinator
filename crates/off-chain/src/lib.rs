@@ -95,7 +95,7 @@ pub mod node_rpc {
     use async_trait::async_trait;
     use jsonrpsee::{
         async_client::Client,
-        core::{to_json_raw_value, SubscriptionResult},
+        core::{to_json_raw_value, RpcResult, SubscriptionResult},
         proc_macros::rpc,
         server::RpcModule,
         server::ServerHandle,
@@ -117,6 +117,7 @@ pub mod node_rpc {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum OffChainNodeRPCServerError {
         SerializationError = 1,
+        NotDesignatedParty = 2,
     }
 
     /// The off-chain node-side JSON-RPC interface.
@@ -132,6 +133,11 @@ pub mod node_rpc {
 
         #[subscription(name = "sub_receive_assigned_mask_shares", unsubscribe = "unsub_receive_assigned_mask_shares", item = Vec<AssignedMaskShare>)]
         async fn receive_assigned_mask_shares(&self) -> SubscriptionResult;
+
+        /// Resets per-job state so the node can serve a subsequent job without a process restart.
+        /// Only the designated leader node (the first element of the MPC node list) may call this.
+        #[method(name = "reset")]
+        async fn reset(&self) -> RpcResult<()>;
     }
 
     pub struct NodeRPCServer<F: FftField, S: ShareBound<F>> {
@@ -325,6 +331,15 @@ pub mod node_rpc {
 
             Ok(outputs)
         }
+
+        pub async fn reset(&self) -> Result<(), CoordinatorError> {
+            for rpc in self.node_rpcs.iter() {
+                OffChainNodeRPCClient::reset(rpc)
+                    .await
+                    .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+            }
+            Ok(())
+        }
     }
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCServer<F, S> {
@@ -332,12 +347,14 @@ pub mod node_rpc {
             addr: &str,
             port: u16,
             cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
+            designated_party: ClientIdentity,
         ) -> Result<Self, CoordinatorError> {
             Self::start(
                 addr,
                 port,
                 cert.cert.der().to_vec(),
                 cert.signing_key.serialize_der(),
+                designated_party,
             )
             .await
         }
@@ -347,8 +364,9 @@ pub mod node_rpc {
             port: u16,
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
+            designated_party: ClientIdentity,
         ) -> Result<Self, CoordinatorError> {
-            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new()));
+            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new(designated_party)));
             let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<
                 NodeRPCServerImpl<F, S>,
             >(
@@ -514,6 +532,8 @@ pub mod node_rpc {
         mask_shares: HashMap<u64, S>,
         /// Maps client identities the per-client information stored by the server.
         clients: HashMap<Vec<u8>, ClientInfo>,
+        /// The identity of the designated party permitted to call `reset`.
+        designated_party: ClientIdentity,
         _phantom: PhantomData<F>,
     }
 
@@ -538,7 +558,7 @@ pub mod node_rpc {
     }
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCServerInternal<F, S> {
-        pub fn new() -> Self {
+        pub fn new(designated_party: ClientIdentity) -> Self {
             Self {
                 index_to_client: HashMap::new(),
                 assigned_reservations: HashMap::new(),
@@ -547,14 +567,9 @@ pub mod node_rpc {
                 assigned_sinks: HashMap::new(),
                 mask_shares: HashMap::new(),
                 clients: HashMap::new(),
+                designated_party,
                 _phantom: PhantomData,
             }
-        }
-    }
-
-    impl<F: FftField, S: ShareBound<F>> Default for NodeRPCServerInternal<F, S> {
-        fn default() -> Self {
-            Self::new()
         }
     }
 
@@ -744,6 +759,32 @@ pub mod node_rpc {
 
             let sink = pending.accept().await?;
             d.assigned_sinks.insert(self.id.clone(), sink);
+
+            Ok(())
+        }
+
+        async fn reset(&self) -> RpcResult<()> {
+            use OffChainNodeRPCServerError::*;
+
+            let mut d = self.d.lock().await;
+
+            if self.id != d.designated_party {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(NotDesignatedParty as i32).code(),
+                    format!(
+                        "Only the designated party {:?} can reset the node.",
+                        d.designated_party
+                    ),
+                    None::<()>,
+                ));
+            }
+
+            d.index_to_client.clear();
+            d.assigned_reservations.clear();
+            d.client_to_index.clear();
+            d.sinks.clear();
+            d.assigned_sinks.clear();
+            d.mask_shares.clear();
 
             Ok(())
         }

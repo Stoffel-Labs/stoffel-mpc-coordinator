@@ -272,6 +272,7 @@ async fn end_to_end() {
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
+                public_keys[0].clone(),
             )
             .await
             .unwrap();
@@ -501,6 +502,7 @@ async fn end_to_end_fake_coord() {
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
+                public_keys[0].clone(),
             )
             .await
             .unwrap();

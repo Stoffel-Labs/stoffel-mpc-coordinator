@@ -265,12 +265,14 @@ async fn end_to_end() {
         )
         .unwrap();
 
+        let designated_party = certs[0].signing_key.public_key_raw().to_vec();
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {
             let mut node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
+                designated_party.clone(),
             )
             .await
             .unwrap();
@@ -500,6 +502,7 @@ async fn end_to_end_fake_coord() {
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
+                public_keys[0].clone(),
             )
             .await
             .unwrap();
