@@ -6,7 +6,22 @@ if [ $# -ne 3 ]; then
 fi
 
 generate_ids() {
-    env RUSTFLAGS="-A warnings" cargo run --bin generate-ids -q -- "$@"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --cert) cert="$2"; shift 2 ;;
+            --key) key="$2"; shift 2 ;;
+            --subject-alt-names) sans="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    san_ext=$(printf '%s' "$sans" | tr ',' '\n' | sed 's/.*/DNS:&/' | tr '\n' ',' | sed 's/,$//')
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 2>/dev/null | openssl pkey -outform DER -out "$key" 2>/dev/null
+    openssl req -x509 \
+        -key "$key" -keyform DER \
+        -outform DER -out "$cert" \
+        -days 365 \
+        -subj "/CN=${sans%%,*}" \
+        -addext "subjectAltName=${san_ext}" 2>/dev/null
 }
 
 ROOT_DIR=$1
