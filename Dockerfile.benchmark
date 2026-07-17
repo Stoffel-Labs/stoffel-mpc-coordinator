@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     net-tools \
+    iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
