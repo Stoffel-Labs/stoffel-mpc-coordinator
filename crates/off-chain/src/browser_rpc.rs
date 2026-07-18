@@ -9,6 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use jsonrpsee::{
     core::RpcResult,
     proc_macros::rpc,
+    server::RpcModule,
     types::{error::ErrorCode, ErrorObjectOwned},
 };
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,31 @@ impl<F: FftField, S: ShareBound<F>> BrowserNodeServer<F, S> {
         verifier: BrowserCapabilityVerifier,
     ) -> Self {
         Self { shared, verifier }
+    }
+}
+
+impl<F: FftField, S: ShareBound<F>>
+    crate::OffChainCoordinatorServer<crate::CoordinatorRPCServerConnectionBase<F, S>>
+{
+    /// Build the capability-authenticated browser RPC module over the same
+    /// coordinator state used by the existing mutual-TLS RPC server.
+    pub fn browser_rpc_module(
+        &self,
+        verifier: BrowserCapabilityVerifier,
+        replay_capacity: usize,
+    ) -> RpcModule<BrowserCoordinatorServer<F, S>> {
+        BrowserCoordinatorServer::new(self.rpc_server.clone(), verifier, replay_capacity).into_rpc()
+    }
+}
+
+impl<F: FftField, S: ShareBound<F>> crate::node_rpc::NodeRPCServer<F, S> {
+    /// Build the capability-authenticated browser RPC module over the same
+    /// party-local mask-share state used by the existing mutual-TLS RPC server.
+    pub fn browser_rpc_module(
+        &self,
+        verifier: BrowserCapabilityVerifier,
+    ) -> RpcModule<BrowserNodeServer<F, S>> {
+        BrowserNodeServer::new(self.rpc_server.clone(), verifier).into_rpc()
     }
 }
 

@@ -136,7 +136,7 @@ pub mod node_rpc {
     }
 
     pub struct NodeRPCServer<F: FftField, S: ShareBound<F>> {
-        rpc_server: Arc<Mutex<NodeRPCServerInternal<F, S>>>,
+        pub(crate) rpc_server: Arc<Mutex<NodeRPCServerInternal<F, S>>>,
         addr: String,
         _port: u16,
         _server_handle: JoinHandle<()>,
