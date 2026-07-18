@@ -14,6 +14,9 @@
 /// Self-signed certificates used for tests.
 pub mod self_signed_certs;
 
+/// Signed capability tokens for browser MPC clients.
+pub mod browser_capability;
+
 /// Things related to JSON-RPC interfaces.
 pub mod rpc;
 

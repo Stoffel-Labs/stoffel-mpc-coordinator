@@ -41,6 +41,8 @@ hpke = "0.13.0"
 rand = "0.9.2"
 p256 = "0.13.2"
 tracing = "0.1"
+base64 = "0.22.1"
+serde_json = "1.0.149"
 
 [dev-dependencies]
 ark-std = "0.5.0"
