@@ -17,6 +17,9 @@ pub mod self_signed_certs;
 /// Signed capability tokens for browser MPC clients.
 pub mod browser_capability;
 
+/// Server-authenticated WSS transport for browser JSON-RPC clients.
+pub mod browser_rpc;
+
 /// Things related to JSON-RPC interfaces.
 pub mod rpc;
 
