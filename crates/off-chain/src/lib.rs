@@ -1,3 +1,4 @@
+pub mod browser_rpc;
 pub mod tests;
 
 use ark_ff::FftField;
@@ -596,6 +597,41 @@ pub mod node_rpc {
 
             Ok(Some(assigned_shares))
         }
+
+        /// Read exactly one capability-owned range without consuming the mTLS delivery queue.
+        pub(crate) fn browser_mask_shares(
+            &self,
+            client: &ClientIdentity,
+            indices: std::ops::Range<u64>,
+        ) -> jsonrpsee::core::RpcResult<Option<Vec<(u64, Vec<u8>)>>> {
+            let mut result = Vec::with_capacity(indices.end.saturating_sub(indices.start) as usize);
+            for i in indices {
+                match self.assigned_reservations.get(&i) {
+                    Some(reservation) if &reservation.client == client => {}
+                    Some(_) => {
+                        return Err(ErrorObjectOwned::owned(
+                            ErrorCode::ServerError(2).code(),
+                            "capability does not own requested mask range",
+                            None::<()>,
+                        ))
+                    }
+                    None => return Ok(None),
+                }
+                let Some(share) = self.mask_shares.get(&i) else {
+                    return Ok(None);
+                };
+                let mut bytes = Vec::new();
+                share.serialize_compressed(&mut bytes).map_err(|_| {
+                    ErrorObjectOwned::owned(
+                        ErrorCode::ServerError(1).code(),
+                        "mask share serialization failed",
+                        None::<()>,
+                    )
+                })?;
+                result.push((i, bytes));
+            }
+            Ok(Some(result))
+        }
     }
 
     #[async_trait]
@@ -1193,6 +1229,106 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         }
 
         Ok(())
+    }
+
+    /// Reserve one browser-authorized index after its whole range was validated.
+    pub(crate) async fn browser_reserve_index(
+        &mut self,
+        client: ClientIdentity,
+        i: u64,
+    ) -> RpcResult<()> {
+        let label = self.input_assignments[i as usize].label;
+        self.reserved_indices[i as usize] = Some(client.clone());
+        self.n_reserved += 1;
+        let event = Event::ReservedInputEvent {
+            client: client.clone(),
+            reserved_index: i,
+        };
+        let assigned = AssignedMaskReservation {
+            client,
+            reserved_index: i,
+            input_ordinal: label,
+        };
+        self.reserved_index_events.push(event.clone());
+        self.assigned_reserved_index_events.push(assigned.clone());
+        let event_json = to_json_raw_value(&event).map_err(|_| {
+            ErrorObjectOwned::owned(
+                ErrorCode::InternalError.code(),
+                "reserved input event serialization failed",
+                None::<()>,
+            )
+        })?;
+        let assigned_json = to_json_raw_value(&assigned).map_err(|_| {
+            ErrorObjectOwned::owned(
+                ErrorCode::InternalError.code(),
+                "assigned input event serialization failed",
+                None::<()>,
+            )
+        })?;
+        for sink in &self.reserved_index_sinks {
+            let _ = sink.send(event_json.clone()).await;
+        }
+        for sink in &self.assigned_reserved_index_sinks {
+            let _ = sink.send(assigned_json.clone()).await;
+        }
+        Ok(())
+    }
+
+    /// Store one canonical masked value after browser range validation.
+    pub(crate) async fn browser_submit_input(
+        &mut self,
+        client: ClientIdentity,
+        i: u64,
+        value: T,
+    ) -> RpcResult<()> {
+        self.masked_inputs[i as usize] = Some(value.clone());
+        let wrapped = ValueWrapper { value };
+        let event = Event::MaskedInputEvent {
+            client: client.clone(),
+            masked_input: wrapped.clone(),
+            reserved_index: i,
+        };
+        let assigned = AssignedMaskedInputEvent {
+            client,
+            reserved_index: i,
+            input_ordinal: self.input_assignments[i as usize].label,
+            masked_input: wrapped,
+        };
+        self.masked_input_events.push(event.clone());
+        self.assigned_masked_input_events.push(assigned.clone());
+        let event_json = to_json_raw_value(&event).map_err(|_| {
+            ErrorObjectOwned::owned(
+                ErrorCode::InternalError.code(),
+                "masked input event serialization failed",
+                None::<()>,
+            )
+        })?;
+        let assigned_json = to_json_raw_value(&assigned).map_err(|_| {
+            ErrorObjectOwned::owned(
+                ErrorCode::InternalError.code(),
+                "assigned masked input event serialization failed",
+                None::<()>,
+            )
+        })?;
+        for sink in &self.masked_input_sinks {
+            let _ = sink.send(event_json.clone()).await;
+        }
+        for sink in &self.assigned_masked_input_sinks {
+            let _ = sink.send(assigned_json.clone()).await;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn browser_output_shares(&self, client: &ClientIdentity) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.output_shares
+            .iter()
+            .filter(|((id, _), _)| id == client)
+            .map(|(_, share)| share.clone())
+            .collect()
+    }
+
+    pub(crate) fn browser_threshold(&self) -> usize {
+        self.t as usize
     }
 }
 

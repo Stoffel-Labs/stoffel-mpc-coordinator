@@ -20,6 +20,7 @@ stoffel-mpc-coordinator-shared = { version = "0.1.0", path = "../coord-shared" }
 ark-ff = "0.5.0"
 ark-serialize = "0.5.0"
 ark-bls12-381 = "0.5.0"
+base64 = "0.22.1"
 async-trait = "0.1.89"
 futures-util = "0.3.31"
 hpke = "0.13.0"
