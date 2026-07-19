@@ -18,7 +18,7 @@ use stoffel_mpc_coordinator_shared::tests::fake_coord::{
     HoneyBadgerShareValueType, HoneyBadgerValueType,
 };
 use stoffel_mpc_coordinator_shared::{CoordinatorError, ShareBound};
-use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
+use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend, MpcCurve};
 use x509_parser::prelude::*;
 
 #[derive(Parser, Debug)]
@@ -73,6 +73,9 @@ fn parse_browser_client_binding(binding: &str) -> Result<(u64, ClientIdentity), 
     let slot = slot
         .parse::<u64>()
         .map_err(|_| format!("invalid browser client slot {slot:?}"))?;
+    u8::try_from(slot).map_err(|_| {
+        format!("browser client slot {slot} exceeds the capability protocol maximum of 255")
+    })?;
     let key = URL_SAFE_NO_PAD
         .decode(encoded_key)
         .map_err(|_| format!("invalid base64url HPKE public key for client slot {slot}"))?;
@@ -83,12 +86,8 @@ fn parse_browser_client_binding(binding: &str) -> Result<(u64, ClientIdentity), 
 
 fn combine_explicit_client_bindings(
     certificate_bindings: Vec<(u64, ClientIdentity)>,
-    browser_bindings: &[String],
+    browser_bindings: Vec<(u64, ClientIdentity)>,
 ) -> Result<Vec<(u64, ClientIdentity)>, String> {
-    let browser_bindings = browser_bindings
-        .iter()
-        .map(|binding| parse_browser_client_binding(binding))
-        .collect::<Result<Vec<_>, _>>()?;
     let mut seen_slots = HashMap::<u64, &'static str>::new();
     let mut bindings = Vec::with_capacity(certificate_bindings.len() + browser_bindings.len());
 
@@ -112,6 +111,50 @@ fn combine_explicit_client_bindings(
     }
 
     Ok(bindings)
+}
+
+fn validate_browser_topology(
+    manifest: &ClientIoManifest,
+    browser_bindings: &[(u64, ClientIdentity)],
+) -> Result<(), String> {
+    if browser_bindings.is_empty() {
+        return Ok(());
+    }
+    if manifest.mpc_curve != MpcCurve::Bls12_381 {
+        return Err(format!(
+            "browser clients require the BLS12-381 manifest curve, found {:?}",
+            manifest.mpc_curve
+        ));
+    }
+
+    for (slot, _) in browser_bindings {
+        let schema = manifest
+            .clients
+            .iter()
+            .find(|schema| schema.client_slot == *slot)
+            .ok_or_else(|| format!("no client IO manifest entry for browser client slot {slot}"))?;
+        if schema.inputs.len() != 4 {
+            return Err(format!(
+                "browser client slot {slot} must have exactly four private inputs in the client IO manifest, found {}",
+                schema.inputs.len()
+            ));
+        }
+    }
+
+    let mut manifest_slots = manifest
+        .clients
+        .iter()
+        .map(|schema| schema.client_slot)
+        .collect::<Vec<_>>();
+    manifest_slots.sort_unstable();
+    for (expected_slot, actual_slot) in manifest_slots.into_iter().enumerate() {
+        if actual_slot != expected_slot as u64 {
+            return Err(format!(
+                "browser client IO slots must be contiguous from 0; expected slot {expected_slot}, found {actual_slot}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_input_assignment(
@@ -295,11 +338,24 @@ async fn main() {
                     .map(|(schema, key)| (schema.client_slot, key))
                     .collect()
             } else {
-                combine_explicit_client_bindings(
+                let browser_bindings = args
+                    .browser_client_bindings
+                    .iter()
+                    .map(|binding| parse_browser_client_binding(binding))
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("invalid browser client bindings");
+                validate_browser_topology(&binary.client_io_manifest, &browser_bindings)
+                    .expect("invalid browser client topology");
+                let browser_clients_configured = !browser_bindings.is_empty();
+                let mut bindings = combine_explicit_client_bindings(
                     binding_keys(&args.client_bindings),
-                    &args.browser_client_bindings,
+                    browser_bindings,
                 )
-                .expect("invalid explicit client bindings")
+                .expect("invalid explicit client bindings");
+                if browser_clients_configured {
+                    bindings.sort_by_key(|(slot, _)| *slot);
+                }
+                bindings
             };
         let (input_assignment, output_clients) =
             build_input_assignment(binary.client_io_manifest, client_bindings)
@@ -469,14 +525,126 @@ mod tests {
 
         let duplicate = combine_explicit_client_bindings(
             Vec::new(),
-            &[format!("0={first}"), format!("0={second}")],
+            vec![
+                parse_browser_client_binding(&format!("0={first}")).unwrap(),
+                parse_browser_client_binding(&format!("0={second}")).unwrap(),
+            ],
         )
         .unwrap_err();
         assert!(duplicate.contains("duplicate client binding for slot 0"));
 
-        let conflict =
-            combine_explicit_client_bindings(vec![(0, vec![4, 5, 6])], &[format!("0={first}")])
-                .unwrap_err();
+        let conflict = combine_explicit_client_bindings(
+            vec![(0, vec![4, 5, 6])],
+            vec![parse_browser_client_binding(&format!("0={first}")).unwrap()],
+        )
+        .unwrap_err();
         assert!(conflict.contains("conflicting client binding for slot 0"));
+    }
+
+    fn four_input_manifest(client_count: u64) -> ClientIoManifest {
+        ClientIoManifest {
+            mpc_backend: MpcBackend::HoneyBadger,
+            mpc_curve: MpcCurve::Bls12_381,
+            clients: (0..client_count)
+                .map(|client_slot| ClientIoSchema {
+                    client_slot,
+                    inputs: vec![ShareType::default_secret_int(); 4],
+                    outputs: vec![],
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_browser_slot_without_exactly_four_private_inputs() {
+        let (_, identity) = browser_public_key(7);
+        for input_count in [0, 3, 5] {
+            let mut manifest = four_input_manifest(1);
+            manifest.clients[0].inputs = vec![ShareType::default_secret_int(); input_count];
+            let error = validate_browser_topology(&manifest, &[(0, identity.clone())]).unwrap_err();
+            assert!(error.contains("exactly four private inputs"));
+            assert!(error.contains(&format!("found {input_count}")));
+        }
+    }
+
+    #[test]
+    fn rejects_browser_binding_for_non_bls12_381_manifest() {
+        let (_, identity) = browser_public_key(7);
+        let mut manifest = four_input_manifest(1);
+        manifest.mpc_curve = MpcCurve::Ed25519;
+
+        let error = validate_browser_topology(&manifest, &[(0, identity)]).unwrap_err();
+        assert!(error.contains("BLS12-381"));
+        assert!(error.contains("Ed25519"));
+    }
+
+    #[test]
+    fn rejects_browser_slots_that_do_not_fit_capability_u8() {
+        let (encoded, _) = browser_public_key(7);
+        let error = parse_browser_client_binding(&format!("256={encoded}")).unwrap_err();
+        assert!(error.contains("maximum of 255"));
+    }
+
+    #[test]
+    fn accepts_valid_browser_slot_four_topology() {
+        let (_, identity) = browser_public_key(7);
+        validate_browser_topology(&four_input_manifest(5), &[(4, identity)]).unwrap();
+    }
+
+    #[test]
+    fn browser_contract_does_not_restrict_native_certificate_clients() {
+        let manifest = ClientIoManifest {
+            mpc_backend: MpcBackend::Avss,
+            mpc_curve: MpcCurve::Ed25519,
+            clients: vec![ClientIoSchema {
+                client_slot: 999,
+                inputs: vec![ShareType::default_secret_int()],
+                outputs: vec![],
+            }],
+            ..Default::default()
+        };
+        validate_browser_topology(&manifest, &[]).unwrap();
+    }
+
+    #[test]
+    fn variable_browser_topologies_have_contiguous_four_value_ranges() {
+        for client_count in [1_u64, 2, 3, 5] {
+            let mut bindings: Vec<_> = (0..client_count)
+                .rev()
+                .map(|slot| (slot, vec![slot as u8 + 1; 65]))
+                .collect();
+            bindings.sort_by_key(|(slot, _)| *slot);
+            let (assignment, _) =
+                build_input_assignment(four_input_manifest(client_count), bindings).unwrap();
+            assert_eq!(assignment.input_slots.len(), client_count as usize * 4);
+            for slot in 0..client_count as usize {
+                let range = slot * 4..slot * 4 + 4;
+                assert!(assignment.input_slots[range.clone()]
+                    .iter()
+                    .all(|input| input.client == vec![slot as u8 + 1; 65]));
+                assert_eq!(
+                    assignment.input_slots[range]
+                        .iter()
+                        .map(|input| input.label)
+                        .collect::<Vec<_>>(),
+                    vec![0, 1, 2, 3]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_noncontiguous_client_slots() {
+        let manifest = ClientIoManifest {
+            clients: vec![ClientIoSchema {
+                client_slot: 1,
+                inputs: vec![ShareType::default_secret_int(); 4],
+                outputs: vec![],
+            }],
+            ..four_input_manifest(0)
+        };
+        let error = validate_browser_topology(&manifest, &[(1, vec![1; 65])]).unwrap_err();
+        assert!(error.contains("contiguous from 0"));
     }
 }

@@ -141,9 +141,6 @@ impl BrowserCapabilityVerifier {
         if claims.allowed_origin != request_origin {
             return Err(CapabilityTokenError::WrongOrigin);
         }
-        if claims.client_slot > 2 {
-            return Err(CapabilityTokenError::InvalidClientSlot);
-        }
         if claims.input_count == 0 {
             return Err(CapabilityTokenError::ZeroInputCount);
         }
@@ -201,8 +198,6 @@ pub enum CapabilityTokenError {
     WrongAudience,
     #[error("capability origin does not match")]
     WrongOrigin,
-    #[error("invalid client slot")]
-    InvalidClientSlot,
     #[error("input count must be nonzero")]
     ZeroInputCount,
     #[error("input range overflows")]
@@ -364,6 +359,22 @@ mod tests {
             verifier.verify(&sign(&key_pair, &overflow), ORIGIN, NOW),
             Err(CapabilityTokenError::InputRangeOverflow)
         );
+    }
+
+    #[test]
+    fn accepts_slots_beyond_legacy_three_client_topology() {
+        let key_pair = key_pair();
+        let verifier = verifier(&key_pair);
+        let mut fifth_client = claims();
+        fifth_client.client_slot = 4;
+        fifth_client.input_start_index = 16;
+        fifth_client.input_count = 4;
+
+        let verified = verifier
+            .verify(&sign(&key_pair, &fifth_client), ORIGIN, NOW)
+            .unwrap();
+        assert_eq!(verified.claims.client_slot, 4);
+        assert_eq!(verified.claims.input_start_index, 16);
     }
 
     #[test]
