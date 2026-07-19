@@ -1,7 +1,9 @@
 use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Parser;
-use std::collections::HashMap;
+use hpke::{kem::DhP256HkdfSha256, Deserializable, Kem};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     AvssCoordinatorConnection, HoneyBadgerCoordinatorConnection,
@@ -43,7 +45,7 @@ struct Args {
     #[arg(long)]
     n_inputs: Option<u64>,
 
-    #[arg(long, required=true, value_delimiter=',', num_args=1..)]
+    #[arg(long, value_delimiter=',', num_args=1..)]
     output_clients: Vec<String>,
 
     #[arg(long)]
@@ -52,11 +54,65 @@ struct Args {
     #[arg(long, value_delimiter=',', num_args=0..)]
     client_bindings: Vec<String>,
 
+    /// Bind a manifest slot to a base64url-encoded raw P-256 HPKE public key.
+    #[arg(long, value_delimiter = ',', num_args = 0..)]
+    browser_client_bindings: Vec<String>,
+
     #[arg(long, default_value = "127.0.0.1")]
     addr: String,
 }
 
 type InputAssignmentBuildResult = (InputAssignment, Vec<ClientIdentity>);
+type BrowserHpkePublicKey = <DhP256HkdfSha256 as Kem>::PublicKey;
+
+fn parse_browser_client_binding(binding: &str) -> Result<(u64, ClientIdentity), String> {
+    let (slot, encoded_key) = binding.split_once('=').ok_or_else(|| {
+        "browser client binding must be formatted as <client_slot>=<base64url-public-key>"
+            .to_string()
+    })?;
+    let slot = slot
+        .parse::<u64>()
+        .map_err(|_| format!("invalid browser client slot {slot:?}"))?;
+    let key = URL_SAFE_NO_PAD
+        .decode(encoded_key)
+        .map_err(|_| format!("invalid base64url HPKE public key for client slot {slot}"))?;
+    BrowserHpkePublicKey::from_bytes(&key)
+        .map_err(|_| format!("invalid P-256 HPKE public key for client slot {slot}"))?;
+    Ok((slot, key))
+}
+
+fn combine_explicit_client_bindings(
+    certificate_bindings: Vec<(u64, ClientIdentity)>,
+    browser_bindings: &[String],
+) -> Result<Vec<(u64, ClientIdentity)>, String> {
+    let browser_bindings = browser_bindings
+        .iter()
+        .map(|binding| parse_browser_client_binding(binding))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen_slots = HashMap::<u64, &'static str>::new();
+    let mut bindings = Vec::with_capacity(certificate_bindings.len() + browser_bindings.len());
+
+    for (source, source_bindings) in [
+        ("certificate", certificate_bindings),
+        ("browser", browser_bindings),
+    ] {
+        for (slot, identity) in source_bindings {
+            if let Some(previous_source) = seen_slots.insert(slot, source) {
+                let kind = if previous_source == source {
+                    "duplicate"
+                } else {
+                    "conflicting"
+                };
+                return Err(format!(
+                    "{kind} client binding for slot {slot} ({previous_source} and {source})"
+                ));
+            }
+            bindings.push((slot, identity));
+        }
+    }
+
+    Ok(bindings)
+}
 
 fn build_input_assignment(
     manifest: ClientIoManifest,
@@ -95,7 +151,7 @@ fn build_input_assignment(
         )));
     }
 
-    let mut seen_clients = std::collections::HashSet::new();
+    let mut seen_clients = HashSet::new();
     let mut input_slots = Vec::new();
     let mut output_clients = Vec::new();
     for (client, _client_slot, input_count, output_count) in bound_clients {
@@ -224,22 +280,27 @@ async fn main() {
         let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
             .expect("failed to load Stoffel bytecode");
         let mpc_backend = binary.client_io_manifest.mpc_backend;
-        let client_bindings = if args.client_bindings.is_empty() {
-            let mut schemas = binary.client_io_manifest.clients.clone();
-            schemas.sort_by_key(|schema| schema.client_slot);
-            assert_eq!(
-                schemas.len(),
-                output_client_keys.len(),
-                "without --client-bindings, --output-clients must match manifest client count"
-            );
-            schemas
-                .into_iter()
-                .zip(output_client_keys)
-                .map(|(schema, key)| (schema.client_slot, key))
-                .collect()
-        } else {
-            binding_keys(&args.client_bindings)
-        };
+        let client_bindings =
+            if args.client_bindings.is_empty() && args.browser_client_bindings.is_empty() {
+                let mut schemas = binary.client_io_manifest.clients.clone();
+                schemas.sort_by_key(|schema| schema.client_slot);
+                assert_eq!(
+                    schemas.len(),
+                    output_client_keys.len(),
+                    "without --client-bindings, --output-clients must match manifest client count"
+                );
+                schemas
+                    .into_iter()
+                    .zip(output_client_keys)
+                    .map(|(schema, key)| (schema.client_slot, key))
+                    .collect()
+            } else {
+                combine_explicit_client_bindings(
+                    binding_keys(&args.client_bindings),
+                    &args.browser_client_bindings,
+                )
+                .expect("invalid explicit client bindings")
+            };
         let (input_assignment, output_clients) =
             build_input_assignment(binary.client_io_manifest, client_bindings)
                 .expect("failed to bind client IO manifest");
@@ -303,6 +364,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hpke::Serializable;
     use stoffel_vm_types::{
         compiled_binary::{MpcBackend, MpcCurve},
         core_types::ShareType,
@@ -341,5 +403,80 @@ mod tests {
         assert_eq!(int_layout.input_slots[0].label, 0);
         assert_eq!(int_layout.input_slots.len(), bool_layout.input_slots.len());
         assert_eq!(int_outputs, bool_outputs);
+    }
+
+    fn browser_public_key(seed: u8) -> (String, ClientIdentity) {
+        let (_, public_key) = DhP256HkdfSha256::derive_keypair(&[seed; 32]);
+        let raw = public_key.to_bytes().to_vec();
+        (URL_SAFE_NO_PAD.encode(&raw), raw)
+    }
+
+    #[test]
+    fn parses_raw_browser_hpke_public_key_binding() {
+        let (encoded, raw) = browser_public_key(7);
+
+        assert_eq!(
+            parse_browser_client_binding(&format!("2={encoded}")),
+            Ok((2, raw))
+        );
+    }
+
+    #[test]
+    fn browser_bindings_do_not_require_certificate_output_clients() {
+        let (encoded, _) = browser_public_key(7);
+        let args = Args::try_parse_from([
+            "run-coord",
+            "--hash",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--initial-mpc-nodes",
+            "node.crt",
+            "--server-cert",
+            "coord.crt",
+            "--server-key",
+            "coord.der",
+            "--n",
+            "3",
+            "--t",
+            "1",
+            "--program",
+            "program.stflb",
+            "--browser-client-bindings",
+            &format!("0={encoded}"),
+        ])
+        .expect("browser-only bindings should parse");
+
+        assert!(args.output_clients.is_empty());
+        assert_eq!(args.browser_client_bindings.len(), 1);
+    }
+
+    #[test]
+    fn rejects_private_and_malformed_browser_binding_values() {
+        let encoded_private_value = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+
+        assert!(
+            parse_browser_client_binding(&format!("0={encoded_private_value}"))
+                .unwrap_err()
+                .contains("invalid P-256 HPKE public key")
+        );
+        assert!(parse_browser_client_binding("0=not+base64url").is_err());
+        assert!(parse_browser_client_binding("0").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_and_conflicting_explicit_bindings() {
+        let (first, _) = browser_public_key(1);
+        let (second, _) = browser_public_key(2);
+
+        let duplicate = combine_explicit_client_bindings(
+            Vec::new(),
+            &[format!("0={first}"), format!("0={second}")],
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate client binding for slot 0"));
+
+        let conflict =
+            combine_explicit_client_bindings(vec![(0, vec![4, 5, 6])], &[format!("0={first}")])
+                .unwrap_err();
+        assert!(conflict.contains("conflicting client binding for slot 0"));
     }
 }

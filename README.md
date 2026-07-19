@@ -28,6 +28,11 @@ For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind l
 
 `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
 
+Client-owned browser slots can instead be bound directly to public identities with
+`--browser-client-bindings <slot>=<base64url(raw P-256 HPKE public key)>`. Certificate and browser
+bindings may be mixed for different slots; duplicate slots and cross-kind conflicts are rejected.
+Only public HPKE keys are accepted by this option.
+
 The off-chain coordinator also selects the MPC share backend from the `.stflb` manifest. Compile
 programs with `stoffel --mpc-backend honeybadger -b program.stfl` or
 `stoffel --mpc-backend avss -b program.stfl`. Legacy/no-program startup defaults to HoneyBadger.
