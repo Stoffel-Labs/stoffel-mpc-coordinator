@@ -175,16 +175,21 @@ impl<F: FftField, S: ShareBound<F>> BrowserNodeServer<F, S> {
     }
 }
 
-impl<F: FftField, S: ShareBound<F>>
-    crate::OffChainCoordinatorServer<crate::CoordinatorRPCServerConnectionBase<F, S>>
+impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection>
+    crate::OffChainCoordinatorServer<C>
 {
     /// Build the capability-authenticated browser RPC module over the same
     /// coordinator state used by the existing mutual-TLS RPC server.
-    pub fn browser_rpc_module(
+    pub fn browser_rpc_module<F: FftField, S: ShareBound<F>>(
         &self,
         verifier: BrowserCapabilityVerifier,
         replay_capacity: usize,
-    ) -> RpcModule<BrowserCoordinatorServer<F, S>> {
+    ) -> RpcModule<BrowserCoordinatorServer<F, S>>
+    where
+        C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection<
+            Internal = CoordinatorRPCServerSharedBase<S::ValueType>,
+        >,
+    {
         BrowserCoordinatorServer::new(self.rpc_server.clone(), verifier, replay_capacity).into_rpc()
     }
 }

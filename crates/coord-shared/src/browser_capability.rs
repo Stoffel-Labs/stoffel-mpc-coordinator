@@ -5,6 +5,7 @@
 //! and replay storage belong elsewhere.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hpke::{kem::DhP256HkdfSha256, Deserializable, Kem};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +15,7 @@ pub const CAPABILITY_TOKEN_VERSION: u8 = 1;
 
 /// The coordinator's current client identity representation.
 pub type ClientIdentity = Vec<u8>;
+type BrowserHpkePublicKey = <DhP256HkdfSha256 as Kem>::PublicKey;
 
 /// Claims in their canonical serialization order.
 ///
@@ -160,9 +162,8 @@ impl BrowserCapabilityVerifier {
         let client_identity = URL_SAFE_NO_PAD
             .decode(&claims.browser_hpke_public_key)
             .map_err(|_| CapabilityTokenError::InvalidHpkePublicKey)?;
-        if client_identity.is_empty() {
-            return Err(CapabilityTokenError::InvalidHpkePublicKey);
-        }
+        BrowserHpkePublicKey::from_bytes(&client_identity)
+            .map_err(|_| CapabilityTokenError::InvalidHpkePublicKey)?;
         if claims.nonce.is_empty() {
             return Err(CapabilityTokenError::InvalidNonce);
         }
@@ -219,6 +220,7 @@ pub enum CapabilityTokenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hpke::Serializable;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -233,6 +235,7 @@ mod tests {
     }
 
     fn claims() -> BrowserCapabilityClaims {
+        let (_, browser_public_key) = DhP256HkdfSha256::derive_keypair(&[7_u8; 32]);
         BrowserCapabilityClaims {
             version: CAPABILITY_TOKEN_VERSION,
             issuer: ISSUER.into(),
@@ -243,7 +246,7 @@ mod tests {
             input_start_index: 8,
             input_count: 3,
             can_obtain_output: true,
-            browser_hpke_public_key: URL_SAFE_NO_PAD.encode([9, 8, 7, 6]),
+            browser_hpke_public_key: URL_SAFE_NO_PAD.encode(browser_public_key.to_bytes()),
             allowed_origin: ORIGIN.into(),
             issued_at: NOW - 30,
             expires_at: NOW + 60,
@@ -274,7 +277,10 @@ mod tests {
         let first = verifier.verify(&token, ORIGIN, NOW).unwrap();
         let second = verifier.verify(&token, ORIGIN, NOW).unwrap();
 
-        assert_eq!(first.client_identity, vec![9, 8, 7, 6]);
+        let expected_identity = URL_SAFE_NO_PAD
+            .decode(claims().browser_hpke_public_key)
+            .unwrap();
+        assert_eq!(first.client_identity, expected_identity);
         assert_eq!(first.client_identity, second.client_identity);
         assert_eq!(first.replay_key, second.replay_key);
         assert_eq!(first.replay_key.issuer, ISSUER);
@@ -357,6 +363,19 @@ mod tests {
         assert_eq!(
             verifier.verify(&sign(&key_pair, &overflow), ORIGIN, NOW),
             Err(CapabilityTokenError::InputRangeOverflow)
+        );
+    }
+
+    #[test]
+    fn rejects_bytes_that_are_not_a_p256_hpke_public_key() {
+        let key_pair = key_pair();
+        let verifier = verifier(&key_pair);
+        let mut invalid = claims();
+        invalid.browser_hpke_public_key = URL_SAFE_NO_PAD.encode([9, 8, 7, 6]);
+
+        assert_eq!(
+            verifier.verify(&sign(&key_pair, &invalid), ORIGIN, NOW),
+            Err(CapabilityTokenError::InvalidHpkePublicKey)
         );
     }
 

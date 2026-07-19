@@ -1,3 +1,4 @@
+pub mod browser_config;
 pub mod browser_rpc;
 pub mod tests;
 
@@ -140,6 +141,7 @@ pub mod node_rpc {
         addr: String,
         _port: u16,
         _server_handle: JoinHandle<()>,
+        _browser_server: Option<stoffel_mpc_coordinator_shared::browser_rpc::BrowserRpcServer>,
     }
 
     /// An object used by an MPC client to connect to the RPC interfaces of many nodes.
@@ -349,6 +351,8 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Result<Self, CoordinatorError> {
+            let browser_config = crate::browser_config::BrowserRpcConfig::from_env()
+                .map_err(|error| CoordinatorError::JSONError(error.to_string()))?;
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new()));
             let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<
                 NodeRPCServerImpl<F, S>,
@@ -356,12 +360,32 @@ pub mod node_rpc {
                 addr, port, cert_der, key_der, rpc_server_data.clone()
             )
             .await?;
-            Ok(Self {
+            let mut server = Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
                 _port: port,
                 _server_handle: server_handle,
-            })
+                _browser_server: None,
+            };
+            if let Some(config) = browser_config {
+                let browser_port = config
+                    .node_port(port)
+                    .map_err(|error| CoordinatorError::JSONError(error.to_string()))?;
+                let (cert_der, key_der) = config.tls_material()?;
+                let module = server.browser_rpc_module(config.verifier()?);
+                server._browser_server = Some(
+                    stoffel_mpc_coordinator_shared::browser_rpc::start_browser_rpc(
+                        addr,
+                        browser_port,
+                        cert_der,
+                        key_der,
+                        config.origin_allowlist()?,
+                        module,
+                    )
+                    .await?,
+                );
+            }
+            Ok(server)
         }
 
         pub fn get_addr(&self) -> String {
@@ -1837,6 +1861,8 @@ pub struct OffChainCoordinatorServer<C: stoffel_mpc_coordinator_shared::rpc::RPC
     server_handle: JoinHandle<()>,
     #[allow(dead_code)]
     t: u64,
+    #[allow(dead_code)]
+    browser_server: Option<stoffel_mpc_coordinator_shared::browser_rpc::BrowserRpcServer>,
 }
 
 pub struct OffChainCoordinatorClient<F: FftField, S: ShareBound<F>> {
@@ -1890,11 +1916,38 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
             port,
             server_handle,
             t,
+            browser_server: None,
         })
     }
 
     pub fn get_addr(&self) -> String {
         self.addr.clone()
+    }
+
+    /// Start the opt-in capability-only browser WSS endpoint over this server's shared state.
+    pub async fn start_browser_rpc<F: FftField, S: ShareBound<F>>(
+        &mut self,
+        config: &crate::browser_config::BrowserRpcConfig,
+    ) -> Result<(), CoordinatorError>
+    where
+        C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection<
+            Internal = CoordinatorRPCServerSharedBase<S::ValueType>,
+        >,
+    {
+        let (cert_der, key_der) = config.tls_material()?;
+        let module = self.browser_rpc_module::<F, S>(config.verifier()?, config.replay_capacity);
+        self.browser_server = Some(
+            stoffel_mpc_coordinator_shared::browser_rpc::start_browser_rpc(
+                &self.addr,
+                config.coordinator_port,
+                cert_der,
+                key_der,
+                config.origin_allowlist()?,
+                module,
+            )
+            .await?,
+        );
+        Ok(())
     }
 }
 

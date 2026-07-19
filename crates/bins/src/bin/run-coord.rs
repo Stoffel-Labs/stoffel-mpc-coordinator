@@ -1,3 +1,4 @@
+use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use clap::Parser;
 use std::collections::HashMap;
@@ -10,8 +11,11 @@ use stoffel_mpc_coordinator_off_chain::{
     OffChainCoordinatorServer,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
-use stoffel_mpc_coordinator_shared::tests::fake_coord::{AvssValueType, HoneyBadgerValueType};
-use stoffel_mpc_coordinator_shared::CoordinatorError;
+use stoffel_mpc_coordinator_shared::tests::fake_coord::{
+    AvssShareType, AvssShareValueType, AvssValueType, HoneyBadgerShareType,
+    HoneyBadgerShareValueType, HoneyBadgerValueType,
+};
+use stoffel_mpc_coordinator_shared::{CoordinatorError, ShareBound};
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
 
@@ -114,7 +118,12 @@ fn build_input_assignment(
     Ok((InputAssignment { input_slots }, output_clients))
 }
 
-async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
+async fn run_coord<
+    T: CanonicalSerialize + CanonicalDeserialize + Clone + Send,
+    C,
+    F: FftField,
+    S: ShareBound<F, ValueType = T>,
+>(
     server_state: CoordinatorRPCServerSharedBase<T>,
     addr: &str,
     port: u16,
@@ -124,7 +133,10 @@ async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
 ) where
     C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase<T>>,
 {
-    let _coord = OffChainCoordinatorServer::<C>::start_coord(
+    let browser_config =
+        stoffel_mpc_coordinator_off_chain::browser_config::BrowserRpcConfig::from_env()
+            .expect("invalid browser RPC configuration");
+    let mut coord = OffChainCoordinatorServer::<C>::start_coord(
         server_state,
         addr,
         port,
@@ -134,6 +146,16 @@ async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
     )
     .await
     .expect("failed to start coordinator");
+    if let Some(config) = browser_config.as_ref() {
+        coord
+            .start_browser_rpc::<F, S>(config)
+            .await
+            .expect("failed to start browser coordinator RPC");
+        println!(
+            "Browser WSS listening on {}:{}",
+            addr, config.coordinator_port
+        );
+    }
     println!("Listening on {}:{}", addr, port);
 
     tokio::time::sleep(tokio::time::Duration::MAX).await;
@@ -251,18 +273,21 @@ async fn main() {
     };
     match mpc_backend {
         MpcBackend::HoneyBadger => {
-            run_coord::<HoneyBadgerValueType, HoneyBadgerCoordinatorConnection>(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert_der,
-                server_key_der,
-            )
+            run_coord::<
+                HoneyBadgerValueType,
+                HoneyBadgerCoordinatorConnection,
+                HoneyBadgerShareValueType,
+                HoneyBadgerShareType,
+            >(server_state, addr, port, t, server_cert_der, server_key_der)
             .await;
         }
         MpcBackend::Avss => {
-            run_coord::<AvssValueType, AvssCoordinatorConnection>(
+            run_coord::<
+                AvssValueType,
+                AvssCoordinatorConnection,
+                AvssShareValueType,
+                AvssShareType,
+            >(
                 server_state,
                 addr,
                 port,
