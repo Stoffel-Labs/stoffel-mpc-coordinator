@@ -56,7 +56,7 @@ pub mod node_rpc {
         async_client::Client,
         core::{to_json_raw_value, SubscriptionResult},
         proc_macros::rpc,
-        server::{RpcModule, ServerHandle},
+        server::RpcModule,
         types::{error::ErrorCode, ErrorObjectOwned},
         PendingSubscriptionSink, SubscriptionSink,
     };
@@ -68,10 +68,9 @@ pub mod node_rpc {
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
     use stoffel_mpc_coordinator_shared::{
-        rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound,
+        rpc::RPCServerHandle, CoordinatorError, NodeRPCError, ShareBound,
     };
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
-    use tokio::task::JoinHandle;
     use tokio::task::JoinSet;
 
     async fn verify_client_sig(
@@ -98,7 +97,7 @@ pub mod node_rpc {
         pub(super) rpc_server: Arc<Mutex<NodeRPCServerShared<P, F, S>>>,
         addr: String,
         _port: u16,
-        _server_handle: JoinHandle<()>,
+        server_handle: RPCServerHandle,
     }
 
     /// Exterior representation of an RPC client that interfaces with the node-side RPC interface.
@@ -237,7 +236,8 @@ pub mod node_rpc {
                     .expect("failed to fetch base nonce"),
             )
             .expect("base nonce does not fit in u64");
-            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerShared::new(coord, base_nonce)));
+            let rpc_server_data =
+                Arc::new(Mutex::new(NodeRPCServerShared::<P, F, S>::new(base_nonce)));
             let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<
                 NodeRPCServerConnection<P, F, S>,
             >(
@@ -249,12 +249,16 @@ pub mod node_rpc {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
                 _port: port,
-                _server_handle: server_handle,
+                server_handle,
             }
         }
 
         pub fn get_addr(&self) -> String {
             self.addr.clone()
+        }
+
+        pub async fn shutdown(self) {
+            self.server_handle.shutdown().await;
         }
 
         pub async fn ids_and_addrs(&self) -> Vec<(Vec<u8>, ClientIdentity)> {
@@ -265,25 +269,6 @@ pub mod node_rpc {
                 .filter(|(_, _, sig)| sig.is_none())
                 .map(|(id, addr, _)| (id.clone(), *addr))
                 .collect()
-        }
-
-        pub async fn reset(&mut self) {
-            let mut d = self.rpc_server.lock().await;
-            let base_nonce = super::u256_to_u64(
-                d.coord
-                    .baseNonce()
-                    .call()
-                    .await
-                    .expect("failed to fetch base nonce"),
-            )
-            .expect("base nonce does not fit in u64");
-            d.index_to_client.clear();
-            d.client_to_index.clear();
-            d.authenticated.clear();
-            d.sinks.clear();
-            d.mask_shares.clear();
-            d.ids_and_addrs.clear();
-            d.base_nonce = base_nonce;
         }
 
         // called when the client has reserved indices at the coordinator
@@ -400,16 +385,14 @@ pub mod node_rpc {
         // (tls_id, addr, pending_sig): pending_sig is Some while awaiting index reservation,
         // None once authenticated
         ids_and_addrs: Vec<(Vec<u8>, ClientIdentity, Option<Vec<u8>>)>,
-        clients: HashMap<Vec<u8>, ClientInfo>,
         base_nonce: u64,
-        coord: StoffelCoordinatorInstance<P>,
-        _marker: std::marker::PhantomData<F>,
+        _marker: std::marker::PhantomData<(P, F)>,
     }
 
     impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
         NodeRPCServerShared<P, F, S>
     {
-        pub fn new(coord: StoffelCoordinatorInstance<P>, base_nonce: u64) -> Self {
+        pub fn new(base_nonce: u64) -> Self {
             Self {
                 index_to_client: HashMap::new(),
                 client_to_index: HashMap::new(),
@@ -417,31 +400,9 @@ pub mod node_rpc {
                 sinks: HashMap::new(),
                 mask_shares: HashMap::new(),
                 ids_and_addrs: Vec::new(),
-                clients: HashMap::new(),
                 base_nonce,
-                coord,
                 _marker: std::marker::PhantomData,
             }
-        }
-    }
-
-    impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
-        stoffel_mpc_coordinator_shared::rpc::RPCServerShared for NodeRPCServerShared<P, F, S>
-    {
-        fn add_client(
-            &mut self,
-            cert_der: Vec<u8>,
-            client_handle: JoinHandle<()>,
-            stop_tx: ServerHandle,
-        ) {
-            self.clients.insert(
-                cert_der.clone(),
-                ClientInfo {
-                    cert: cert_der,
-                    thread: client_handle,
-                    stop_tx,
-                },
-            );
         }
     }
 
@@ -668,23 +629,6 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
         u256_to_u64(base_nonce).expect("impossible bug: block number does not fit into u64")
     }
 
-    /// Resets local state after the smart contract has been reset, so subsequent event listeners
-    /// do not replay events from previous rounds.
-    pub async fn reset(&mut self) -> Result<(), CoordinatorError> {
-        self.contract_block = self
-            .coord
-            .provider()
-            .get_block_number()
-            .await
-            .map_err(|e| {
-                CoordinatorError::EthereumError(format!(
-                    "error getting current block number: {}",
-                    e
-                ))
-            })?;
-        Ok(())
-    }
-
     pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
         let result = match round {
             Round::Idle => {
@@ -829,25 +773,6 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
             },
             Err(e) => Err(CoordinatorError::EthereumError(format!(
                 "error sending transaction to finalize: {}",
-                e
-            ))),
-        }
-    }
-
-    async fn reset_coord(&self) -> Result<(), CoordinatorError> {
-        let builder = self.coord.resetCoordinator();
-        let result = builder.send().await;
-
-        match result {
-            Ok(r) => match r.watch().await {
-                Ok(_) => Ok(()),
-                Err(e) => Err(CoordinatorError::EthereumError(format!(
-                    "error waiting for transaction to reset coordinator to be mined: {}",
-                    e
-                ))),
-            },
-            Err(e) => Err(CoordinatorError::EthereumError(format!(
-                "error sending transaction to reset coordinator: {}",
                 e
             ))),
         }

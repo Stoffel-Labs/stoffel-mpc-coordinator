@@ -22,11 +22,15 @@ Install a mock on-chain coordinator with
 Deployment derives the program hash, input count, and MPC backend threshold from the compiled program manifest.
 
 For the off-chain coordinator, generate identities using `cargo run --bin generate-ids -- ids 2 5` (output directory `ids`, 2 clients, 5 nodes).
-Then, run the off-chain coordinator with `cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt,ids/pub/clients/client1.crt`.
+Every program invocation needs one nonzero 256-bit execution ID shared by its coordinator, MPC
+nodes, and clients. The commands below use
+`0000000000000000000000000000000000000000000000000000000000000001` as a readable example;
+use a freshly generated value (for example, `openssl rand -hex 32`) for each real invocation.
+Then, run the off-chain coordinator with `cargo run --bin run-coord -- --execution-id 0000000000000000000000000000000000000000000000000000000000000001 --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt,ids/pub/clients/client1.crt`.
 
 For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
 
-`cargo run --bin run-coord -- --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
+`cargo run --bin run-coord -- --execution-id 0000000000000000000000000000000000000000000000000000000000000001 --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
 
 The off-chain coordinator also selects the MPC share backend from the `.stflb` manifest. Compile
 programs with `stoffel --mpc-backend honeybadger -b program.stfl` or

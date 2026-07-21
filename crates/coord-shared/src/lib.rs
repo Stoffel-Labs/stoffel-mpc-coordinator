@@ -1,6 +1,6 @@
 // The coordinator is generic over the share type `S` used to represent shares in the underlying
-// MPC protocol. Concretely, `S` must implement `ShareBound`, which is `SecretSharingScheme` from
-// mpc-protocols plus some additional bounds to make the code work.
+// MPC protocol. Concretely, `S` must implement `ShareBound`, which is `stoffelcrypto`'s
+// `SecretSharingScheme` plus some additional bounds to make the code work.
 // Every struct and trait in this library that touches shares is parametrized as `<F: FftField, S: ShareBound<F>>`;
 // the generic type `F` comes directly from the definition of `SecretSharingScheme`.
 //
@@ -25,13 +25,78 @@ use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Once;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::share::ShareError;
 use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use thiserror::Error;
+
+/// Uniquely identifies one MPC program invocation.
+///
+/// A program hash is deliberately not used as the execution identity: two invocations of the
+/// same program must be able to overlap without sharing coordinator or node state. The all-zero
+/// value is reserved and rejected by persistent/concurrent RPC paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExecutionId([u8; 32]);
+
+impl ExecutionId {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 32]
+    }
+}
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl FromStr for ExecutionId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err(format!(
+                "execution ID must contain exactly 64 hexadecimal characters, got {}",
+                value.len()
+            ));
+        }
+        let bytes = hex::decode(value).map_err(|error| format!("invalid execution ID: {error}"))?;
+        Ok(Self(
+            bytes.try_into().expect("validated execution ID length"),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod execution_id_tests {
+    use super::*;
+
+    #[test]
+    fn hex_round_trip_is_strict_and_stable() {
+        let id = ExecutionId::from_bytes([0xab; 32]);
+        let encoded = id.to_string();
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(encoded.parse::<ExecutionId>().unwrap(), id);
+        assert!("ab".parse::<ExecutionId>().is_err());
+        assert!(format!("{}z", &encoded[..63])
+            .parse::<ExecutionId>()
+            .is_err());
+    }
+}
 
 pub trait ShareBound<F: FftField>:
     SecretSharingScheme<F, SecretType = Self::ValueType>
@@ -139,8 +204,6 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
         key: Vec<u8>,
         output_shares: Vec<S>,
     ) -> impl Future<Output = Result<(), CoordinatorError>>;
-
-    fn reset_coord(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
 }
 
 #[derive(Error, Clone, Debug, Serialize, Deserialize)]
@@ -193,6 +256,8 @@ pub enum CoordinatorError {
 
 #[derive(Error, Clone, Debug)]
 pub enum NodeRPCError {
+    #[error("Execution is not registered or is ambiguous")]
+    ExecutionNotFound,
     #[error("Index already added")]
     IndexAlreadyAdded,
     #[error("Index not added")]

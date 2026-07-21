@@ -11,7 +11,7 @@ use stoffel_mpc_coordinator_shared::tests::fake_coord::{
     AvssShareType, AvssShareValueType, AvssValueType, HoneyBadgerShareType,
     HoneyBadgerShareValueType, HoneyBadgerValueType,
 };
-use stoffel_mpc_coordinator_shared::Round;
+use stoffel_mpc_coordinator_shared::{ExecutionId, Round};
 use tokio::sync::Mutex;
 
 pub type HoneyBadgerOffChainCoordinatorClient =
@@ -66,27 +66,39 @@ impl<S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>>
 impl<S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>> StoffelCoordinatorRPCServer
     for CoordinatorConnection<Fr, S>
 {
-    async fn start_preprocessing(&self) -> RpcResult<()> {
-        self.base.transition(Round::Preprocessing).await
+    async fn start_preprocessing(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::Preprocessing)
+            .await
     }
 
-    async fn reserve_input_masks(&self) -> RpcResult<()> {
-        self.base.transition(Round::InputMaskReservation).await
+    async fn reserve_input_masks(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::InputMaskReservation)
+            .await
     }
 
-    async fn collect_inputs(&self) -> RpcResult<()> {
-        self.base.transition(Round::InputCollection).await
+    async fn collect_inputs(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::InputCollection)
+            .await
     }
 
-    async fn start_mpc(&self) -> RpcResult<()> {
-        self.base.transition(Round::MPCExecution).await
+    async fn start_mpc(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::MPCExecution)
+            .await
     }
 
-    async fn send_output(&self) -> RpcResult<()> {
-        self.base.transition(Round::OutputDistribution).await
+    async fn send_output(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::OutputDistribution)
+            .await
     }
 
-    async fn finalize(&self) -> RpcResult<()> {
-        self.base.transition(Round::ProgramFinished).await
+    async fn finalize(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::ProgramFinished)
+            .await
     }
 }

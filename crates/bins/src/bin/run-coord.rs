@@ -11,7 +11,7 @@ use stoffel_mpc_coordinator_off_chain::{
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{AvssValueType, HoneyBadgerValueType};
-use stoffel_mpc_coordinator_shared::CoordinatorError;
+use stoffel_mpc_coordinator_shared::{CoordinatorError, ExecutionId};
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
 
@@ -28,6 +28,10 @@ enum Backend {
 struct Args {
     #[arg(long)]
     hash: String,
+
+    /// Identity of the program invocation initially registered with the coordinator.
+    #[arg(long, value_parser = parse_nonzero_execution_id)]
+    execution_id: ExecutionId,
 
     #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     initial_mpc_nodes: Vec<String>,
@@ -59,8 +63,21 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     addr: String,
 
+    #[arg(long, default_value_t = 31415)]
+    port: u16,
+
     #[arg(long, default_value = "honeybadger")]
     backend: Backend,
+}
+
+fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
+    let execution_id = value
+        .parse::<ExecutionId>()
+        .map_err(|error| error.to_string())?;
+    if execution_id.is_zero() {
+        return Err("execution ID must be nonzero".to_string());
+    }
+    Ok(execution_id)
 }
 
 type InputAssignmentBuildResult = (InputAssignment, Vec<ClientIdentity>);
@@ -186,6 +203,19 @@ async fn main() {
     };
 
     let public_keys = parse_public_keys(&args.initial_mpc_nodes);
+    assert!(n > 0, "--n must be greater than zero");
+    assert_eq!(
+        public_keys.len(),
+        usize::try_from(n).expect("--n does not fit in usize"),
+        "--n must match the number of --initial-mpc-nodes"
+    );
+    assert!(t < n, "--t must be less than --n");
+    let unique_public_keys = public_keys.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique_public_keys.len(),
+        public_keys.len(),
+        "--initial-mpc-nodes must contain unique identities"
+    );
     let output_client_keys = parse_public_keys(&args.output_clients);
     let binding_keys = |bindings: &[String]| -> Vec<(u64, Vec<u8>)> {
         bindings
@@ -208,7 +238,7 @@ async fn main() {
     let server_key_der = fs::read(args.server_key).unwrap();
 
     let addr = args.addr.as_str();
-    let port = 31415;
+    let port = args.port;
     let (mpc_backend, server_state) = if let Some(program_path) = args.program {
         let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
             .expect("failed to load Stoffel bytecode");
@@ -233,7 +263,8 @@ async fn main() {
             build_input_assignment(binary.client_io_manifest, client_bindings)
                 .expect("failed to bind client IO manifest");
         let n_inputs = input_assignment.input_slots.len() as u64;
-        let server_state = CoordinatorRPCServerSharedBase::new_with_input_assignment(
+        let server_state = CoordinatorRPCServerSharedBase::new_for_execution(
+            args.execution_id,
             hash,
             n,
             t,
@@ -254,14 +285,17 @@ async fn main() {
         };
         (
             mpc_backend,
-            CoordinatorRPCServerSharedBase::new(
+            CoordinatorRPCServerSharedBase::new_for_execution(
+                args.execution_id,
                 hash,
                 n,
                 t,
                 public_keys,
                 n_inputs,
                 output_client_keys,
-            ),
+                InputAssignment::default(),
+            )
+            .expect("failed to configure coordinator"),
         )
     };
     match mpc_backend {
@@ -331,5 +365,15 @@ mod tests {
         assert_eq!(int_layout.input_slots[0].label, 0);
         assert_eq!(int_layout.input_slots.len(), bool_layout.input_slots.len());
         assert_eq!(int_outputs, bool_outputs);
+    }
+
+    #[test]
+    fn execution_id_validation_rejects_zero() {
+        assert!(parse_nonzero_execution_id(&"00".repeat(32)).is_err());
+        let execution_id = ExecutionId::from_bytes([7; 32]);
+        assert_eq!(
+            parse_nonzero_execution_id(&execution_id.to_string()).unwrap(),
+            execution_id,
+        );
     }
 }

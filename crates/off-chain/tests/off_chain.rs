@@ -5,17 +5,131 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     HoneyBadgerCoordinatorRPCServerSharedBase, HoneyBadgerNodeRPCClient, HoneyBadgerNodeRPCServer,
     HoneyBadgerOffChainCoordinatorClient, HoneyBadgerOffChainCoordinatorServer,
 };
+use stoffel_mpc_coordinator_off_chain::{CoordinatorRPCBaseClient, InputAssignment};
 use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{
     HoneyBadgerShareType, HoneyBadgerShareValueType,
 };
-use stoffel_mpc_coordinator_shared::Round;
 use stoffel_mpc_coordinator_shared::{Coordinator, ShareBound};
+use stoffel_mpc_coordinator_shared::{ExecutionId, Round};
 use stoffelmpc_mpc::common::SecretSharingScheme;
 use tokio::sync::Barrier;
 
 fn sample_ids(n: usize) -> Vec<usize> {
     (1..=n).collect()
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn execution(byte: u8) -> ExecutionId {
+    ExecutionId::from_bytes([byte; 32])
+}
+
+fn cert_parts(cert: &Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> (Vec<u8>, Vec<u8>) {
+    (cert.cert.der().to_vec(), cert.signing_key.serialize_der())
+}
+
+fn coordinator_state(
+    execution_id: ExecutionId,
+    n: u64,
+    t: u64,
+    nodes: Vec<Vec<u8>>,
+    n_inputs: u64,
+    output_clients: Vec<Vec<u8>>,
+) -> HoneyBadgerCoordinatorRPCServerSharedBase {
+    HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
+        execution_id,
+        [0; 32],
+        n,
+        t,
+        nodes,
+        n_inputs,
+        output_clients,
+        InputAssignment::default(),
+    )
+    .unwrap()
+}
+
+async fn start_node_server(
+    execution_id: ExecutionId,
+    addr: &str,
+    port: u16,
+    cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
+) -> HoneyBadgerNodeRPCServer {
+    let (cert_der, key_der) = cert_parts(&cert);
+    HoneyBadgerNodeRPCServer::start_for_execution(addr, port, execution_id, cert_der, key_der)
+        .await
+        .unwrap()
+}
+
+async fn start_node_client(
+    execution_id: ExecutionId,
+    n: usize,
+    t: usize,
+    addrs: Vec<(String, u16)>,
+    cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
+) -> HoneyBadgerNodeRPCClient {
+    let (cert_der, key_der) = cert_parts(&cert);
+    HoneyBadgerNodeRPCClient::start_rpc_client_for_execution(
+        n,
+        t,
+        addrs,
+        execution_id,
+        cert_der,
+        key_der,
+    )
+    .await
+    .unwrap()
+}
+
+async fn start_coord_client(
+    execution_id: ExecutionId,
+    addr: &str,
+    port: u16,
+    t: u64,
+    n_parties: u64,
+    n_outputs: u64,
+    cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
+) -> HoneyBadgerOffChainCoordinatorClient {
+    let (cert_der, key_der) = cert_parts(&cert);
+    HoneyBadgerOffChainCoordinatorClient::start_rpc_client_for_execution(
+        addr,
+        port,
+        t,
+        n_parties,
+        n_outputs,
+        execution_id,
+        cert_der,
+        key_der,
+    )
+    .await
+    .unwrap()
+}
+
+#[test]
+fn rejects_invalid_mpc_rosters() {
+    let build = |execution_id, n, t, nodes| {
+        HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
+            execution_id,
+            [0; 32],
+            n,
+            t,
+            nodes,
+            0,
+            vec![],
+            InputAssignment::default(),
+        )
+    };
+
+    let valid_execution = ExecutionId::from_bytes([1; 32]);
+    assert!(build(valid_execution, 1, 0, vec![]).is_err());
+    assert!(build(valid_execution, 2, 1, vec![vec![1]]).is_err());
+    assert!(build(valid_execution, 2, 1, vec![vec![1], vec![1]]).is_err());
+    assert!(build(valid_execution, 1, 1, vec![vec![1]]).is_err());
+    assert!(build(ExecutionId::from_bytes([0; 32]), 1, 0, vec![vec![1]]).is_err());
 }
 
 #[tokio::test]
@@ -31,8 +145,8 @@ async fn start_client_server() {
     let addr = "127.0.0.1";
     let port = 12345;
     let t = 1;
-    let server_state =
-        HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+    let execution_id = execution(0x45);
+    let server_state = coordinator_state(execution_id, 5, t, public_keys[..5].to_vec(), 1, vec![]);
     let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
         server_state,
         addr,
@@ -43,16 +157,79 @@ async fn start_client_server() {
     .await
     .unwrap();
 
-    let _ = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
+    let _ = start_coord_client(execution_id, addr, port, 1, 5, 1, client_cert()).await;
+}
+
+#[tokio::test]
+async fn coordinator_shutdown_closes_connections_and_releases_port() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let cert = client_cert();
+    let public_key = cert.signing_key.public_key_raw().to_vec();
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x46);
+    let state = coordinator_state(execution_id, 1, 0, vec![public_key.clone()], 0, vec![]);
+    let server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        state,
         addr,
         port,
-        1,
-        5,
-        1,
-        client_cert(),
+        0,
+        server_cert(),
     )
     .await
     .unwrap();
+    let client = start_coord_client(execution_id, addr, port, 0, 1, 0, cert).await;
+
+    client.trigger_round(Round::Preprocessing).await.unwrap();
+    server.shutdown().await;
+    let disconnected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.trigger_round(Round::InputMaskReservation),
+    )
+    .await
+    .expect("client RPC did not finish after server shutdown");
+    assert!(disconnected.is_err());
+
+    let replacement_state = coordinator_state(execution_id, 1, 0, vec![public_key], 0, vec![]);
+    let replacement = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        replacement_state,
+        addr,
+        port,
+        0,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+    replacement.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropping_node_server_closes_connections_and_releases_port() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x47);
+    let server = start_node_server(execution_id, addr, port, server_cert()).await;
+    let client = start_node_client(
+        execution_id,
+        1,
+        0,
+        vec![(addr.to_string(), port)],
+        client_cert(),
+    )
+    .await;
+
+    drop(server);
+    let disconnected =
+        tokio::time::timeout(std::time::Duration::from_secs(1), client.receive_mask())
+            .await
+            .expect("node RPC did not finish after server drop");
+    assert!(disconnected.is_err());
+
+    let replacement = start_node_server(execution_id, addr, port, server_cert()).await;
+    replacement.shutdown().await;
 }
 
 // Fakes event triggering.
@@ -71,8 +248,8 @@ async fn trigger_pp() {
         let addr = "127.0.0.1";
         let port = 12346;
         let t = 1;
-        let server_state =
-            HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+        let execution_id = execution(0x48);
+        let server_state = coordinator_state(execution_id, 5, t, public_keys, 1, vec![]);
         let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
             server_state,
             addr,
@@ -83,26 +260,8 @@ async fn trigger_pp() {
         .await
         .unwrap();
 
-        let node0 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
-            addr,
-            port,
-            1,
-            5,
-            1,
-            certs.remove(0),
-        )
-        .await
-        .unwrap();
-        let node1 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
-            addr,
-            port,
-            1,
-            5,
-            1,
-            certs.remove(0),
-        )
-        .await
-        .unwrap();
+        let node0 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
+        let node1 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
 
         node0.trigger_round(Round::Preprocessing).await.unwrap();
 
@@ -128,8 +287,8 @@ async fn trigger_pp() {
         let addr = "127.0.0.1";
         let port = 12347;
         let t = 1;
-        let server_state =
-            HoneyBadgerCoordinatorRPCServerSharedBase::new([0u8; 32], 5, t, public_keys, 1, vec![]);
+        let execution_id = execution(0x49);
+        let server_state = coordinator_state(execution_id, 5, t, public_keys, 1, vec![]);
         let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
             server_state,
             addr,
@@ -141,33 +300,15 @@ async fn trigger_pp() {
         .unwrap();
         let barrier = Arc::new(Barrier::new(2));
 
-        let node0 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
-            addr,
-            port,
-            1,
-            5,
-            1,
-            certs.remove(0),
-        )
-        .await
-        .unwrap();
-        let node1 = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
-            addr,
-            port,
-            1,
-            5,
-            1,
-            certs.remove(0),
-        )
-        .await
-        .unwrap();
+        let node0 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
+        let node1 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
 
         tokio::spawn({
             let barrier = barrier.clone();
             async move {
                 if tokio::time::timeout(
                     std::time::Duration::from_millis(500),
-                    node1.trigger_round(Round::Preprocessing),
+                    node1.wait_for_round(Round::Preprocessing),
                 )
                 .await
                 .is_err()
@@ -181,6 +322,36 @@ async fn trigger_pp() {
         node0.trigger_round(Round::Preprocessing).await.unwrap();
         barrier.wait().await;
     }
+}
+
+#[tokio::test]
+async fn zero_input_execution_skips_input_rounds() {
+    stoffel_mpc_coordinator_shared::setup_test();
+    let cert = client_cert();
+    let execution_id = execution(0x4a);
+    let state = coordinator_state(
+        execution_id,
+        1,
+        0,
+        vec![cert.signing_key.public_key_raw().to_vec()],
+        0,
+        vec![],
+    );
+    let port = free_port();
+    let _server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        state,
+        "127.0.0.1",
+        port,
+        0,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+    let node = start_coord_client(execution_id, "127.0.0.1", port, 0, 1, 0, cert).await;
+
+    node.start_preprocessing().await.unwrap();
+    node.start_mpc().await.unwrap();
+    node.wait_for_round(Round::MPCExecution).await.unwrap();
 }
 
 // Goes through one entire program execution, calling all needed coordinator methods.
@@ -206,11 +377,12 @@ async fn end_to_end() {
     let correct_output = Fr::from(31415);
     let coord_addr = "127.0.0.1";
     let coord_port = 12348;
-    let server_state = HoneyBadgerCoordinatorRPCServerSharedBase::new(
-        [0u8; 32],
+    let execution_id = execution(0x50);
+    let server_state = coordinator_state(
+        execution_id,
         n,
         t,
-        public_keys.clone(),
+        public_keys[..n as usize].to_vec(),
         1,
         vec![public_keys[5].clone()],
     );
@@ -231,16 +403,9 @@ async fn end_to_end() {
 
         let mut coords: Vec<HoneyBadgerOffChainCoordinatorClient> = Vec::new();
         for cert in certs.iter().take(n_nodes) {
-            let coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
-                coord_addr,
-                coord_port,
-                1,
-                n,
-                1,
-                cert.clone(),
-            )
-            .await
-            .unwrap();
+            let coord =
+                start_coord_client(execution_id, coord_addr, coord_port, 1, n, 1, cert.clone())
+                    .await;
             coords.push(coord);
         }
 
@@ -265,19 +430,20 @@ async fn end_to_end() {
         )
         .unwrap();
 
-        let designated_party = certs[0].signing_key.public_key_raw().to_vec();
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {
-            let mut node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
+            let node_rpc = start_node_server(
+                execution_id,
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
-                designated_party.clone(),
             )
-            .await
-            .unwrap();
+            .await;
 
-            node_rpc.add_mask_share(0, &mask_shares[i]).await.unwrap();
+            node_rpc
+                .add_mask_share_for_execution(execution_id, 0, &mask_shares[i])
+                .await
+                .unwrap();
             node_rpcs.push(node_rpc);
         }
 
@@ -302,7 +468,10 @@ async fn end_to_end() {
                     for node_rpc in node_rpcs.iter_mut() {
                         // just received by one node here, but in reality would be received by
                         // all nodes, so we simulate this here for more nodes
-                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+                        node_rpc
+                            .add_reserved_index_for_execution(execution_id, c.to_vec(), *i)
+                            .await
+                            .unwrap();
                     }
                 }
             }
@@ -360,24 +529,16 @@ async fn end_to_end() {
     tokio::spawn({
         let barrier = barrier.clone();
         let cert = certs[5].clone();
-        let mut coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
-            coord_addr,
-            coord_port,
-            1,
-            n,
-            1,
-            cert.clone(),
-        )
-        .await
-        .unwrap();
-        let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
+        let mut coord =
+            start_coord_client(execution_id, coord_addr, coord_port, 1, n, 1, cert.clone()).await;
+        let rpc_client = start_node_client(
+            execution_id,
             n as usize,
             t as usize,
             node_rpc_addrs.clone(),
-            cert.clone(),
+            cert,
         )
-        .await
-        .unwrap();
+        .await;
         async move {
             coord.wait_for_round(Round::Preprocessing).await.unwrap();
             coord
@@ -442,11 +603,12 @@ async fn end_to_end_fake_coord() {
 
     let coord_addr = "127.0.0.1";
     let coord_port = 12352;
-    let server_state = HoneyBadgerCoordinatorRPCServerSharedBase::new(
-        [0u8; 32],
+    let execution_id = execution(0x52);
+    let server_state = coordinator_state(
+        execution_id,
         5,
         t,
-        public_keys.clone(),
+        public_keys[..n].to_vec(),
         1,
         vec![public_keys[5].clone()],
     );
@@ -467,7 +629,8 @@ async fn end_to_end_fake_coord() {
 
         let mut coords = Vec::new();
         for cert in certs.iter().take(n_nodes) {
-            let coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
+            let coord = start_coord_client(
+                execution_id,
                 coord_addr,
                 coord_port,
                 1,
@@ -475,8 +638,7 @@ async fn end_to_end_fake_coord() {
                 1,
                 cert.clone(),
             )
-            .await
-            .unwrap();
+            .await;
             coords.push(coord);
         }
 
@@ -498,17 +660,16 @@ async fn end_to_end_fake_coord() {
 
         let mut node_rpcs = Vec::new();
         for i in 0..n_nodes {
-            let mut node_rpc = HoneyBadgerNodeRPCServer::start_from_cert(
+            let node_rpc = start_node_server(
+                execution_id,
                 &node_rpc_addrs[i].0,
                 node_rpc_addrs[i].1,
                 certs[i].clone(),
-                public_keys[0].clone(),
             )
-            .await
-            .unwrap();
+            .await;
 
             node_rpc
-                .add_mask_share(0, &mask_shares[i].clone())
+                .add_mask_share_for_execution(execution_id, 0, &mask_shares[i])
                 .await
                 .unwrap();
             node_rpcs.push(node_rpc);
@@ -532,7 +693,10 @@ async fn end_to_end_fake_coord() {
                     for node_rpc in node_rpcs.iter_mut() {
                         // just received by one node here, but in reality would be received by
                         // all nodes, so we simulate this here for more nodes
-                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
+                        node_rpc
+                            .add_reserved_index_for_execution(execution_id, c.to_vec(), *i)
+                            .await
+                            .unwrap();
                     }
                 }
             }
@@ -581,7 +745,8 @@ async fn end_to_end_fake_coord() {
     tokio::spawn({
         let barrier = barrier.clone();
         let cert = certs[5].clone();
-        let mut coord = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_from_cert(
+        let mut coord = start_coord_client(
+            execution_id,
             coord_addr,
             coord_port,
             1,
@@ -589,16 +754,9 @@ async fn end_to_end_fake_coord() {
             1,
             cert.clone(),
         )
-        .await
-        .unwrap();
-        let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
-            n,
-            t as usize,
-            node_rpc_addrs.clone(),
-            cert.clone(),
-        )
-        .await
-        .unwrap();
+        .await;
+        let rpc_client =
+            start_node_client(execution_id, n, t as usize, node_rpc_addrs.clone(), cert).await;
         async move {
             coord.wait_for_round(Round::Preprocessing).await.unwrap();
             coord
@@ -641,6 +799,140 @@ async fn end_to_end_fake_coord() {
 }
 
 #[tokio::test]
-async fn stop_rpc_server() {
-    // TODO: try using stop_tx
+async fn output_waiters_receive_threshold_and_later_share_snapshots() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let execution_id = ExecutionId::from_bytes([0x65; 32]);
+    let node_certs = [client_cert(), client_cert(), client_cert(), client_cert()];
+    let node_ids = node_certs
+        .iter()
+        .map(|cert| cert.signing_key.public_key_raw().to_vec())
+        .collect::<Vec<_>>();
+    let output_cert = client_cert();
+    let output_id = output_cert.signing_key.public_key_raw().to_vec();
+    let addr = "127.0.0.1";
+    let port = 12365;
+    let server_state = coordinator_state(execution_id, 4, 1, node_ids, 0, vec![output_id.clone()]);
+    let _server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        server_state,
+        addr,
+        port,
+        1,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+    let node_rpcs = futures_util::future::join_all(node_certs.into_iter().map(|node_cert| {
+        stoffel_mpc_coordinator_shared::self_signed_certs::setup_client(
+            addr,
+            port,
+            node_cert.cert.der().to_vec(),
+            node_cert.signing_key.serialize_der(),
+        )
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let output_rpc = stoffel_mpc_coordinator_shared::self_signed_certs::setup_client(
+        addr,
+        port,
+        output_cert.cert.der().to_vec(),
+        output_cert.signing_key.serialize_der(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::obtain_output_shares(
+            &output_rpc,
+            ExecutionId::from_bytes([0x66; 32]),
+        )
+        .await
+        .is_err()
+    );
+
+    let mut waiter_a = CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::obtain_output_shares(
+        &output_rpc,
+        execution_id,
+    )
+    .await
+    .unwrap();
+    let outputs = [
+        (vec![1], vec![11]),
+        (vec![2], vec![22]),
+        (vec![3], vec![33]),
+        (vec![4], vec![44]),
+    ];
+    assert!(
+        CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+            &node_rpcs[0],
+            execution_id,
+            vec![0xff],
+            outputs[0].clone(),
+        )
+        .await
+        .is_err()
+    );
+    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+        &node_rpcs[0],
+        execution_id,
+        output_id.clone(),
+        outputs[0].clone(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiter_a.next())
+            .await
+            .is_err(),
+        "one share must not satisfy a t=1 output threshold"
+    );
+
+    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+        &node_rpcs[1],
+        execution_id,
+        output_id.clone(),
+        outputs[1].clone(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiter_a.next())
+            .await
+            .is_err(),
+        "two shares must not satisfy the robust t=1 output threshold"
+    );
+
+    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+        &node_rpcs[2],
+        execution_id,
+        output_id.clone(),
+        outputs[2].clone(),
+    )
+    .await
+    .unwrap();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), waiter_a.next())
+        .await
+        .expect("threshold snapshot must be delivered")
+        .expect("subscription must remain open")
+        .expect("threshold snapshot must deserialize");
+    assert_eq!(snapshot.len(), 3);
+    assert!(outputs[..3].iter().all(|output| snapshot.contains(output)));
+
+    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+        &node_rpcs[3],
+        execution_id,
+        output_id,
+        outputs[3].clone(),
+    )
+    .await
+    .unwrap();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), waiter_a.next())
+        .await
+        .expect("additional-share snapshot must be delivered")
+        .expect("subscription must remain open after threshold delivery")
+        .expect("additional-share snapshot must deserialize");
+    assert_eq!(snapshot.len(), 4);
+    assert!(outputs.iter().all(|output| snapshot.contains(output)));
 }

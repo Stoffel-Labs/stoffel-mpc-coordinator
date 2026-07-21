@@ -15,7 +15,6 @@ use jsonrpsee::types::{error::ErrorCode, ErrorObjectOwned};
 use jsonrpsee::{
     core::{to_json_raw_value, RpcResult, SubscriptionResult},
     proc_macros::rpc,
-    server::ServerHandle,
     PendingSubscriptionSink, SubscriptionSink,
 };
 use p256::{pkcs8::DecodePrivateKey, SecretKey};
@@ -25,11 +24,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use stoffel_mpc_coordinator_shared::{
     round_before,
-    rpc::{ClientInfo, ValueWrapper},
-    Coordinator, CoordinatorError, Round, ShareBound,
+    rpc::{RPCServerHandle, ValueWrapper},
+    Coordinator, CoordinatorError, ExecutionId, Round, ShareBound,
 };
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use CoordinatorRPCBaseError::*;
 
 /// KEM, KDF, and AEAD instantiations are needed to encrypt the output shares for an MPC client
@@ -51,6 +49,10 @@ type AeadImpl = AesGcm256;
 /// must simply be the same: if a client requests a mask share from a node for a previously reserved
 /// mask index, then the node simply checks that the public keys used for both these actions are the same.
 pub type ClientIdentity = Vec<u8>;
+
+/// A deliberately small, explicit bound for the number of live executions owned by one RPC
+/// listener. Finished executions must be retired before this many more are registered.
+pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignedMaskReservation {
@@ -95,10 +97,9 @@ pub mod node_rpc {
     use async_trait::async_trait;
     use jsonrpsee::{
         async_client::Client,
-        core::{to_json_raw_value, RpcResult, SubscriptionResult},
+        core::{to_json_raw_value, SubscriptionResult},
         proc_macros::rpc,
         server::RpcModule,
-        server::ServerHandle,
         types::{error::ErrorCode, ErrorObjectOwned},
         PendingSubscriptionSink, SubscriptionSink,
     };
@@ -107,17 +108,16 @@ pub mod node_rpc {
     use std::marker::PhantomData;
     use std::sync::Arc;
     use stoffel_mpc_coordinator_shared::{
-        rpc::ClientInfo, CoordinatorError, NodeRPCError, ShareBound,
+        rpc::RPCServerHandle, CoordinatorError, ExecutionId, NodeRPCError, ShareBound,
     };
     use tokio::sync::Mutex;
-    use tokio::task::JoinHandle;
     use tokio::task::JoinSet;
 
     /// Errors returned by the node-side RPC interface.
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum OffChainNodeRPCServerError {
         SerializationError = 1,
-        NotDesignatedParty = 2,
+        ExecutionNotFound = 2,
     }
 
     /// The off-chain node-side JSON-RPC interface.
@@ -129,22 +129,19 @@ pub mod node_rpc {
         /// authentication is needed, since the client's identity is the same as the one used to
         /// establish the TLS connection to access this very interface.
         #[subscription(name = "sub_receive_mask_share", unsubscribe = "unsub_receive_mask_share", item = Vec<u8>)]
-        async fn receive_mask_share(&self) -> SubscriptionResult;
+        async fn receive_mask_share(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
         #[subscription(name = "sub_receive_assigned_mask_shares", unsubscribe = "unsub_receive_assigned_mask_shares", item = Vec<AssignedMaskShare>)]
-        async fn receive_assigned_mask_shares(&self) -> SubscriptionResult;
-
-        /// Resets per-job state so the node can serve a subsequent job without a process restart.
-        /// Only the designated leader node (the first element of the MPC node list) may call this.
-        #[method(name = "reset")]
-        async fn reset(&self) -> RpcResult<()>;
+        async fn receive_assigned_mask_shares(
+            &self,
+            execution_id: ExecutionId,
+        ) -> SubscriptionResult;
     }
 
     pub struct NodeRPCServer<F: FftField, S: ShareBound<F>> {
         rpc_server: Arc<Mutex<NodeRPCServerInternal<F, S>>>,
         addr: String,
-        _port: u16,
-        _server_handle: JoinHandle<()>,
+        server_handle: RPCServerHandle,
     }
 
     /// An object used by an MPC client to connect to the RPC interfaces of many nodes.
@@ -155,31 +152,17 @@ pub mod node_rpc {
         n: usize,
         /// The threshold value.
         t: usize,
+        /// The program invocation to which all RPC calls made by this handle belong.
+        execution_id: ExecutionId,
         _phantom: PhantomData<(F, S)>,
     }
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCClient<F, S> {
-        pub async fn start_rpc_client_from_cert(
+        pub async fn start_rpc_client_for_execution(
             n: usize,
             t: usize,
             addrs: Vec<(String, u16)>,
-            client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-        ) -> Result<Self, CoordinatorError> {
-            Self::start_rpc_client(
-                n,
-                t,
-                addrs,
-                client_cert.cert.der().to_vec(),
-                client_cert.signing_key.serialize_der(),
-            )
-            .await
-        }
-
-        /// Connects to a list of MPC nodes via Websockets over TLS.
-        pub async fn start_rpc_client(
-            n: usize,
-            t: usize,
-            addrs: Vec<(String, u16)>,
+            execution_id: ExecutionId,
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Result<Self, CoordinatorError> {
@@ -200,6 +183,7 @@ pub mod node_rpc {
                 node_rpcs,
                 n,
                 t,
+                execution_id,
                 _phantom: PhantomData,
             })
         }
@@ -211,7 +195,7 @@ pub mod node_rpc {
 
             for rpc in self.node_rpcs.iter() {
                 let mut sub = rpc
-                    .receive_mask_share()
+                    .receive_mask_share(self.execution_id)
                     .await
                     .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
                 share_futures.spawn(async move { sub.next().await });
@@ -256,7 +240,7 @@ pub mod node_rpc {
 
             for rpc in self.node_rpcs.iter() {
                 let mut sub = rpc
-                    .receive_assigned_mask_shares()
+                    .receive_assigned_mask_shares(self.execution_id)
                     .await
                     .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
                 share_futures.spawn(async move { sub.next().await });
@@ -331,42 +315,19 @@ pub mod node_rpc {
 
             Ok(outputs)
         }
-
-        pub async fn reset(&self) -> Result<(), CoordinatorError> {
-            for rpc in self.node_rpcs.iter() {
-                OffChainNodeRPCClient::reset(rpc)
-                    .await
-                    .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
-            }
-            Ok(())
-        }
     }
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCServer<F, S> {
-        pub async fn start_from_cert(
+        pub async fn start_for_execution(
             addr: &str,
             port: u16,
-            cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-            designated_party: ClientIdentity,
-        ) -> Result<Self, CoordinatorError> {
-            Self::start(
-                addr,
-                port,
-                cert.cert.der().to_vec(),
-                cert.signing_key.serialize_der(),
-                designated_party,
-            )
-            .await
-        }
-
-        pub async fn start(
-            addr: &str,
-            port: u16,
+            execution_id: ExecutionId,
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
-            designated_party: ClientIdentity,
         ) -> Result<Self, CoordinatorError> {
-            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::<F, S>::new(designated_party)));
+            let mut internal = NodeRPCServerInternal::<F, S>::new();
+            internal.register_execution(execution_id)?;
+            let rpc_server_data = Arc::new(Mutex::new(internal));
             let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<
                 NodeRPCServerImpl<F, S>,
             >(
@@ -376,8 +337,7 @@ pub mod node_rpc {
             Ok(Self {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
-                _port: port,
-                _server_handle: server_handle,
+                server_handle,
             })
         }
 
@@ -385,25 +345,44 @@ pub mod node_rpc {
             self.addr.clone()
         }
 
-        // called when the client has reserved indices at the coordinator
-        pub async fn add_reserved_index(
-            &mut self,
-            id: ClientIdentity,
-            i: u64,
-        ) -> Result<(), NodeRPCError> {
-            self.add_assigned_reserved_index(AssignedMaskReservation {
-                client: id,
-                reserved_index: i,
-                input_ordinal: i,
-            })
-            .await
+        pub async fn shutdown(self) {
+            self.server_handle.shutdown().await;
         }
 
-        pub async fn add_assigned_reserved_index(
-            &mut self,
+        /// Registers a program invocation on this long-running listener.
+        pub async fn register_execution(
+            &self,
+            execution_id: ExecutionId,
+        ) -> Result<(), CoordinatorError> {
+            self.rpc_server
+                .lock()
+                .await
+                .register_execution(execution_id)
+        }
+
+        /// Stops admitting new RPCs for an invocation and drops all of its node-side state.
+        pub async fn retire_execution(&self, execution_id: ExecutionId) -> bool {
+            self.rpc_server.lock().await.retire_execution(execution_id)
+        }
+
+        async fn execution_state(
+            &self,
+            execution_id: ExecutionId,
+        ) -> Result<Arc<Mutex<NodeRPCExecutionState<S>>>, NodeRPCError> {
+            self.rpc_server
+                .lock()
+                .await
+                .execution_state(execution_id)
+                .ok_or(NodeRPCError::ExecutionNotFound)
+        }
+
+        pub async fn add_assigned_reserved_index_for_execution(
+            &self,
+            execution_id: ExecutionId,
             reservation: AssignedMaskReservation,
         ) -> Result<(), NodeRPCError> {
-            let mut d = self.rpc_server.lock().await;
+            let d = self.execution_state(execution_id).await?;
+            let mut d = d.lock().await;
             let id = reservation.client.clone();
             let i = reservation.reserved_index;
 
@@ -452,11 +431,35 @@ pub mod node_rpc {
             Ok(())
         }
 
-        // called when preprocessing has generated the mask shares
-        pub async fn add_mask_share(&mut self, i: u64, share: &S) -> Result<(), NodeRPCError> {
-            let mut d = self.rpc_server.lock().await;
+        pub async fn add_reserved_index_for_execution(
+            &self,
+            execution_id: ExecutionId,
+            client: ClientIdentity,
+            reserved_index: u64,
+        ) -> Result<(), NodeRPCError> {
+            self.add_assigned_reserved_index_for_execution(
+                execution_id,
+                AssignedMaskReservation {
+                    client,
+                    reserved_index,
+                    input_ordinal: reserved_index,
+                },
+            )
+            .await
+        }
 
-            assert!(!d.mask_shares.contains_key(&i));
+        pub async fn add_mask_share_for_execution(
+            &self,
+            execution_id: ExecutionId,
+            i: u64,
+            share: &S,
+        ) -> Result<(), NodeRPCError> {
+            let d = self.execution_state(execution_id).await?;
+            let mut d = d.lock().await;
+
+            if d.mask_shares.contains_key(&i) {
+                return Err(NodeRPCError::IndexAlreadyAdded);
+            }
             d.mask_shares.insert(i, share.clone());
 
             // if reserved index has been added and client has requested the share already, send the share now
@@ -501,6 +504,15 @@ pub mod node_rpc {
         id: Vec<u8>,
     }
 
+    impl<F: FftField, S: ShareBound<F>> NodeRPCServerImpl<F, S> {
+        async fn execution_state(
+            &self,
+            execution_id: ExecutionId,
+        ) -> Option<Arc<Mutex<NodeRPCExecutionState<S>>>> {
+            self.d.lock().await.execution_state(execution_id)
+        }
+    }
+
     impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServerConnection
         for NodeRPCServerImpl<F, S>
     {
@@ -520,6 +532,12 @@ pub mod node_rpc {
 
     /// The internal state of the node-side RPC server.
     pub struct NodeRPCServerInternal<F: FftField, S: ShareBound<F>> {
+        executions: HashMap<ExecutionId, Arc<Mutex<NodeRPCExecutionState<S>>>>,
+        _phantom: PhantomData<F>,
+    }
+
+    /// State that must never be shared between two program invocations.
+    struct NodeRPCExecutionState<S> {
         /// Maps reserved indices to the clients that have reserved them.
         index_to_client: HashMap<u64, ClientIdentity>,
         assigned_reservations: HashMap<u64, AssignedMaskReservation>,
@@ -528,37 +546,59 @@ pub mod node_rpc {
         /// Client sinks to send mask shares over Websockets.
         sinks: HashMap<ClientIdentity, SubscriptionSink>,
         assigned_sinks: HashMap<ClientIdentity, SubscriptionSink>,
-        /// TODO
+        /// Preprocessed mask shares, indexed only within this execution.
         mask_shares: HashMap<u64, S>,
-        /// Maps client identities the per-client information stored by the server.
-        clients: HashMap<Vec<u8>, ClientInfo>,
-        /// The identity of the designated party permitted to call `reset`.
-        designated_party: ClientIdentity,
-        _phantom: PhantomData<F>,
-    }
-
-    impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServerShared
-        for NodeRPCServerInternal<F, S>
-    {
-        fn add_client(
-            &mut self,
-            cert_der: Vec<u8>,
-            client_handle: JoinHandle<()>,
-            stop_tx: ServerHandle,
-        ) {
-            self.clients.insert(
-                cert_der.clone(),
-                ClientInfo {
-                    cert: cert_der,
-                    thread: client_handle,
-                    stop_tx,
-                },
-            );
-        }
     }
 
     impl<F: FftField, S: ShareBound<F>> NodeRPCServerInternal<F, S> {
-        pub fn new(designated_party: ClientIdentity) -> Self {
+        fn new() -> Self {
+            Self {
+                executions: HashMap::new(),
+                _phantom: PhantomData,
+            }
+        }
+
+        fn register_execution(
+            &mut self,
+            execution_id: ExecutionId,
+        ) -> Result<(), CoordinatorError> {
+            if execution_id.is_zero() {
+                return Err(CoordinatorError::JSONError(
+                    "zero execution IDs are not valid for persistent RPC listeners".to_string(),
+                ));
+            }
+            if self.executions.contains_key(&execution_id) {
+                return Err(CoordinatorError::JSONError(format!(
+                    "Execution {execution_id} is already registered"
+                )));
+            }
+            if self.executions.len() >= super::DEFAULT_MAX_CONCURRENT_EXECUTIONS {
+                return Err(CoordinatorError::JSONError(format!(
+                    "Execution capacity {} reached",
+                    super::DEFAULT_MAX_CONCURRENT_EXECUTIONS
+                )));
+            }
+            self.executions.insert(
+                execution_id,
+                Arc::new(Mutex::new(NodeRPCExecutionState::new())),
+            );
+            Ok(())
+        }
+
+        fn retire_execution(&mut self, execution_id: ExecutionId) -> bool {
+            self.executions.remove(&execution_id).is_some()
+        }
+
+        fn execution_state(
+            &self,
+            execution_id: ExecutionId,
+        ) -> Option<Arc<Mutex<NodeRPCExecutionState<S>>>> {
+            self.executions.get(&execution_id).cloned()
+        }
+    }
+
+    impl<S> NodeRPCExecutionState<S> {
+        fn new() -> Self {
             Self {
                 index_to_client: HashMap::new(),
                 assigned_reservations: HashMap::new(),
@@ -566,14 +606,11 @@ pub mod node_rpc {
                 sinks: HashMap::new(),
                 assigned_sinks: HashMap::new(),
                 mask_shares: HashMap::new(),
-                clients: HashMap::new(),
-                designated_party,
-                _phantom: PhantomData,
             }
         }
     }
 
-    impl<F: FftField, S: ShareBound<F>> NodeRPCServerInternal<F, S> {
+    impl<S: ark_serialize::CanonicalSerialize> NodeRPCExecutionState<S> {
         fn assigned_mask_share(
             &self,
             reserved_index: u64,
@@ -615,10 +652,24 @@ pub mod node_rpc {
 
     #[async_trait]
     impl<F: FftField, S: ShareBound<F>> OffChainNodeRPCServer for NodeRPCServerImpl<F, S> {
-        async fn receive_mask_share(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+        async fn receive_mask_share(
+            &self,
+            pending: PendingSubscriptionSink,
+            execution_id: ExecutionId,
+        ) -> SubscriptionResult {
             use OffChainNodeRPCServerError::*;
 
-            let mut d = self.d.lock().await;
+            let Some(d) = self.execution_state(execution_id).await else {
+                pending
+                    .reject(ErrorObjectOwned::owned(
+                        ErrorCode::ServerError(ExecutionNotFound as i32).code(),
+                        format!("Execution {execution_id} is not registered"),
+                        None::<()>,
+                    ))
+                    .await;
+                return Ok(());
+            };
+            let mut d = d.lock().await;
 
             // Each client may have multiple inputs, but only one mask-share request can be
             // outstanding per node connection.
@@ -702,10 +753,21 @@ pub mod node_rpc {
         async fn receive_assigned_mask_shares(
             &self,
             pending: PendingSubscriptionSink,
+            execution_id: ExecutionId,
         ) -> SubscriptionResult {
             use OffChainNodeRPCServerError::*;
 
-            let mut d = self.d.lock().await;
+            let Some(d) = self.execution_state(execution_id).await else {
+                pending
+                    .reject(ErrorObjectOwned::owned(
+                        ErrorCode::ServerError(ExecutionNotFound as i32).code(),
+                        format!("Execution {execution_id} is not registered"),
+                        None::<()>,
+                    ))
+                    .await;
+                return Ok(());
+            };
+            let mut d = d.lock().await;
 
             if d.assigned_sinks.contains_key(&self.id) {
                 pending
@@ -762,32 +824,6 @@ pub mod node_rpc {
 
             Ok(())
         }
-
-        async fn reset(&self) -> RpcResult<()> {
-            use OffChainNodeRPCServerError::*;
-
-            let mut d = self.d.lock().await;
-
-            if self.id != d.designated_party {
-                return Err(ErrorObjectOwned::owned(
-                    ErrorCode::ServerError(NotDesignatedParty as i32).code(),
-                    format!(
-                        "Only the designated party {:?} can reset the node.",
-                        d.designated_party
-                    ),
-                    None::<()>,
-                ));
-            }
-
-            d.index_to_client.clear();
-            d.assigned_reservations.clear();
-            d.client_to_index.clear();
-            d.sinks.clear();
-            d.assigned_sinks.clear();
-            d.mask_shares.clear();
-
-            Ok(())
-        }
     }
 }
 
@@ -833,17 +869,17 @@ pub enum Event<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
 #[rpc(server, client)]
 pub trait StoffelCoordinatorRPC {
     #[method(name = "start_preprocessing")]
-    async fn start_preprocessing(&self) -> RpcResult<()>;
+    async fn start_preprocessing(&self, execution_id: ExecutionId) -> RpcResult<()>;
     #[method(name = "reserve_input_masks")]
-    async fn reserve_input_masks(&self) -> RpcResult<()>;
+    async fn reserve_input_masks(&self, execution_id: ExecutionId) -> RpcResult<()>;
     #[method(name = "collect_inputs")]
-    async fn collect_inputs(&self) -> RpcResult<()>;
+    async fn collect_inputs(&self, execution_id: ExecutionId) -> RpcResult<()>;
     #[method(name = "start_mpc")]
-    async fn start_mpc(&self) -> RpcResult<()>;
+    async fn start_mpc(&self, execution_id: ExecutionId) -> RpcResult<()>;
     #[method(name = "send_output")]
-    async fn send_output(&self) -> RpcResult<()>;
+    async fn send_output(&self, execution_id: ExecutionId) -> RpcResult<()>;
     #[method(name = "finalize")]
-    async fn finalize(&self) -> RpcResult<()>;
+    async fn finalize(&self, execution_id: ExecutionId) -> RpcResult<()>;
 }
 
 // RPC interface already implemented by this library.
@@ -854,51 +890,49 @@ pub trait StoffelCoordinatorRPC {
 pub trait CoordinatorRPCBase<F: FftField, S: ShareBound<F>> {
     /// Wait for round `round` to be started.
     #[subscription(name = "sub_round", unsubscribe = "unsub_round", item = Event<S::ValueType>)]
-    async fn sub_round(&self, round: Round) -> SubscriptionResult;
+    async fn sub_round(&self, execution_id: ExecutionId, round: Round) -> SubscriptionResult;
 
     #[subscription(name = "sub_reserved_indices", unsubscribe = "unsub_reserved_indices", item = Event<S::ValueType>)]
-    async fn sub_reserved_indices(&self) -> SubscriptionResult;
+    async fn sub_reserved_indices(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
     #[subscription(name = "sub_masked_inputs", unsubscribe = "unsub_masked_inputs", item = Event<S::ValueType>)]
-    async fn sub_masked_inputs(&self) -> SubscriptionResult;
+    async fn sub_masked_inputs(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
     #[subscription(name = "sub_assigned_reserved_indices", unsubscribe = "unsub_assigned_reserved_indices", item = AssignedMaskReservation)]
-    async fn sub_assigned_reserved_indices(&self) -> SubscriptionResult;
+    async fn sub_assigned_reserved_indices(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
     #[subscription(name = "sub_assigned_masked_inputs", unsubscribe = "unsub_assigned_masked_inputs", item = AssignedMaskedInputEvent<S::ValueType>)]
-    async fn sub_assigned_masked_inputs(&self) -> SubscriptionResult;
+    async fn sub_assigned_masked_inputs(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
     /// Returns the number of available input masks left. TODO: this involves a race condition
     /// since querying this and reserving an index is not atomic. remove it?
     #[method(name = "available_input_masks")]
-    async fn available_input_masks(&self) -> RpcResult<u64>;
+    async fn available_input_masks(&self, execution_id: ExecutionId) -> RpcResult<u64>;
 
     /// MPC clients can request index `i`.
     #[method(name = "reserve_mask_index")]
-    async fn reserve_mask_index(&self, i: u64) -> RpcResult<()>;
-
-    /// The designated party can reset the coordinator with this method.
-    #[method(name = "reset")]
-    async fn reset(&self) -> RpcResult<()>;
+    async fn reserve_mask_index(&self, execution_id: ExecutionId, i: u64) -> RpcResult<()>;
 
     /// An MPC client uses this to submit a masked input `masked_input`, for which it has
     /// previously reserved the index `reserved_index`.
     #[method(name = "submit_masked_input")]
     async fn submit_masked_input(
         &self,
+        execution_id: ExecutionId,
         masked_input: ValueWrapper<S::ValueType>,
         reserved_index: u64,
     ) -> RpcResult<()>;
 
     /// The designated party uses this to transition to the new round `next_round`.
     #[method(name = "transition")]
-    async fn transition(&self, next_round: Round) -> RpcResult<()>;
+    async fn transition(&self, execution_id: ExecutionId, next_round: Round) -> RpcResult<()>;
 
     /// MPC nodes use this to send encrypted output shares `enc_shares` for a client with identity
     /// `client_id`.
     #[method(name = "send_output_shares")]
     async fn send_output_shares(
         &self,
+        execution_id: ExecutionId,
         client_id: ClientIdentity,
         enc_shares: (Vec<u8>, Vec<u8>),
     ) -> RpcResult<()>;
@@ -906,7 +940,7 @@ pub trait CoordinatorRPCBase<F: FftField, S: ShareBound<F>> {
     /// MPC clients use this to receive their output shares from the coordinator, so they can
     /// reconstruct their private output.
     #[subscription(name = "sub_obtain_output_shares", unsubscribe = "unsub_obtain_output_shares", item = Vec<(Vec<u8>, Vec<u8>)>)]
-    async fn obtain_output_shares(&self) -> SubscriptionResult;
+    async fn obtain_output_shares(&self, execution_id: ExecutionId) -> SubscriptionResult;
 }
 
 /// Errors returned to RPC clients by the basic coordinator RPC interface.
@@ -924,6 +958,15 @@ pub enum CoordinatorRPCBaseError {
     SendingFailed = 11,
     NotOutputClient = 12,
     UnauthorizedClientIo = 15,
+    ExecutionNotFound = 16,
+}
+
+fn execution_not_found(execution_id: ExecutionId) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        ErrorCode::ServerError(CoordinatorRPCBaseError::ExecutionNotFound as i32).code(),
+        format!("Execution {execution_id} is not registered"),
+        None::<()>,
+    )
 }
 
 /// The basic server-side information for one client connection to the coordinator RPC interface.
@@ -939,9 +982,15 @@ pub struct CoordinatorRPCServerConnectionBase<F: FftField, S: ShareBound<F>> {
 /// The basic internal state of the coordinator RPC server.
 /// Can be extended by the developer.
 pub struct CoordinatorRPCServerSharedBase<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
+    execution_id: ExecutionId,
+    execution: CoordinatorExecutionState<T>,
+}
+
+/// All mutable protocol state for one program invocation.
+struct CoordinatorExecutionState<T: CanonicalSerialize + CanonicalDeserialize + Clone> {
     // Contains the sinks of clients, which subscribed to the transition to the given round.
     sinks: HashMap<Round, Vec<SubscriptionSink>>,
-    trans_events: HashMap<Round, Vec<Event<T>>>,
+    trans_events: HashMap<Round, Event<T>>,
     reserved_index_events: Vec<Event<T>>,
     reserved_index_sinks: Vec<SubscriptionSink>,
     assigned_reserved_index_events: Vec<AssignedMaskReservation>,
@@ -958,14 +1007,12 @@ pub struct CoordinatorRPCServerSharedBase<T: CanonicalSerialize + CanonicalDeser
     /// The `t` value.
     t: u64,
     /// The MPC nodes.
-    mpc_nodes: Option<Vec<ClientIdentity>>,
-    /// The connected clients and their connection-specific information.
-    clients: HashMap<ClientIdentity, ClientInfo>,
+    mpc_nodes: Vec<ClientIdentity>,
     /// Stores encrypted output shares sent by MPC nodes for MPC clients. The first element of the key is the client ID,
     /// the second is the node ID.
     output_shares: HashMap<(ClientIdentity, ClientIdentity), (Vec<u8>, Vec<u8>)>,
-    /// Sinks for MPC clients that are waiting to obtain their output shares.
-    output_sinks: HashMap<ClientIdentity, SubscriptionSink>,
+    /// A client remains subscribed as additional parties submit output shares.
+    output_sinks: HashMap<ClientIdentity, Arc<SubscriptionSink>>,
     /// The set of clients that are permitted to call `obtain_output_shares`.
     output_clients: Vec<ClientIdentity>,
     /// Optional index assignments used to prevent clients from reserving indices assigned to others.
@@ -979,66 +1026,87 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCServerConnectionBase<F, S> {
     ) -> Self {
         Self { d: internal, id }
     }
+
+    async fn execution_state(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<MappedMutexGuard<'_, CoordinatorExecutionState<S::ValueType>>, ErrorObjectOwned>
+    {
+        let shared = self.d.lock().await;
+        if shared.execution_id != execution_id {
+            return Err(execution_not_found(execution_id));
+        }
+        Ok(MutexGuard::map(shared, |shared| &mut shared.execution))
+    }
 }
 
 impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerSharedBase<T> {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_execution(
+        execution_id: ExecutionId,
         _prog_hash: [u8; 32],
-        _n: u64,
-        t: u64,
-        initial_mpc_nodes: Vec<ClientIdentity>,
-        n_inputs: u64,
-        output_clients: Vec<ClientIdentity>,
-    ) -> Self {
-        Self {
-            sinks: HashMap::from([
-                (Round::Idle, vec![]),
-                (Round::Preprocessing, vec![]),
-                (Round::InputMaskReservation, vec![]),
-                (Round::InputCollection, vec![]),
-                (Round::MPCExecution, vec![]),
-                (Round::OutputDistribution, vec![]),
-                (Round::ProgramFinished, vec![]),
-            ]),
-            trans_events: HashMap::from([
-                (Round::Preprocessing, vec![]),
-                (Round::InputMaskReservation, vec![]),
-                (Round::InputCollection, vec![]),
-                (Round::MPCExecution, vec![]),
-                (Round::OutputDistribution, vec![]),
-                (Round::ProgramFinished, vec![]),
-            ]),
-            reserved_index_events: vec![],
-            reserved_index_sinks: vec![],
-            assigned_reserved_index_events: vec![],
-            assigned_reserved_index_sinks: vec![],
-            masked_input_events: vec![],
-            masked_input_sinks: vec![],
-            assigned_masked_input_events: vec![],
-            assigned_masked_input_sinks: vec![],
-            n_reserved: 0,
-            reserved_indices: vec![None; n_inputs as usize],
-            masked_inputs: vec![None; n_inputs as usize],
-            round: Round::Idle,
-            t,
-            mpc_nodes: Some(initial_mpc_nodes),
-            clients: HashMap::new(),
-            output_shares: HashMap::new(),
-            output_sinks: HashMap::new(),
-            output_clients,
-            input_assignments: vec![],
-        }
-    }
-
-    pub fn new_with_input_assignment(
-        _prog_hash: [u8; 32],
-        _n: u64,
+        n: u64,
         t: u64,
         initial_mpc_nodes: Vec<ClientIdentity>,
         n_inputs: u64,
         output_clients: Vec<ClientIdentity>,
         input_assignment: InputAssignment,
     ) -> Result<Self, CoordinatorError> {
+        if execution_id.is_zero() {
+            return Err(CoordinatorError::JSONError(
+                "execution ID must be nonzero".to_string(),
+            ));
+        }
+        let execution = CoordinatorExecutionState::new(
+            n,
+            t,
+            initial_mpc_nodes,
+            n_inputs,
+            output_clients,
+            input_assignment,
+        )?;
+        Ok(Self {
+            execution_id,
+            execution,
+        })
+    }
+}
+
+impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorExecutionState<T> {
+    fn new(
+        n: u64,
+        t: u64,
+        initial_mpc_nodes: Vec<ClientIdentity>,
+        n_inputs: u64,
+        output_clients: Vec<ClientIdentity>,
+        input_assignment: InputAssignment,
+    ) -> Result<Self, CoordinatorError> {
+        if initial_mpc_nodes.is_empty() {
+            return Err(CoordinatorError::JSONError(
+                "Coordinator requires at least one MPC node".to_string(),
+            ));
+        }
+        let n_usize = usize::try_from(n).map_err(|_| CoordinatorError::U64ToUsizeError)?;
+        if initial_mpc_nodes.len() != n_usize {
+            return Err(CoordinatorError::JSONError(format!(
+                "Coordinator was configured for {n} MPC nodes, but received {} node identities",
+                initial_mpc_nodes.len()
+            )));
+        }
+        if t >= n {
+            return Err(CoordinatorError::JSONError(format!(
+                "Threshold {t} must be less than the MPC node count {n}"
+            )));
+        }
+        if initial_mpc_nodes
+            .iter()
+            .enumerate()
+            .any(|(index, node)| initial_mpc_nodes[..index].contains(node))
+        {
+            return Err(CoordinatorError::JSONError(
+                "MPC node identities must be unique".to_string(),
+            ));
+        }
         if !input_assignment.input_slots.is_empty()
             && n_inputs as usize != input_assignment.input_slots.len()
         {
@@ -1049,23 +1117,8 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
             )));
         }
         Ok(Self {
-            sinks: HashMap::from([
-                (Round::Idle, vec![]),
-                (Round::Preprocessing, vec![]),
-                (Round::InputMaskReservation, vec![]),
-                (Round::InputCollection, vec![]),
-                (Round::MPCExecution, vec![]),
-                (Round::OutputDistribution, vec![]),
-                (Round::ProgramFinished, vec![]),
-            ]),
-            trans_events: HashMap::from([
-                (Round::Preprocessing, vec![]),
-                (Round::InputMaskReservation, vec![]),
-                (Round::InputCollection, vec![]),
-                (Round::MPCExecution, vec![]),
-                (Round::OutputDistribution, vec![]),
-                (Round::ProgramFinished, vec![]),
-            ]),
+            sinks: HashMap::new(),
+            trans_events: HashMap::new(),
             reserved_index_events: vec![],
             reserved_index_sinks: vec![],
             assigned_reserved_index_events: vec![],
@@ -1079,8 +1132,7 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
             masked_inputs: vec![None; n_inputs as usize],
             round: Round::Idle,
             t,
-            mpc_nodes: Some(initial_mpc_nodes),
-            clients: HashMap::new(),
+            mpc_nodes: initial_mpc_nodes,
             output_shares: HashMap::new(),
             output_sinks: HashMap::new(),
             output_clients,
@@ -1088,21 +1140,12 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         })
     }
 
-    pub fn add_client(&mut self, cert: Vec<u8>, thread: JoinHandle<()>, stop_tx: ServerHandle) {
-        let info = ClientInfo {
-            cert: cert.clone(),
-            thread,
-            stop_tx,
-        };
-        self.clients.insert(cert, info);
-    }
-
     async fn subscribe_oneshot(
         &mut self,
         pending: PendingSubscriptionSink,
         round: Round,
     ) -> SubscriptionResult {
-        if !self.trans_events.contains_key(&round) {
+        if round_before(round).is_none() {
             pending
                 .reject(ErrorObjectOwned::owned(
                     ErrorCode::InvalidParams.code(),
@@ -1115,21 +1158,13 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
 
         let sink = pending.accept().await?;
 
-        {
-            let events = &self.trans_events[&round];
-
-            if let Some(event) = events.last() {
-                let json = to_json_raw_value(event).expect("failed convert to JSON");
-                sink.send(json).await?;
-
-                return Ok(());
-            }
+        if let Some(event) = self.trans_events.get(&round) {
+            let json = to_json_raw_value(event).expect("failed convert to JSON");
+            sink.send(json).await?;
+            return Ok(());
         }
 
-        self.sinks
-            .get_mut(&round)
-            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round))
-            .push(sink);
+        self.sinks.entry(round).or_default().push(sink);
         Ok(())
     }
 
@@ -1202,19 +1237,11 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
             return Err(CoordinatorError::CannotTransitionToIdle);
         }
 
-        let sinks = self
-            .sinks
-            .get_mut(&round)
-            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round));
-
-        let sinks = std::mem::take(sinks);
+        let sinks = self.sinks.remove(&round).unwrap_or_default();
 
         // Record the round even if one of the existing subscribers has disconnected.
         // Late subscribers will replay this event from history.
-        self.trans_events
-            .get_mut(&round)
-            .unwrap_or_else(|| panic!("BUG: {:?} must be present!", round))
-            .push(event.clone());
+        self.trans_events.insert(round, event.clone());
 
         self.round = round;
 
@@ -1235,19 +1262,62 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
 
         Ok(())
     }
+
+    fn ready_output_snapshot(
+        &mut self,
+        client_id: &ClientIdentity,
+        min_shares: usize,
+    ) -> Option<(Arc<SubscriptionSink>, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let waiter = self.output_sinks.get(client_id)?.clone();
+        if waiter.is_closed() {
+            self.output_sinks.remove(client_id);
+            return None;
+        }
+
+        let output_shares = self
+            .output_shares
+            .iter()
+            .filter(|((candidate, _), _)| candidate == client_id)
+            .map(|(_, shares)| shares.clone())
+            .collect::<Vec<_>>();
+        if output_shares.len() < min_shares {
+            return None;
+        }
+
+        Some((waiter, output_shares))
+    }
 }
 
-/// The basic shared state can be used as a full-fledged shared state.
-impl<T: CanonicalSerialize + CanonicalDeserialize + Clone>
-    stoffel_mpc_coordinator_shared::rpc::RPCServerShared for CoordinatorRPCServerSharedBase<T>
-{
-    fn add_client(
-        &mut self,
-        cert_der: Vec<u8>,
-        client_handle: JoinHandle<()>,
-        stop_tx: ServerHandle,
-    ) {
-        self.add_client(cert_der, client_handle, stop_tx);
+async fn deliver_ready_output_waiters<T: CanonicalSerialize + CanonicalDeserialize + Clone>(
+    shared: &Arc<Mutex<CoordinatorRPCServerSharedBase<T>>>,
+    execution_id: ExecutionId,
+    client_id: &ClientIdentity,
+    min_shares: usize,
+) {
+    let Some((waiter, output_shares)) = ({
+        let mut shared = shared.lock().await;
+        if shared.execution_id != execution_id {
+            return;
+        }
+        shared
+            .execution
+            .ready_output_snapshot(client_id, min_shares)
+    }) else {
+        return;
+    };
+
+    let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
+    if waiter.send(json).await.is_err() {
+        let mut shared = shared.lock().await;
+        if shared.execution_id == execution_id
+            && shared
+                .execution
+                .output_sinks
+                .get(client_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &waiter))
+        {
+            shared.execution.output_sinks.remove(client_id);
+        }
     }
 }
 
@@ -1259,82 +1329,52 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
     async fn sub_round(
         &self,
         pending: PendingSubscriptionSink,
+        execution_id: ExecutionId,
         round: Round,
     ) -> SubscriptionResult {
-        let mut d = self.d.lock().await;
-
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            pending.reject(execution_not_found(execution_id)).await;
+            return Ok(());
+        };
         d.subscribe_oneshot(pending, round).await
     }
 
-    async fn available_input_masks(&self) -> RpcResult<u64> {
-        let d = self.d.lock().await;
-
+    async fn available_input_masks(&self, execution_id: ExecutionId) -> RpcResult<u64> {
+        let d = self.execution_state(execution_id).await?;
         Ok(d.masked_inputs.len() as u64 - d.n_reserved)
     }
 
     async fn sub_assigned_reserved_indices(
         &self,
         pending: PendingSubscriptionSink,
+        execution_id: ExecutionId,
     ) -> SubscriptionResult {
-        let mut d = self.d.lock().await;
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            pending.reject(execution_not_found(execution_id)).await;
+            return Ok(());
+        };
         d.subscribe_assigned_reserved_indices(pending).await
     }
 
     async fn sub_assigned_masked_inputs(
         &self,
         pending: PendingSubscriptionSink,
+        execution_id: ExecutionId,
     ) -> SubscriptionResult {
-        let mut d = self.d.lock().await;
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            pending.reject(execution_not_found(execution_id)).await;
+            return Ok(());
+        };
         d.subscribe_assigned_masked_inputs(pending).await
-    }
-
-    async fn reset(&self) -> RpcResult<()> {
-        let mut d = self.d.lock().await;
-
-        let designated_party = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0].clone();
-        if self.id != designated_party {
-            return Err(ErrorObjectOwned::owned(
-                ErrorCode::ServerError(NotDesignatedParty as i32).code(),
-                format!(
-                    "Only designated party {:?} can reset the coordinator.",
-                    designated_party
-                ),
-                None::<()>,
-            ));
-        }
-
-        let n_inputs = d.masked_inputs.len();
-
-        d.round = Round::Idle;
-        d.masked_inputs = vec![None; n_inputs as usize];
-        d.n_reserved = 0;
-        d.reserved_indices = vec![None; n_inputs as usize];
-        d.reserved_index_events.clear();
-        d.reserved_index_sinks.clear();
-        d.assigned_reserved_index_events.clear();
-        d.assigned_reserved_index_sinks.clear();
-        d.masked_input_events.clear();
-        d.masked_input_sinks.clear();
-        d.assigned_masked_input_events.clear();
-        d.assigned_masked_input_sinks.clear();
-        d.output_shares.clear();
-        d.output_sinks.clear();
-        for sinks in d.sinks.values_mut() {
-            sinks.clear();
-        }
-        for events in d.trans_events.values_mut() {
-            events.clear();
-        }
-
-        Ok(())
     }
 
     async fn submit_masked_input(
         &self,
+        execution_id: ExecutionId,
         masked_input: ValueWrapper<S::ValueType>,
         raw_reserved_index: u64,
     ) -> RpcResult<()> {
-        let mut d = self.d.lock().await;
+        let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputCollection {
             return Err(ErrorObjectOwned::owned(
@@ -1440,20 +1480,32 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         Ok(())
     }
 
-    async fn sub_reserved_indices(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
-        let mut d = self.d.lock().await;
-
+    async fn sub_reserved_indices(
+        &self,
+        pending: PendingSubscriptionSink,
+        execution_id: ExecutionId,
+    ) -> SubscriptionResult {
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            pending.reject(execution_not_found(execution_id)).await;
+            return Ok(());
+        };
         d.subscribe_reserved_indices(pending).await
     }
 
-    async fn sub_masked_inputs(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
-        let mut d = self.d.lock().await;
-
+    async fn sub_masked_inputs(
+        &self,
+        pending: PendingSubscriptionSink,
+        execution_id: ExecutionId,
+    ) -> SubscriptionResult {
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            pending.reject(execution_not_found(execution_id)).await;
+            return Ok(());
+        };
         d.subscribe_masked_inputs(pending).await
     }
 
-    async fn reserve_mask_index(&self, i: u64) -> RpcResult<()> {
-        let mut d = self.d.lock().await;
+    async fn reserve_mask_index(&self, execution_id: ExecutionId, i: u64) -> RpcResult<()> {
+        let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputMaskReservation {
             return Err(ErrorObjectOwned::owned(
@@ -1551,16 +1603,30 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         Ok(())
     }
 
-    async fn transition(&self, next_round: Round) -> RpcResult<()> {
-        let mut d = self.d.lock().await;
+    async fn transition(&self, execution_id: ExecutionId, next_round: Round) -> RpcResult<()> {
+        let mut d = self.execution_state(execution_id).await?;
 
-        let designated_party = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!")[0].clone();
+        let designated_party = d.mpc_nodes[0].clone();
         if self.id != designated_party {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(NotDesignatedParty as i32).code(),
                 format!(
                     "Only designated party {:?} can do transitions.",
                     designated_party
+                ),
+                None::<()>,
+            ));
+        }
+
+        let skips_empty_input_rounds = d.masked_inputs.is_empty()
+            && d.round == Round::Preprocessing
+            && next_round == Round::MPCExecution;
+        if round_before(next_round) != Some(d.round) && !skips_empty_input_rounds {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(WrongRound as i32).code(),
+                format!(
+                    "Cannot transition execution {execution_id} from {:?} to {:?}",
+                    d.round, next_round
                 ),
                 None::<()>,
             ));
@@ -1616,16 +1682,23 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
 
     async fn send_output_shares(
         &self,
+        execution_id: ExecutionId,
         client_id: ClientIdentity,
         enc_shares: (Vec<u8>, Vec<u8>),
     ) -> RpcResult<()> {
-        let mut d = self.d.lock().await;
+        let mut d = self.execution_state(execution_id).await?;
 
-        let mpc_nodes = d.mpc_nodes.clone().expect("BUG: mpc nodes must be set!");
-        if !mpc_nodes.contains(&self.id) {
+        if !d.mpc_nodes.contains(&self.id) {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(NotParty as i32).code(),
                 "Only parties can send output shares.",
+                None::<()>,
+            ));
+        }
+        if !d.output_clients.contains(&client_id) {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(NotOutputClient as i32).code(),
+                "Output client is not authorized for this execution.",
                 None::<()>,
             ));
         }
@@ -1648,26 +1721,21 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         d.output_shares
             .insert((client_id.clone(), self.id.clone()), enc_shares);
 
-        let output_shares: Vec<_> = d
-            .output_shares
-            .iter()
-            .filter(|((cid, _), _)| *cid == client_id)
-            .map(|(_, shares)| shares.clone())
-            .collect();
-
-        if output_shares.len() >= S::min_shares(d.t as usize) {
-            if let Some(sink) = d.output_sinks.get(&client_id) {
-                let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
-                if sink.send(json.clone()).await.is_err() {
-                    eprintln!("coordinator output subscriber disconnected");
-                }
-            }
-        }
+        let min_shares = S::min_shares(d.t as usize);
+        drop(d);
+        deliver_ready_output_waiters(&self.d, execution_id, &client_id, min_shares).await;
         Ok(())
     }
 
-    async fn obtain_output_shares(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
-        let mut d = self.d.lock().await;
+    async fn obtain_output_shares(
+        &self,
+        pending: PendingSubscriptionSink,
+        execution_id: ExecutionId,
+    ) -> SubscriptionResult {
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            pending.reject(execution_not_found(execution_id)).await;
+            return Ok(());
+        };
 
         if !d.output_clients.contains(&self.id) {
             pending
@@ -1680,14 +1748,14 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
             return Ok(());
         }
 
-        if d.output_sinks.contains_key(&self.id) {
+        if d.output_sinks
+            .get(&self.id)
+            .is_some_and(|sink| !sink.is_closed())
+        {
             pending
                 .reject(ErrorObjectOwned::owned(
                     ErrorCode::ServerError(OutputSharesAlreadyRequested as i32).code(),
-                    format!(
-                        "Client {:?} already has requested their output shares.",
-                        self.id
-                    ),
+                    "Output shares already requested.",
                     None::<()>,
                 ))
                 .await;
@@ -1695,21 +1763,10 @@ impl<F: FftField, S: ShareBound<F>> CoordinatorRPCBaseServer<F, S>
         }
 
         let sink = pending.accept().await?;
-        d.output_sinks.insert(self.id.clone(), sink);
-
-        let output_shares: Vec<_> = d
-            .output_shares
-            .iter()
-            .filter(|((client_id, _), _)| *client_id == self.id)
-            .map(|(_, shares)| shares.clone())
-            .collect();
-
-        if output_shares.len() >= S::min_shares(d.t as usize) {
-            let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
-            let sink = d.output_sinks.get(&self.id).unwrap();
-
-            sink.send(json.clone()).await?;
-        }
+        d.output_sinks.insert(self.id.clone(), Arc::new(sink));
+        let min_shares = S::min_shares(d.t as usize);
+        drop(d);
+        deliver_ready_output_waiters(&self.d, execution_id, &self.id, min_shares).await;
 
         Ok(())
     }
@@ -1733,19 +1790,14 @@ impl<F: FftField, S: ShareBound<F>> stoffel_mpc_coordinator_shared::rpc::RPCServ
 
 /// The exterior wrapper of the server-side coordinator.
 pub struct OffChainCoordinatorServer<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> {
-    #[allow(dead_code)]
-    rpc_server: Arc<Mutex<C::Internal>>,
     addr: String,
-    #[allow(dead_code)]
-    port: u16,
-    #[allow(dead_code)]
-    server_handle: JoinHandle<()>,
-    #[allow(dead_code)]
-    t: u64,
+    server_handle: RPCServerHandle,
+    _connection: std::marker::PhantomData<C>,
 }
 
 pub struct OffChainCoordinatorClient<F: FftField, S: ShareBound<F>> {
     rpc_coord: Client,
+    execution_id: ExecutionId,
     t: u64,
     n_parties: u64,
     n_outputs: u64,
@@ -1776,7 +1828,7 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         shared: C::Internal,
         addr: &str,
         port: u16,
-        t: u64,
+        _t: u64,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
@@ -1790,60 +1842,31 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         )
         .await?;
         Ok(Self {
-            rpc_server: rpc_server_data,
             addr: String::from(addr),
-            port,
             server_handle,
-            t,
+            _connection: std::marker::PhantomData,
         })
     }
 
     pub fn get_addr(&self) -> String {
         self.addr.clone()
     }
+
+    /// Stops the listener. Dropping the server state closes its connections.
+    pub async fn shutdown(self) {
+        self.server_handle.shutdown().await;
+    }
 }
 
 impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
-    pub async fn start_rpc_client_from_cert(
-        addr: &str,
-        port: u16,
-        t: u64,
-        n_parties: u64,
-        n_outputs: u64,
-        client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-    ) -> Result<Self, CoordinatorError> {
-        Self::start_rpc_client_with_parties(
-            addr,
-            port,
-            t,
-            n_parties,
-            n_outputs,
-            client_cert.cert.der().to_vec(),
-            client_cert.signing_key.serialize_der(),
-        )
-        .await
-    }
-
-    pub async fn start_rpc_client(
-        addr: &str,
-        port: u16,
-        t: u64,
-        n_parties: u64,
-        n_outputs: u64,
-        cert_der: Vec<u8>,
-        key_der: Vec<u8>,
-    ) -> Result<Self, CoordinatorError> {
-        Self::start_rpc_client_with_parties(addr, port, t, n_parties, n_outputs, cert_der, key_der)
-            .await
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_rpc_client_with_parties(
+    pub async fn start_rpc_client_for_execution(
         addr: &str,
         port: u16,
         t: u64,
         n_parties: u64,
         n_outputs: u64,
+        execution_id: ExecutionId,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, CoordinatorError> {
@@ -1857,6 +1880,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
 
         Ok(Self {
             rpc_coord,
+            execution_id,
             t,
             n_parties,
             n_outputs,
@@ -1866,7 +1890,7 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     }
 
     pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::<F, S>::transition(self.rpc(), round)
+        CoordinatorRPCBaseClient::<F, S>::transition(self.rpc(), self.execution_id, round)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
@@ -1880,42 +1904,43 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
 
 static ENC_INFO: &[u8] = b"StoffelOutputShareEncryption";
 
+fn execution_enc_info(execution_id: ExecutionId) -> Vec<u8> {
+    let mut info = Vec::with_capacity(ENC_INFO.len() + execution_id.as_bytes().len());
+    info.extend_from_slice(ENC_INFO);
+    info.extend_from_slice(execution_id.as_bytes());
+    info
+}
+
 impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorClient<F, S> {
     type ClientIdentity = ClientIdentity;
 
     async fn start_preprocessing(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::start_preprocessing(self.rpc())
+        StoffelCoordinatorRPCClient::start_preprocessing(self.rpc(), self.execution_id)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn reserve_input_masks(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::reserve_input_masks(self.rpc())
+        StoffelCoordinatorRPCClient::reserve_input_masks(self.rpc(), self.execution_id)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn collect_inputs(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::collect_inputs(self.rpc())
+        StoffelCoordinatorRPCClient::collect_inputs(self.rpc(), self.execution_id)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn start_mpc(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::start_mpc(self.rpc())
+        StoffelCoordinatorRPCClient::start_mpc(self.rpc(), self.execution_id)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn send_output(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::send_output(self.rpc())
+        StoffelCoordinatorRPCClient::send_output(self.rpc(), self.execution_id)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
     async fn finalize(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::finalize(self.rpc())
-            .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
-    }
-
-    async fn reset_coord(&self) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::<F, S>::reset(self.rpc())
+        StoffelCoordinatorRPCClient::finalize(self.rpc(), self.execution_id)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
@@ -1925,9 +1950,10 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         n_inputs: u64,
     ) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
         // Wait for reserved index events.
-        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_reserved_indices(self.rpc())
-            .await
-            .unwrap();
+        let mut sub =
+            CoordinatorRPCBaseClient::<F, S>::sub_reserved_indices(self.rpc(), self.execution_id)
+                .await
+                .unwrap();
 
         let mut map: HashMap<ClientIdentity, Vec<u64>> = HashMap::new();
 
@@ -1955,9 +1981,10 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         mask_shares: Vec<S>,
     ) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
         // Wait for masked input events.
-        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_masked_inputs(self.rpc())
-            .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        let mut sub =
+            CoordinatorRPCBaseClient::<F, S>::sub_masked_inputs(self.rpc(), self.execution_id)
+                .await
+                .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         let mut map: HashMap<ClientIdentity, Vec<(u64, S)>> = HashMap::new();
 
@@ -1996,9 +2023,10 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
     }
 
     async fn wait_for_round(&self, round: Round) -> Result<(), CoordinatorError> {
-        let mut sub = CoordinatorRPCBaseClient::<F, S>::sub_round(self.rpc(), round)
-            .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        let mut sub =
+            CoordinatorRPCBaseClient::<F, S>::sub_round(self.rpc(), self.execution_id, round)
+                .await
+                .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         if let Some(Ok(_)) = sub.next().await {
             Ok(())
@@ -2016,6 +2044,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
     ) -> Result<(), CoordinatorError> {
         match CoordinatorRPCBaseClient::<F, S>::submit_masked_input(
             self.rpc(),
+            self.execution_id,
             ValueWrapper {
                 value: masked_input,
             },
@@ -2029,14 +2058,18 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
     }
 
     async fn reserve_mask_index(&mut self, i: u64) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::<F, S>::reserve_mask_index(self.rpc(), i)
+        CoordinatorRPCBaseClient::<F, S>::reserve_mask_index(self.rpc(), self.execution_id, i)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn obtain_outputs(&self) -> Result<Vec<S::ValueType>, CoordinatorError> {
         // Wait for output shares.
-        let mut sub = match CoordinatorRPCBaseClient::<F, S>::obtain_output_shares(self.rpc()).await
+        let mut sub = match CoordinatorRPCBaseClient::<F, S>::obtain_output_shares(
+            self.rpc(),
+            self.execution_id,
+        )
+        .await
         {
             Ok(sub) => sub,
             Err(e) => {
@@ -2054,6 +2087,8 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
             <KemImpl as Kem>::PrivateKey::from_bytes(&raw_sk)
                 .map_err(|_| CoordinatorError::ParsingPrivateKeyFailed)?
         };
+
+        let enc_info = execution_enc_info(self.execution_id);
 
         // Try to decrypt and reconstruct outputs until it succeeds.
         while let Some(Ok(enc_output_shares)) = sub.next().await {
@@ -2074,7 +2109,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                     &OpModeR::Base,
                     &client_sk,
                     &encapped_key,
-                    ENC_INFO,
+                    &enc_info,
                     c,
                     b"",
                 )
@@ -2141,10 +2176,11 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
         // Encrypt the shares.
         let mut rng = StdRng::from_os_rng();
+        let enc_info = execution_enc_info(self.execution_id);
         let (encapsulated_key, ciphertext) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
             &OpModeS::Base,
             &client_pk,
-            ENC_INFO,
+            &enc_info,
             &output_shares_bytes,
             b"",
             &mut rng,
@@ -2153,8 +2189,13 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
 
         // Send the encrypted shares.
-        if let Err(e) =
-            CoordinatorRPCBaseClient::<F, S>::send_output_shares(self.rpc(), client_id, c).await
+        if let Err(e) = CoordinatorRPCBaseClient::<F, S>::send_output_shares(
+            self.rpc(),
+            self.execution_id,
+            client_id,
+            c,
+        )
+        .await
         {
             return Err(CoordinatorError::JSONError(e.to_string()));
         }
