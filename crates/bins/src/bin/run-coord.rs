@@ -47,7 +47,7 @@ struct Args {
     #[arg(long)]
     n_inputs: Option<u64>,
 
-    #[arg(long, required=true, value_delimiter=',', num_args=1..)]
+    #[arg(long, value_delimiter=',', num_args=0..)]
     output_clients: Vec<String>,
 
     #[arg(long)]
@@ -152,6 +152,11 @@ async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
 
 #[tokio::main]
 async fn main() {
+    println!(
+        "Executing: {}",
+        std::env::args().collect::<Vec<_>>().join(" ")
+    );
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install default crypto provider");
@@ -204,7 +209,8 @@ async fn main() {
             .collect()
     };
 
-    let server_cert_der = fs::read(args.server_cert).unwrap();
+    let server_cert_der = fs::read(&args.server_cert)
+        .unwrap_or_else(|_| panic!("could not read certificate file {}", args.server_cert));
     let server_key_der = fs::read(args.server_key).unwrap();
 
     let addr = args.addr.as_str();
