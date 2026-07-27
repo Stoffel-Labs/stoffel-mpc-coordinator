@@ -285,10 +285,12 @@ async fn dropping_node_server_closes_connections_and_releases_port() {
     .await;
 
     drop(server);
-    let disconnected =
-        tokio::time::timeout(std::time::Duration::from_secs(1), client.receive_mask())
-            .await
-            .expect("node RPC did not finish after server drop");
+    let disconnected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.receive_assigned_masks(0, 1),
+    )
+    .await
+    .expect("node RPC did not finish after server drop");
     assert!(disconnected.is_err());
 
     let replacement = start_node_server(execution_id, addr, port, server_cert()).await;
@@ -615,7 +617,11 @@ async fn end_to_end() {
                 .expect("obtaining mask indices failed");
             println!("CLIENT: obtained index 0");
 
-            let mask = rpc_client.receive_mask().await.unwrap();
+            let mask = rpc_client
+                .receive_assigned_masks(0, 1)
+                .await
+                .unwrap()
+                .remove(0);
             assert_eq!(mask, correct_mask);
 
             coord.wait_for_round(Round::InputCollection).await.unwrap();
@@ -833,7 +839,11 @@ async fn end_to_end_fake_coord() {
                 .expect("obtaining mask indices failed");
             println!("CLIENT: obtained index 0");
 
-            let mask = rpc_client.receive_mask().await.unwrap();
+            let mask = rpc_client
+                .receive_assigned_masks(0, 1)
+                .await
+                .unwrap()
+                .remove(0);
             assert_eq!(mask, correct_mask);
 
             coord.wait_for_round(Round::InputCollection).await.unwrap();
