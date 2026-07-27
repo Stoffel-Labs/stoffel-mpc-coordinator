@@ -371,11 +371,11 @@ pub mod node_rpc {
                     {
                         let json = to_json_raw_value(&assigned_shares)
                             .map_err(|_| NodeRPCError::SerializationError)?;
-                        request
-                            .sink
-                            .send(json)
-                            .await
-                            .map_err(|_| NodeRPCError::JSONError)?;
+                        if request.sink.send(json).await.is_err() {
+                            eprintln!(
+                                "node RPC client disconnected after obtaining enough mask shares"
+                            );
+                        }
                     } else {
                         d.assigned_sinks.insert(id.clone(), request);
                     }
@@ -428,11 +428,11 @@ pub mod node_rpc {
                     {
                         let json = to_json_raw_value(&assigned_shares)
                             .map_err(|_| NodeRPCError::SerializationError)?;
-                        request
-                            .sink
-                            .send(json)
-                            .await
-                            .map_err(|_| NodeRPCError::JSONError)?;
+                        if request.sink.send(json).await.is_err() {
+                            eprintln!(
+                                "node RPC client disconnected after obtaining enough mask shares"
+                            );
+                        }
                     } else {
                         d.assigned_sinks.insert(id.clone(), request);
                     }
