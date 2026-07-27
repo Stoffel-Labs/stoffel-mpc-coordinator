@@ -1,16 +1,12 @@
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
 use std::fs;
-use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
-    AvssCoordinatorConnection, HoneyBadgerCoordinatorConnection,
-};
+use stoffel_mpc_coordinator_off_chain::tests::fake_coord::HoneyBadgerCoordinatorConnection;
 use stoffel_mpc_coordinator_off_chain::{
-    ClientIdentity, CoordinatorRPCServerSharedBase, InputAssignment, InputSlotAssignment,
-    OffChainCoordinatorServer,
+    ClientIdentity, CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment,
+    InputSlotAssignment, OffChainCoordinatorServer,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
-use stoffel_mpc_coordinator_shared::tests::fake_coord::{AvssValueType, HoneyBadgerValueType};
 use stoffel_mpc_coordinator_shared::{CoordinatorError, ExecutionId};
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
@@ -26,12 +22,13 @@ enum Backend {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long)]
-    hash: String,
+    /// Program content hash for an optional initially registered one-shot execution.
+    #[arg(long, requires = "execution_id")]
+    hash: Option<String>,
 
-    /// Identity of the program invocation initially registered with the coordinator.
+    /// Optional invocation to register before listening. Omit for a standing coordinator.
     #[arg(long, value_parser = parse_nonzero_execution_id)]
-    execution_id: ExecutionId,
+    execution_id: Option<ExecutionId>,
 
     #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     initial_mpc_nodes: Vec<String>,
@@ -51,7 +48,7 @@ struct Args {
     #[arg(long)]
     n_inputs: Option<u64>,
 
-    #[arg(long, required=true, value_delimiter=',', num_args=1..)]
+    #[arg(long, value_delimiter=',', num_args=0..)]
     output_clients: Vec<String>,
 
     #[arg(long)]
@@ -142,15 +139,15 @@ fn build_input_assignment(
     Ok((InputAssignment { input_slots }, output_clients))
 }
 
-async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
-    server_state: CoordinatorRPCServerSharedBase<T>,
+async fn run_coord<C>(
+    server_state: CoordinatorRPCServerSharedBase,
     addr: &str,
     port: u16,
     t: u64,
     server_cert_der: Vec<u8>,
     server_key_der: Vec<u8>,
 ) where
-    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase<T>>,
+    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
 {
     let _coord = OffChainCoordinatorServer::<C>::start_coord(
         server_state,
@@ -177,11 +174,6 @@ async fn main() {
 
     let n = args.n;
     let t = args.t;
-    let hash: [u8; 32] = {
-        let h = hex::decode(args.hash).expect("invalid hash");
-        h.try_into().expect("hash should be 32 bytes")
-    };
-
     let parse_public_keys = |cert_files: &[String]| -> Vec<Vec<u8>> {
         cert_files
             .iter()
@@ -239,89 +231,83 @@ async fn main() {
 
     let addr = args.addr.as_str();
     let port = args.port;
-    let (mpc_backend, server_state) = if let Some(program_path) = args.program {
-        let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
-            .expect("failed to load Stoffel bytecode");
-        let mpc_backend = binary.client_io_manifest.mpc_backend;
-        let client_bindings = if args.client_bindings.is_empty() {
-            let mut schemas = binary.client_io_manifest.clients.clone();
-            schemas.sort_by_key(|schema| schema.client_slot);
-            assert_eq!(
+    let mut server_state =
+        CoordinatorRPCServerSharedBase::new(n, t, public_keys).expect("invalid coordinator roster");
+    if let Some(execution_id) = args.execution_id {
+        let hash: [u8; 32] = {
+            let h = hex::decode(
+                args.hash
+                    .as_deref()
+                    .expect("--hash is required with --execution-id"),
+            )
+            .expect("invalid hash");
+            h.try_into().expect("hash should be 32 bytes")
+        };
+        let (mpc_backend, input_assignment, output_clients, n_inputs) =
+            if let Some(program_path) = args.program {
+                let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
+                    .expect("failed to load Stoffel bytecode");
+                let mpc_backend = binary.client_io_manifest.mpc_backend;
+                let client_bindings = if args.client_bindings.is_empty() {
+                    let mut schemas = binary.client_io_manifest.clients.clone();
+                    schemas.sort_by_key(|schema| schema.client_slot);
+                    assert_eq!(
                 schemas.len(),
                 output_client_keys.len(),
                 "without --client-bindings, --output-clients must match manifest client count"
             );
-            schemas
-                .into_iter()
-                .zip(output_client_keys)
-                .map(|(schema, key)| (schema.client_slot, key))
-                .collect()
-        } else {
-            binding_keys(&args.client_bindings)
+                    schemas
+                        .into_iter()
+                        .zip(output_client_keys)
+                        .map(|(schema, key)| (schema.client_slot, key))
+                        .collect()
+                } else {
+                    binding_keys(&args.client_bindings)
+                };
+                let (input_assignment, output_clients) =
+                    build_input_assignment(binary.client_io_manifest, client_bindings)
+                        .expect("failed to bind client IO manifest");
+                let n_inputs = input_assignment.input_slots.len() as u64;
+                (mpc_backend, input_assignment, output_clients, n_inputs)
+            } else {
+                let n_inputs = args
+                    .n_inputs
+                    .expect("--n-inputs is required when --program is not provided");
+                let mpc_backend = match args.backend {
+                    Backend::HoneyBadger => MpcBackend::HoneyBadger,
+                    Backend::Avss => MpcBackend::Avss,
+                };
+                (
+                    mpc_backend,
+                    InputAssignment::default(),
+                    output_client_keys,
+                    n_inputs,
+                )
+            };
+        let min_output_shares = match mpc_backend {
+            MpcBackend::HoneyBadger => 2 * t + 1,
+            MpcBackend::Avss => t + 1,
         };
-        let (input_assignment, output_clients) =
-            build_input_assignment(binary.client_io_manifest, client_bindings)
-                .expect("failed to bind client IO manifest");
-        let n_inputs = input_assignment.input_slots.len() as u64;
-        let server_state = CoordinatorRPCServerSharedBase::new_for_execution(
-            args.execution_id,
-            hash,
-            n,
-            t,
-            public_keys,
-            n_inputs,
-            output_clients,
-            input_assignment,
-        )
-        .expect("failed to configure bound client IO");
-        (mpc_backend, server_state)
-    } else {
-        let n_inputs = args
-            .n_inputs
-            .expect("--n-inputs is required when --program is not provided");
-        let mpc_backend = match args.backend {
-            Backend::HoneyBadger => MpcBackend::HoneyBadger,
-            Backend::Avss => MpcBackend::Avss,
-        };
-        (
-            mpc_backend,
-            CoordinatorRPCServerSharedBase::new_for_execution(
-                args.execution_id,
-                hash,
-                n,
-                t,
-                public_keys,
+        server_state
+            .register_execution(ExecutionRegistration {
+                execution_id,
+                program_hash: hash,
                 n_inputs,
-                output_client_keys,
-                InputAssignment::default(),
-            )
-            .expect("failed to configure coordinator"),
-        )
+                output_clients,
+                input_assignment,
+                min_output_shares,
+            })
+            .expect("failed to configure initial execution");
     };
-    match mpc_backend {
-        MpcBackend::HoneyBadger => {
-            run_coord::<HoneyBadgerValueType, HoneyBadgerCoordinatorConnection>(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert_der,
-                server_key_der,
-            )
-            .await;
-        }
-        MpcBackend::Avss => {
-            run_coord::<AvssValueType, AvssCoordinatorConnection>(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert_der,
-                server_key_der,
-            )
-            .await;
-        }
-    }
+    run_coord::<HoneyBadgerCoordinatorConnection>(
+        server_state,
+        addr,
+        port,
+        t,
+        server_cert_der,
+        server_key_der,
+    )
+    .await;
 }
 
 #[cfg(test)]

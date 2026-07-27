@@ -5,7 +5,9 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     HoneyBadgerCoordinatorRPCServerSharedBase, HoneyBadgerNodeRPCClient, HoneyBadgerNodeRPCServer,
     HoneyBadgerOffChainCoordinatorClient, HoneyBadgerOffChainCoordinatorServer,
 };
-use stoffel_mpc_coordinator_off_chain::{CoordinatorRPCBaseClient, InputAssignment};
+use stoffel_mpc_coordinator_off_chain::{
+    CoordinatorRPCBaseClient, ExecutionRegistration, InputAssignment,
+};
 use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{
     HoneyBadgerShareType, HoneyBadgerShareValueType,
@@ -42,7 +44,7 @@ fn coordinator_state(
 ) -> HoneyBadgerCoordinatorRPCServerSharedBase {
     HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
         execution_id,
-        [0; 32],
+        [1; 32],
         n,
         t,
         nodes,
@@ -114,7 +116,7 @@ fn rejects_invalid_mpc_rosters() {
     let build = |execution_id, n, t, nodes| {
         HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
             execution_id,
-            [0; 32],
+            [1; 32],
             n,
             t,
             nodes,
@@ -130,6 +132,67 @@ fn rejects_invalid_mpc_rosters() {
     assert!(build(valid_execution, 2, 1, vec![vec![1], vec![1]]).is_err());
     assert!(build(valid_execution, 1, 1, vec![vec![1]]).is_err());
     assert!(build(ExecutionId::from_bytes([0; 32]), 1, 0, vec![vec![1]]).is_err());
+}
+
+#[tokio::test]
+async fn one_listener_isolates_and_retires_concurrent_executions() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let node_cert = client_cert();
+    let node_id = node_cert.signing_key.public_key_raw().to_vec();
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let first_id = execution(0x31);
+    let second_id = execution(0x32);
+    let state = HoneyBadgerCoordinatorRPCServerSharedBase::new(1, 0, vec![node_id]).unwrap();
+    let _server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        state,
+        addr,
+        port,
+        0,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+    let first = start_coord_client(first_id, addr, port, 0, 1, 0, node_cert.clone()).await;
+    let second = start_coord_client(second_id, addr, port, 0, 1, 0, node_cert).await;
+    for (client, execution_id, program_hash) in [
+        (&first, first_id, [0x41; 32]),
+        (&second, second_id, [0x42; 32]),
+    ] {
+        client
+            .register_execution(ExecutionRegistration {
+                execution_id,
+                program_hash,
+                n_inputs: 0,
+                output_clients: vec![],
+                input_assignment: InputAssignment::default(),
+                min_output_shares: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    first.start_preprocessing().await.unwrap();
+    first.wait_for_round(Round::Preprocessing).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            second.wait_for_round(Round::Preprocessing),
+        )
+        .await
+        .is_err(),
+        "a transition for one execution must not wake another"
+    );
+    second.start_preprocessing().await.unwrap();
+    second.wait_for_round(Round::Preprocessing).await.unwrap();
+
+    first.start_mpc().await.unwrap();
+    first.send_output().await.unwrap();
+    first.finalize().await.unwrap();
+    first.retire_execution().await.unwrap();
+    assert!(first.wait_for_round(Round::ProgramFinished).await.is_err());
+    second.wait_for_round(Round::Preprocessing).await.unwrap();
 }
 
 #[tokio::test]
@@ -843,38 +906,31 @@ async fn output_waiters_receive_threshold_and_later_share_snapshots() {
     .await
     .unwrap();
 
-    assert!(
-        CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::obtain_output_shares(
-            &output_rpc,
-            ExecutionId::from_bytes([0x66; 32]),
-        )
-        .await
-        .is_err()
-    );
-
-    let mut waiter_a = CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::obtain_output_shares(
+    assert!(CoordinatorRPCBaseClient::obtain_output_shares(
         &output_rpc,
-        execution_id,
+        ExecutionId::from_bytes([0x66; 32]),
     )
     .await
-    .unwrap();
+    .is_err());
+
+    let mut waiter_a = CoordinatorRPCBaseClient::obtain_output_shares(&output_rpc, execution_id)
+        .await
+        .unwrap();
     let outputs = [
         (vec![1], vec![11]),
         (vec![2], vec![22]),
         (vec![3], vec![33]),
         (vec![4], vec![44]),
     ];
-    assert!(
-        CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
-            &node_rpcs[0],
-            execution_id,
-            vec![0xff],
-            outputs[0].clone(),
-        )
-        .await
-        .is_err()
-    );
-    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+    assert!(CoordinatorRPCBaseClient::send_output_shares(
+        &node_rpcs[0],
+        execution_id,
+        vec![0xff],
+        outputs[0].clone(),
+    )
+    .await
+    .is_err());
+    CoordinatorRPCBaseClient::send_output_shares(
         &node_rpcs[0],
         execution_id,
         output_id.clone(),
@@ -889,7 +945,7 @@ async fn output_waiters_receive_threshold_and_later_share_snapshots() {
         "one share must not satisfy a t=1 output threshold"
     );
 
-    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+    CoordinatorRPCBaseClient::send_output_shares(
         &node_rpcs[1],
         execution_id,
         output_id.clone(),
@@ -904,7 +960,7 @@ async fn output_waiters_receive_threshold_and_later_share_snapshots() {
         "two shares must not satisfy the robust t=1 output threshold"
     );
 
-    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+    CoordinatorRPCBaseClient::send_output_shares(
         &node_rpcs[2],
         execution_id,
         output_id.clone(),
@@ -920,7 +976,7 @@ async fn output_waiters_receive_threshold_and_later_share_snapshots() {
     assert_eq!(snapshot.len(), 3);
     assert!(outputs[..3].iter().all(|output| snapshot.contains(output)));
 
-    CoordinatorRPCBaseClient::<Fr, HoneyBadgerShareType>::send_output_shares(
+    CoordinatorRPCBaseClient::send_output_shares(
         &node_rpcs[3],
         execution_id,
         output_id,
