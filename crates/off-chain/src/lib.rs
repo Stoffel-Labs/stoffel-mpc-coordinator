@@ -630,16 +630,15 @@ pub mod node_rpc {
             let mut d = self.d.lock().await;
 
             // Each client may have multiple inputs, but only one mask-share request can be
-            // outstanding per node connection.
-            if d.sinks.contains_key(&self.id) {
-                pending
-                    .reject(ErrorObjectOwned::owned(
-                        ErrorCode::InvalidParams.code(),
-                        format!("Client {:?} already requested mask share", self.id),
-                        None::<()>,
-                    ))
-                    .await;
-                return Ok(());
+            // outstanding per node connection. A new subscription from the same client
+            // supersedes any previous one still pending: the client only ever moves on to
+            // the next input after it has consumed (or given up on) the last one, so a
+            // still-registered sink at this point is stale rather than a genuine conflict
+            // (e.g. the client returned early once threshold shares from other nodes arrived
+            // and abandoned this node's still-outstanding subscription without waiting for
+            // the unsubscribe to be processed here first).
+            if let Some(old_sink) = d.sinks.remove(&self.id) {
+                drop(old_sink);
             }
 
             let next_index = d
