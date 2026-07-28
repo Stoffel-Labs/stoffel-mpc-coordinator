@@ -545,7 +545,15 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             client_handle: JoinHandle<()>,
             stop_tx: ServerHandle,
-        ) {
+        ) -> bool {
+            if let Some(existing) = self.clients.get(&cert_der) {
+                if !existing.stop_tx.is_stopped() {
+                    eprintln!(
+                        "rejecting new connection: a live session already exists for this client certificate"
+                    );
+                    return false;
+                }
+            }
             self.clients.insert(
                 cert_der.clone(),
                 ClientInfo {
@@ -554,6 +562,7 @@ pub mod node_rpc {
                     stop_tx,
                 },
             );
+            true
         }
     }
 
@@ -1088,13 +1097,27 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone> CoordinatorRPCServerS
         })
     }
 
-    pub fn add_client(&mut self, cert: Vec<u8>, thread: JoinHandle<()>, stop_tx: ServerHandle) {
+    pub fn add_client(
+        &mut self,
+        cert: Vec<u8>,
+        thread: JoinHandle<()>,
+        stop_tx: ServerHandle,
+    ) -> bool {
+        if let Some(existing) = self.clients.get(&cert) {
+            if !existing.stop_tx.is_stopped() {
+                eprintln!(
+                    "rejecting new connection: a live session already exists for this client certificate"
+                );
+                return false;
+            }
+        }
         let info = ClientInfo {
             cert: cert.clone(),
             thread,
             stop_tx,
         };
         self.clients.insert(cert, info);
+        true
     }
 
     async fn subscribe_oneshot(
@@ -1246,8 +1269,8 @@ impl<T: CanonicalSerialize + CanonicalDeserialize + Clone>
         cert_der: Vec<u8>,
         client_handle: JoinHandle<()>,
         stop_tx: ServerHandle,
-    ) {
-        self.add_client(cert_der, client_handle, stop_tx);
+    ) -> bool {
+        self.add_client(cert_der, client_handle, stop_tx)
     }
 }
 

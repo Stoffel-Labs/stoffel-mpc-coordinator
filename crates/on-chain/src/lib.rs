@@ -433,7 +433,15 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             client_handle: JoinHandle<()>,
             stop_tx: ServerHandle,
-        ) {
+        ) -> bool {
+            if let Some(existing) = self.clients.get(&cert_der) {
+                if !existing.stop_tx.is_stopped() {
+                    eprintln!(
+                        "rejecting new connection: a live session already exists for this client certificate"
+                    );
+                    return false;
+                }
+            }
             self.clients.insert(
                 cert_der.clone(),
                 ClientInfo {
@@ -442,6 +450,7 @@ pub mod node_rpc {
                     stop_tx,
                 },
             );
+            true
         }
     }
 

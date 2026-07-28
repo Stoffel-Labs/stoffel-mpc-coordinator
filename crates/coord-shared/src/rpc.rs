@@ -55,12 +55,15 @@ pub struct ClientInfo {
 
 /// The internal state of a JSON-RPC server. This is shared state across all client connections.
 pub trait RPCServerShared {
+    /// Registers a newly-accepted connection for `cert_der`. Returns `false`, leaving any
+    /// existing entry for this identity untouched, if a still-live connection for the same
+    /// client certificate is already registered.
     fn add_client(
         &mut self,
         cert_der: Vec<u8>,
         client_handle: JoinHandle<()>,
         stop_tx: ServerHandle,
-    );
+    ) -> bool;
 }
 
 /// This represents the JSON-RPC server's state for one client connection. Internally, it refers to
@@ -168,11 +171,20 @@ pub async fn start_coord<T: RPCServerConnection>(
                     }
                 });
 
-                rpc_server_data
-                    .lock()
-                    .await
-                    .add_client(cert_der, client_handle, stop_tx);
+                let accepted = rpc_server_data.lock().await.add_client(
+                    cert_der,
+                    client_handle,
+                    stop_tx.clone(),
+                );
                 barrier.clone().wait().await;
+
+                if !accepted {
+                    tracing::warn!(
+                        "Rejecting duplicate connection: a live session for this client \
+                         certificate already exists; the existing session is unaffected"
+                    );
+                    let _ = stop_tx.stop();
+                }
             }
         }
     }))
