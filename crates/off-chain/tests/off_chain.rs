@@ -297,13 +297,14 @@ async fn end_to_end() {
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
             for (c, indices) in &client_to_indices {
-                for i in indices {
-                    println!("NODE: client {:?} reserved index {:?}", c, i);
-                    for node_rpc in node_rpcs.iter_mut() {
-                        // just received by one node here, but in reality would be received by
-                        // all nodes, so we simulate this here for more nodes
-                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
-                    }
+                println!("NODE: client {:?} reserved indices {:?}", c, indices);
+                for node_rpc in node_rpcs.iter_mut() {
+                    // just received by one node here, but in reality would be received by
+                    // all nodes, so we simulate this here for more nodes
+                    node_rpc
+                        .add_reserved_indices(c.to_vec(), indices.clone())
+                        .await
+                        .unwrap();
                 }
             }
 
@@ -386,12 +387,19 @@ async fn end_to_end() {
                 .unwrap();
 
             coord
-                .reserve_mask_index(0)
+                .reserve_mask_indices(&[0])
                 .await
                 .expect("obtaining mask indices failed");
             println!("CLIENT: obtained index 0");
 
-            let mask = rpc_client.receive_mask().await.unwrap();
+            let mask = rpc_client
+                .receive_assigned_masks()
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .1;
             assert_eq!(mask, correct_mask);
 
             coord.wait_for_round(Round::InputCollection).await.unwrap();
@@ -527,13 +535,14 @@ async fn end_to_end_fake_coord() {
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
             for (c, indices) in &client_to_indices {
-                for i in indices {
-                    println!("NODE: client {:?} reserved index {:?}", c, i);
-                    for node_rpc in node_rpcs.iter_mut() {
-                        // just received by one node here, but in reality would be received by
-                        // all nodes, so we simulate this here for more nodes
-                        node_rpc.add_reserved_index(c.to_vec(), *i).await.unwrap();
-                    }
+                println!("NODE: client {:?} reserved indices {:?}", c, indices);
+                for node_rpc in node_rpcs.iter_mut() {
+                    // just received by one node here, but in reality would be received by
+                    // all nodes, so we simulate this here for more nodes
+                    node_rpc
+                        .add_reserved_indices(c.to_vec(), indices.clone())
+                        .await
+                        .unwrap();
                 }
             }
 
@@ -607,12 +616,19 @@ async fn end_to_end_fake_coord() {
                 .unwrap();
 
             coord
-                .reserve_mask_index(0)
+                .reserve_mask_indices(&[0])
                 .await
                 .expect("obtaining mask indices failed");
             println!("CLIENT: obtained index 0");
 
-            let mask = rpc_client.receive_mask().await.unwrap();
+            let mask = rpc_client
+                .receive_assigned_masks()
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .1;
             assert_eq!(mask, correct_mask);
 
             coord.wait_for_round(Round::InputCollection).await.unwrap();
