@@ -420,6 +420,85 @@ async fn zero_input_execution_skips_input_rounds() {
     node.wait_for_round(Round::MPCExecution).await.unwrap();
 }
 
+#[tokio::test]
+async fn reserve_mask_indices_rejects_empty_batch() {
+    stoffel_mpc_coordinator_shared::setup_test();
+    let cert = client_cert();
+    let execution_id = execution(0x4c);
+    let state = coordinator_state(
+        execution_id,
+        1,
+        0,
+        vec![cert.signing_key.public_key_raw().to_vec()],
+        2,
+        vec![],
+    );
+    let port = free_port();
+    let _server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        state,
+        "127.0.0.1",
+        port,
+        0,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+    let mut node = start_coord_client(execution_id, "127.0.0.1", port, 0, 1, 0, cert).await;
+
+    node.start_preprocessing().await.unwrap();
+    node.wait_for_round(Round::Preprocessing).await.unwrap();
+    node.reserve_input_masks().await.unwrap();
+    node.wait_for_round(Round::InputMaskReservation)
+        .await
+        .unwrap();
+
+    node.reserve_mask_indices(&[])
+        .await
+        .expect_err("an empty batch of indices does not make sense and must be rejected");
+}
+
+#[tokio::test]
+async fn client_may_only_call_reserve_mask_indices_once() {
+    stoffel_mpc_coordinator_shared::setup_test();
+    let cert = client_cert();
+    let execution_id = execution(0x4d);
+    let state = coordinator_state(
+        execution_id,
+        1,
+        0,
+        vec![cert.signing_key.public_key_raw().to_vec()],
+        2,
+        vec![],
+    );
+    let port = free_port();
+    let _server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        state,
+        "127.0.0.1",
+        port,
+        0,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+    let mut node = start_coord_client(execution_id, "127.0.0.1", port, 0, 1, 0, cert).await;
+
+    node.start_preprocessing().await.unwrap();
+    node.wait_for_round(Round::Preprocessing).await.unwrap();
+    node.reserve_input_masks().await.unwrap();
+    node.wait_for_round(Round::InputMaskReservation)
+        .await
+        .unwrap();
+
+    node.reserve_mask_indices(&[0])
+        .await
+        .expect("first reservation call must succeed");
+
+    node.reserve_mask_indices(&[1]).await.expect_err(
+        "a second reservation call from the same client must be rejected, even though index 1 \
+         is still free",
+    );
+}
+
 // Goes through one entire program execution, calling all needed coordinator methods.
 #[tokio::test]
 async fn end_to_end() {
@@ -529,16 +608,14 @@ async fn end_to_end() {
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
             for (c, indices) in &client_to_indices {
-                for i in indices {
-                    println!("NODE: client {:?} reserved index {:?}", c, i);
-                    for node_rpc in node_rpcs.iter_mut() {
-                        // just received by one node here, but in reality would be received by
-                        // all nodes, so we simulate this here for more nodes
-                        node_rpc
-                            .add_reserved_index_for_execution(execution_id, c.to_vec(), *i)
-                            .await
-                            .unwrap();
-                    }
+                println!("NODE: client {:?} reserved indices {:?}", c, indices);
+                for node_rpc in node_rpcs.iter_mut() {
+                    // just received by one node here, but in reality would be received by
+                    // all nodes, so we simulate this here for more nodes
+                    node_rpc
+                        .add_reserved_indices_for_execution(execution_id, c.to_vec(), indices.clone())
+                        .await
+                        .unwrap();
                 }
             }
 
@@ -613,7 +690,7 @@ async fn end_to_end() {
                 .unwrap();
 
             coord
-                .reserve_mask_index(0)
+                .reserve_mask_indices(&[0])
                 .await
                 .expect("obtaining mask indices failed");
             println!("CLIENT: obtained index 0");
@@ -758,16 +835,14 @@ async fn end_to_end_fake_coord() {
                 .unwrap();
             let client_to_indices = coords[0].wait_for_indices(1).await.unwrap(); // called by node
             for (c, indices) in &client_to_indices {
-                for i in indices {
-                    println!("NODE: client {:?} reserved index {:?}", c, i);
-                    for node_rpc in node_rpcs.iter_mut() {
-                        // just received by one node here, but in reality would be received by
-                        // all nodes, so we simulate this here for more nodes
-                        node_rpc
-                            .add_reserved_index_for_execution(execution_id, c.to_vec(), *i)
-                            .await
-                            .unwrap();
-                    }
+                println!("NODE: client {:?} reserved indices {:?}", c, indices);
+                for node_rpc in node_rpcs.iter_mut() {
+                    // just received by one node here, but in reality would be received by
+                    // all nodes, so we simulate this here for more nodes
+                    node_rpc
+                        .add_reserved_indices_for_execution(execution_id, c.to_vec(), indices.clone())
+                        .await
+                        .unwrap();
                 }
             }
 
@@ -835,7 +910,7 @@ async fn end_to_end_fake_coord() {
                 .unwrap();
 
             coord
-                .reserve_mask_index(0)
+                .reserve_mask_indices(&[0])
                 .await
                 .expect("obtaining mask indices failed");
             println!("CLIENT: obtained index 0");

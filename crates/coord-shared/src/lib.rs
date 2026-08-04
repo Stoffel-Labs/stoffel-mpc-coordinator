@@ -179,11 +179,44 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
 
     fn reserve_mask_index(&mut self, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
 
+    /// Reserves several input-mask indices in one call. The default implementation just calls
+    /// `reserve_mask_index` in a loop, so implementors get this for free; `off-chain` overrides
+    /// it with a single round trip, since reserving indices one at a time is what makes clients
+    /// with many inputs blow past the RPC timeout under load.
+    fn reserve_mask_indices(
+        &mut self,
+        indices: &[u64],
+    ) -> impl Future<Output = Result<(), CoordinatorError>> {
+        async move {
+            for &i in indices {
+                self.reserve_mask_index(i).await?;
+            }
+            Ok(())
+        }
+    }
+
     fn send_masked_input(
         &self,
         masked_input: S::ValueType,
         i: u64,
     ) -> impl Future<Output = Result<(), CoordinatorError>>;
+
+    /// Submits several masked inputs in one call. The default implementation just calls
+    /// `send_masked_input` in a loop, so implementors get this for free; `off-chain` overrides
+    /// it with a single round trip, for the same reason `reserve_mask_indices` overrides
+    /// `reserve_mask_index`: submitting inputs one at a time is what makes clients with many
+    /// inputs blow past the RPC timeout under load.
+    fn send_masked_inputs(
+        &self,
+        inputs: &[(u64, S::ValueType)],
+    ) -> impl Future<Output = Result<(), CoordinatorError>> {
+        async move {
+            for (i, masked_input) in inputs {
+                self.send_masked_input(masked_input.clone(), *i).await?;
+            }
+            Ok(())
+        }
+    }
 
     fn wait_for_inputs(
         &self,

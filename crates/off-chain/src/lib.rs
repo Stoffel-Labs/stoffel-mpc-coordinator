@@ -105,7 +105,7 @@ pub mod node_rpc {
     use async_trait::async_trait;
     use jsonrpsee::{
         async_client::Client,
-        core::{to_json_raw_value, SubscriptionResult},
+        core::{to_json_raw_value, JsonRawValue, SubscriptionResult},
         proc_macros::rpc,
         server::RpcModule,
         types::{error::ErrorCode, ErrorObjectOwned},
@@ -351,35 +351,69 @@ pub mod node_rpc {
             execution_id: ExecutionId,
             reservation: AssignedMaskReservation,
         ) -> Result<(), NodeRPCError> {
+            self.add_assigned_reserved_indices_for_execution(execution_id, vec![reservation])
+                .await
+        }
+
+        /// Batch form of `add_assigned_reserved_index_for_execution`: registers every
+        /// reservation in `reservations` in one call, instead of the caller looping and
+        /// re-acquiring this execution's state lock once per index. This is what a node process
+        /// should call when it receives a batched `sub_reserved_indices`/
+        /// `sub_assigned_reserved_indices` event covering several indices at once.
+        pub async fn add_assigned_reserved_indices_for_execution(
+            &self,
+            execution_id: ExecutionId,
+            reservations: Vec<AssignedMaskReservation>,
+        ) -> Result<(), NodeRPCError> {
             let d = self.execution_state(execution_id).await?;
-            let mut d = d.lock().await;
-            let id = reservation.client.clone();
-            let i = reservation.reserved_index;
+            let mut pending_sends: Vec<(SubscriptionSink, Box<JsonRawValue>)> = Vec::new();
+            {
+                let mut d = d.lock().await;
 
-            if d.index_to_client.contains_key(&i) {
-                return Err(NodeRPCError::IndexAlreadyAdded);
-            }
-
-            d.index_to_client.insert(i, id.clone());
-            d.assigned_reservations.insert(i, reservation.clone());
-
-            // Complete an exact-range request once its final assignment and share exist.
-            if d.mask_shares.contains_key(&i) {
-                if let Some(request) = d.assigned_sinks.remove(&id) {
-                    if let Some(assigned_shares) =
-                        d.assigned_mask_shares_for_client(&id, request.start, request.count)?
-                    {
-                        let json = to_json_raw_value(&assigned_shares)
-                            .map_err(|_| NodeRPCError::SerializationError)?;
-                        if request.sink.send(json).await.is_err() {
-                            eprintln!(
-                                "node RPC client disconnected after obtaining enough mask shares"
-                            );
-                        }
-                    } else {
-                        d.assigned_sinks.insert(id.clone(), request);
+                for reservation in &reservations {
+                    if d.index_to_client.contains_key(&reservation.reserved_index) {
+                        return Err(NodeRPCError::IndexAlreadyAdded);
                     }
                 }
+
+                // Phase 1: register every reservation in the batch before checking any pending
+                // range request below. A range request only completes once every index in its
+                // range has both a reservation and a share, so checking it once per registration
+                // in this batch (instead of once after all of them land) can only produce the
+                // same answer more slowly.
+                let mut touched_clients: Vec<ClientIdentity> = Vec::new();
+                for reservation in &reservations {
+                    let id = reservation.client.clone();
+                    let i = reservation.reserved_index;
+
+                    d.index_to_client.insert(i, id.clone());
+                    d.assigned_reservations.insert(i, reservation.clone());
+                    if !touched_clients.contains(&id) {
+                        touched_clients.push(id);
+                    }
+                }
+
+                // Phase 2: now that the batch's indices are all registered, check once per
+                // affected client whether its pending range request can be satisfied.
+                for id in touched_clients {
+                    if let Some(request) = d.assigned_sinks.remove(&id) {
+                        match d.assigned_mask_shares_for_client(&id, request.start, request.count)?
+                        {
+                            Some(assigned_shares) => {
+                                let json = to_json_raw_value(&assigned_shares)
+                                    .map_err(|_| NodeRPCError::SerializationError)?;
+                                pending_sends.push((request.sink, json));
+                            }
+                            None => {
+                                d.assigned_sinks.insert(id, request);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (sink, json) in pending_sends {
+                let _ = sink.send(json).await;
             }
 
             Ok(())
@@ -391,13 +425,29 @@ pub mod node_rpc {
             client: ClientIdentity,
             reserved_index: u64,
         ) -> Result<(), NodeRPCError> {
-            self.add_assigned_reserved_index_for_execution(
+            self.add_reserved_indices_for_execution(execution_id, client, vec![reserved_index])
+                .await
+        }
+
+        /// Batch form of `add_reserved_index_for_execution`: registers every index in `indices`
+        /// for `client` from a single (now-vectorized) `ReservedInputEvent`, instead of the
+        /// caller looping and re-acquiring this execution's state lock once per index.
+        pub async fn add_reserved_indices_for_execution(
+            &self,
+            execution_id: ExecutionId,
+            client: ClientIdentity,
+            indices: Vec<u64>,
+        ) -> Result<(), NodeRPCError> {
+            self.add_assigned_reserved_indices_for_execution(
                 execution_id,
-                AssignedMaskReservation {
-                    client,
-                    reserved_index,
-                    input_ordinal: reserved_index,
-                },
+                indices
+                    .into_iter()
+                    .map(|i| AssignedMaskReservation {
+                        client: client.clone(),
+                        reserved_index: i,
+                        input_ordinal: i,
+                    })
+                    .collect(),
             )
             .await
         }
@@ -408,35 +458,71 @@ pub mod node_rpc {
             i: u64,
             share: &S,
         ) -> Result<(), NodeRPCError> {
+            self.add_mask_shares_for_execution(execution_id, &[(i, share)])
+                .await
+        }
+
+        /// Batch form of `add_mask_share_for_execution`: registers every `(index, share)` pair
+        /// in `shares` while holding this execution's state lock only once, instead of the
+        /// caller looping and re-acquiring the lock (and re-checking every affected client's
+        /// pending range request) once per index.
+        pub async fn add_mask_shares_for_execution<S: CanonicalSerialize>(
+            &self,
+            execution_id: ExecutionId,
+            shares: &[(u64, &S)],
+        ) -> Result<(), NodeRPCError> {
             let d = self.execution_state(execution_id).await?;
-            let mut d = d.lock().await;
+            let mut pending_sends: Vec<(SubscriptionSink, Box<JsonRawValue>)> = Vec::new();
+            {
+                let mut d = d.lock().await;
 
-            if d.mask_shares.contains_key(&i) {
-                return Err(NodeRPCError::IndexAlreadyAdded);
-            }
-            let mut share_bytes = Vec::new();
-            share
-                .serialize_compressed(&mut share_bytes)
-                .map_err(|_| NodeRPCError::SerializationError)?;
-            d.mask_shares.insert(i, share_bytes.clone());
-
-            // Complete an exact-range request once its final share exists.
-            if let Some(id) = d.index_to_client.get(&i).cloned() {
-                if let Some(request) = d.assigned_sinks.remove(&id) {
-                    if let Some(assigned_shares) =
-                        d.assigned_mask_shares_for_client(&id, request.start, request.count)?
-                    {
-                        let json = to_json_raw_value(&assigned_shares)
-                            .map_err(|_| NodeRPCError::SerializationError)?;
-                        if request.sink.send(json).await.is_err() {
-                            eprintln!(
-                                "node RPC client disconnected after obtaining enough mask shares"
-                            );
-                        }
-                    } else {
-                        d.assigned_sinks.insert(id.clone(), request);
+                for (i, _) in shares {
+                    if d.mask_shares.contains_key(i) {
+                        return Err(NodeRPCError::IndexAlreadyAdded);
                     }
                 }
+
+                // Phase 1: record every share in the batch before checking any pending range
+                // request below, for the same reason `add_assigned_reserved_indices_for_execution`
+                // does: a range request only completes once every index in its range has both a
+                // reservation and a share, so checking it once per client touched by this batch
+                // (instead of once per index) can only produce the same answer more slowly.
+                let mut touched_clients: Vec<ClientIdentity> = Vec::new();
+                for (i, share) in shares {
+                    let mut share_bytes = Vec::new();
+                    share
+                        .serialize_compressed(&mut share_bytes)
+                        .map_err(|_| NodeRPCError::SerializationError)?;
+                    d.mask_shares.insert(*i, share_bytes);
+
+                    if let Some(id) = d.index_to_client.get(i).cloned() {
+                        if !touched_clients.contains(&id) {
+                            touched_clients.push(id);
+                        }
+                    }
+                }
+
+                // Phase 2: now that the batch's shares are all recorded, check once per affected
+                // client whether its pending range request can be satisfied.
+                for id in touched_clients {
+                    if let Some(request) = d.assigned_sinks.remove(&id) {
+                        match d.assigned_mask_shares_for_client(&id, request.start, request.count)?
+                        {
+                            Some(assigned_shares) => {
+                                let json = to_json_raw_value(&assigned_shares)
+                                    .map_err(|_| NodeRPCError::SerializationError)?;
+                                pending_sends.push((request.sink, json));
+                            }
+                            None => {
+                                d.assigned_sinks.insert(id, request);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (sink, json) in pending_sends {
+                let _ = sink.send(json).await;
             }
 
             Ok(())
@@ -677,18 +763,22 @@ pub enum Event {
         creation_block: u64,
         designated_party: ClientIdentity,
     },
+    /// Carries every (index, masked input) pair submitted by one `submit_masked_input`/
+    /// `submit_masked_inputs` call, so a batch submission only needs one event on the wire
+    /// instead of one per index.
     MaskedInputEvent {
         client: ClientIdentity,
-        masked_input: Vec<u8>,
-        reserved_index: u64,
+        masked_inputs: Vec<(u64, Vec<u8>)>,
     },
     IndexBufferEvent {
         total_indices: u64,
         designated_party: ClientIdentity,
     },
+    /// Carries every index reserved by one `reserve_mask_index`/`reserve_mask_indices` call, so a
+    /// batch reservation only needs one event on the wire instead of one per index.
     ReservedInputEvent {
         client: ClientIdentity,
-        reserved_index: u64,
+        reserved_indices: Vec<u64>,
     },
     PreprocessingStarted {
         designated_party: ClientIdentity,
@@ -750,10 +840,17 @@ pub trait CoordinatorRPCBase {
     #[subscription(name = "sub_masked_inputs", unsubscribe = "unsub_masked_inputs", item = Event)]
     async fn sub_masked_inputs(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
-    #[subscription(name = "sub_assigned_reserved_indices", unsubscribe = "unsub_assigned_reserved_indices", item = AssignedMaskReservation)]
+    /// Pushes every `AssignedMaskReservation` from one `reserve_mask_index`/`reserve_mask_indices`
+    /// call as a single batch, mirroring `receive_assigned_mask_shares`'s `Vec<AssignedMaskShare>`
+    /// item -- one message per reservation batch instead of one per index.
+    #[subscription(name = "sub_assigned_reserved_indices", unsubscribe = "unsub_assigned_reserved_indices", item = Vec<AssignedMaskReservation>)]
     async fn sub_assigned_reserved_indices(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
-    #[subscription(name = "sub_assigned_masked_inputs", unsubscribe = "unsub_assigned_masked_inputs", item = AssignedMaskedInputEvent)]
+    /// Pushes every `AssignedMaskedInputEvent` from one `submit_masked_input`/
+    /// `submit_masked_inputs` call as a single batch, mirroring
+    /// `sub_assigned_reserved_indices`'s `Vec<AssignedMaskReservation>` item -- one message per
+    /// submission batch instead of one per index.
+    #[subscription(name = "sub_assigned_masked_inputs", unsubscribe = "unsub_assigned_masked_inputs", item = Vec<AssignedMaskedInputEvent>)]
     async fn sub_assigned_masked_inputs(&self, execution_id: ExecutionId) -> SubscriptionResult;
 
     /// Returns the number of available input masks left. TODO: this involves a race condition
@@ -765,6 +862,14 @@ pub trait CoordinatorRPCBase {
     #[method(name = "reserve_mask_index")]
     async fn reserve_mask_index(&self, execution_id: ExecutionId, i: u64) -> RpcResult<()>;
 
+    /// Batch form of `reserve_mask_index`: reserves every index in `indices` in one round trip,
+    /// atomically (either all of them are reserved, or an error is returned and none are).
+    /// Clients with many inputs should use this instead of calling `reserve_mask_index` in a
+    /// loop -- one round trip per input is what makes large client counts blow past the RPC
+    /// client's request timeout under load.
+    #[method(name = "reserve_mask_indices")]
+    async fn reserve_mask_indices(&self, execution_id: ExecutionId, indices: Vec<u64>) -> RpcResult<()>;
+
     /// An MPC client uses this to submit a masked input `masked_input`, for which it has
     /// previously reserved the index `reserved_index`.
     #[method(name = "submit_masked_input")]
@@ -773,6 +878,19 @@ pub trait CoordinatorRPCBase {
         execution_id: ExecutionId,
         masked_input: Vec<u8>,
         reserved_index: u64,
+    ) -> RpcResult<()>;
+
+    /// Batch form of `submit_masked_input`: submits every (index, masked input) pair in
+    /// `reserved_indices`/`masked_inputs` in one round trip, atomically (either all of them are
+    /// recorded, or an error is returned and none are). Clients with many inputs should use this
+    /// instead of calling `submit_masked_input` in a loop -- one round trip per input is what
+    /// makes large client counts blow past the RPC client's request timeout under load.
+    #[method(name = "submit_masked_inputs")]
+    async fn submit_masked_inputs(
+        &self,
+        execution_id: ExecutionId,
+        masked_inputs: Vec<Vec<u8>>,
+        reserved_indices: Vec<u64>,
     ) -> RpcResult<()>;
 
     /// The designated party uses this to transition to the new round `next_round`.
@@ -809,10 +927,13 @@ pub enum CoordinatorRPCBaseError {
     NotParty = 10,
     SendingFailed = 11,
     NotOutputClient = 12,
+    MismatchedBatchLengths = 13,
+    ClientAlreadyReserved = 14,
     UnauthorizedClientIo = 15,
     ExecutionNotFound = 16,
     ExecutionAlreadyRegistered = 17,
     ShutdownNotAccepted = 18,
+    EmptyBatch = 19,
 }
 
 fn execution_not_found(execution_id: ExecutionId) -> ErrorObjectOwned {
@@ -1151,8 +1272,11 @@ impl CoordinatorExecutionState {
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
 
-        for event in &self.assigned_reserved_index_events {
-            let json = to_json_raw_value(event).expect("failed convert to JSON");
+        // Replay history as a single batch, matching the one-message-per-reservation-call shape
+        // that live broadcasts use.
+        if !self.assigned_reserved_index_events.is_empty() {
+            let json = to_json_raw_value(&self.assigned_reserved_index_events)
+                .expect("failed convert to JSON");
             sink.send(json).await?;
         }
 
@@ -1166,8 +1290,11 @@ impl CoordinatorExecutionState {
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
 
-        for event in &self.assigned_masked_input_events {
-            let json = to_json_raw_value(event).expect("failed convert to JSON");
+        // Replay history as a single batch, matching the one-message-per-submission-call shape
+        // that live broadcasts use.
+        if !self.assigned_masked_input_events.is_empty() {
+            let json = to_json_raw_value(&self.assigned_masked_input_events)
+                .expect("failed convert to JSON");
             sink.send(json).await?;
         }
 
@@ -1373,7 +1500,17 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         &self,
         execution_id: ExecutionId,
         masked_input: Vec<u8>,
-        raw_reserved_index: u64,
+        reserved_index: u64,
+    ) -> RpcResult<()> {
+        self.submit_masked_inputs(execution_id, vec![masked_input], vec![reserved_index])
+            .await
+    }
+
+    async fn submit_masked_inputs(
+        &self,
+        execution_id: ExecutionId,
+        masked_inputs: Vec<Vec<u8>>,
+        reserved_indices: Vec<u64>,
     ) -> RpcResult<()> {
         let mut d = self.execution_state(execution_id).await?;
 
@@ -1389,92 +1526,137 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
-        let reserved_index = raw_reserved_index as usize;
-
-        if reserved_index >= d.masked_inputs.len() {
+        if masked_inputs.len() != reserved_indices.len() {
             return Err(ErrorObjectOwned::owned(
-                ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
+                ErrorCode::ServerError(MismatchedBatchLengths as i32).code(),
                 format!(
-                    "The index {} is out of bounds, there are only {} input masks.",
-                    reserved_index,
-                    d.masked_inputs.len()
+                    "Got {} masked inputs but {} reserved indices; these must match.",
+                    masked_inputs.len(),
+                    reserved_indices.len()
                 ),
                 None::<()>,
             ));
         }
 
-        match &d.reserved_indices[reserved_index] {
-            Some(public_key) => {
-                if *public_key != self.id {
-                    return Err(ErrorObjectOwned::owned(
-                            ErrorCode::ServerError(BadID as i32).code(),
-                            format!("Client {:?} cannot submit a masked input for index {}, since this index has been reserved by {:?}", self.id, reserved_index, *public_key),
-                            None::<()>
-                    ));
+        if reserved_indices.is_empty() {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(EmptyBatch as i32).code(),
+                "Cannot submit an empty batch of masked inputs.",
+                None::<()>,
+            ));
+        }
+
+        // Validate every index before applying any of them, so the batch is atomic: either all
+        // of `reserved_indices` end up with a masked input recorded, or (on error) none do.
+        for &raw_reserved_index in &reserved_indices {
+            let reserved_index = raw_reserved_index as usize;
+
+            if reserved_index >= d.masked_inputs.len() {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
+                    format!(
+                        "The index {} is out of bounds, there are only {} input masks.",
+                        reserved_index,
+                        d.masked_inputs.len()
+                    ),
+                    None::<()>,
+                ));
+            }
+
+            match &d.reserved_indices[reserved_index] {
+                Some(public_key) => {
+                    if *public_key != self.id {
+                        return Err(ErrorObjectOwned::owned(
+                                ErrorCode::ServerError(BadID as i32).code(),
+                                format!("Client {:?} cannot submit a masked input for index {}, since this index has been reserved by {:?}", self.id, reserved_index, *public_key),
+                                None::<()>
+                        ));
+                    }
+                    if d.masked_inputs[reserved_index].is_some() {
+                        return Err(ErrorObjectOwned::owned(
+                            ErrorCode::ServerError(MaskedInputAlreadySubmitted as i32).code(),
+                            format!(
+                                "Client {:?} has already submitted a masked input for index {}",
+                                self.id, reserved_index
+                            ),
+                            None::<()>,
+                        ));
+                    }
                 }
-                if d.masked_inputs[reserved_index].is_some() {
+                None => {
                     return Err(ErrorObjectOwned::owned(
-                        ErrorCode::ServerError(MaskedInputAlreadySubmitted as i32).code(),
+                        ErrorCode::ServerError(IndexNotReserved as i32).code(),
                         format!(
-                            "Client {:?} has already submitted a masked input for index {}",
-                            self.id, reserved_index
+                            "Cannot submit a masked input for index {}, since it has not been reserved",
+                            reserved_index
                         ),
                         None::<()>,
                     ));
                 }
-                d.masked_inputs[reserved_index] = Some(masked_input.clone());
-
-                let masked_input_for_assigned = masked_input.clone();
-                let event = Event::MaskedInputEvent {
-                    client: self.id.clone(),
-                    masked_input,
-                    reserved_index: raw_reserved_index,
-                };
-                let assigned_event =
-                    d.input_assignments
-                        .get(reserved_index)
-                        .map(|slot| AssignedMaskedInputEvent {
-                            client: self.id.clone(),
-                            reserved_index: raw_reserved_index,
-                            input_ordinal: slot.label,
-                            masked_input: masked_input_for_assigned,
-                        });
-                d.masked_input_events.push(event.clone());
-                if let Some(assigned_event) = assigned_event.clone() {
-                    d.assigned_masked_input_events.push(assigned_event);
-                }
-
-                let sinks = std::mem::take(&mut d.masked_input_sinks);
-                for sink in sinks {
-                    let json = to_json_raw_value(&event).expect("failed convert to JSON");
-                    if sink.send(json).await.is_ok() {
-                        d.masked_input_sinks.push(sink);
-                    } else {
-                        eprintln!("coordinator masked-input subscriber disconnected");
-                    }
-                }
-                if let Some(assigned_event) = assigned_event {
-                    let assigned_sinks = std::mem::take(&mut d.assigned_masked_input_sinks);
-                    for sink in assigned_sinks {
-                        let json =
-                            to_json_raw_value(&assigned_event).expect("failed convert to JSON");
-                        if sink.send(json).await.is_ok() {
-                            d.assigned_masked_input_sinks.push(sink);
-                        } else {
-                            eprintln!("coordinator assigned masked-input subscriber disconnected");
-                        }
-                    }
-                }
             }
-            None => {
-                return Err(ErrorObjectOwned::owned(
-                    ErrorCode::ServerError(IndexNotReserved as i32).code(),
-                    format!(
-                        "Cannot submit a masked input for index {}, since it has not been reserved",
-                        reserved_index
-                    ),
-                    None::<()>,
-                ));
+        }
+
+        let mut pairs = Vec::with_capacity(reserved_indices.len());
+        let mut assigned_events = Vec::new();
+        for (raw_reserved_index, masked_input) in
+            reserved_indices.into_iter().zip(masked_inputs.into_iter())
+        {
+            let reserved_index = raw_reserved_index as usize;
+            d.masked_inputs[reserved_index] = Some(masked_input.clone());
+
+            if let Some(slot) = d.input_assignments.get(reserved_index) {
+                assigned_events.push(AssignedMaskedInputEvent {
+                    client: self.id.clone(),
+                    reserved_index: raw_reserved_index,
+                    input_ordinal: slot.label,
+                    masked_input: masked_input.clone(),
+                });
+            }
+
+            pairs.push((raw_reserved_index, masked_input));
+        }
+
+        // One event carries every pair in this batch, so subscribers (and history replay) see
+        // one message per `submit_masked_input(s)` call instead of one per index.
+        let event = Event::MaskedInputEvent {
+            client: self.id.clone(),
+            masked_inputs: pairs,
+        };
+        d.masked_input_events.push(event.clone());
+        d.assigned_masked_input_events
+            .extend(assigned_events.iter().cloned());
+
+        // Broadcast the batch to all subscribed RPC clients concurrently -- sequential sends
+        // here would hold the coordinator-wide execution lock for as long as the slowest
+        // subscriber takes to drain its socket, stalling every other execution and client on
+        // this coordinator. Disconnected subscribers are pruned; late/restarted nodes replay
+        // from event history.
+        let sinks = std::mem::take(&mut d.masked_input_sinks);
+        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
+            let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            sink.send(json)
+        }))
+        .await;
+        for (sink, result) in sinks.into_iter().zip(results) {
+            if result.is_ok() {
+                d.masked_input_sinks.push(sink);
+            } else {
+                eprintln!("coordinator masked-input subscriber disconnected");
+            }
+        }
+        if !assigned_events.is_empty() {
+            let assigned_sinks = std::mem::take(&mut d.assigned_masked_input_sinks);
+            let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
+                let json = to_json_raw_value(&assigned_events).expect("failed convert to JSON");
+                sink.send(json)
+            }))
+            .await;
+            for (sink, result) in assigned_sinks.into_iter().zip(results) {
+                if result.is_ok() {
+                    d.assigned_masked_input_sinks.push(sink);
+                } else {
+                    eprintln!("coordinator assigned masked-input subscriber disconnected");
+                }
             }
         }
 
@@ -1506,6 +1688,14 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     }
 
     async fn reserve_mask_index(&self, execution_id: ExecutionId, i: u64) -> RpcResult<()> {
+        self.reserve_mask_indices(execution_id, vec![i]).await
+    }
+
+    async fn reserve_mask_indices(
+        &self,
+        execution_id: ExecutionId,
+        indices: Vec<u64>,
+    ) -> RpcResult<()> {
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputMaskReservation {
@@ -1520,80 +1710,120 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
-        if i as usize >= d.reserved_indices.len() {
+        if indices.is_empty() {
             return Err(ErrorObjectOwned::owned(
-                ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
+                ErrorCode::ServerError(EmptyBatch as i32).code(),
+                "Cannot reserve an empty batch of indices.",
+                None::<()>,
+            ));
+        }
+
+        // Clients must reserve all of their indices in a single (batched) call: once a client
+        // owns any entry in `reserved_indices`, it gets no second call to add more piecemeal.
+        // An empty batch is rejected above, so every successful call leaves at least one such
+        // entry -- no separate "has this client reserved" bookkeeping is needed.
+        if d.reserved_indices.iter().any(|owner| owner.as_ref() == Some(&self.id)) {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(ClientAlreadyReserved as i32).code(),
                 format!(
-                    "The index {} is out of bounds, there are only {} input masks.",
-                    i,
-                    d.reserved_indices.len()
+                    "Client {:?} has already made a reservation call; all indices must be reserved in a single call.",
+                    self.id
                 ),
                 None::<()>,
             ));
         }
 
-        if d.reserved_indices[i as usize].is_some() {
-            return Err(ErrorObjectOwned::owned(
-                ErrorCode::ServerError(IndexAlreadyReserved as i32).code(),
-                format!("Index {} already reserved.", i),
-                None::<()>,
-            ));
-        }
-
-        let assigned_reservation = if let Some(slot) = d.input_assignments.get(i as usize) {
-            // The duplicate-reservation check above only proves the index is free; assigned input
-            // slots also need to be reserved by the client they were bound to.
-            if slot.client != self.id {
+        // Validate every index before reserving any of them, so the batch is atomic: either all
+        // of `indices` end up reserved, or (on error) none do.
+        for &i in &indices {
+            if i as usize >= d.reserved_indices.len() {
                 return Err(ErrorObjectOwned::owned(
-                    ErrorCode::ServerError(UnauthorizedClientIo as i32).code(),
+                    ErrorCode::ServerError(IndexOutOfBounds as i32).code(),
                     format!(
-                        "Client {:?} cannot reserve assigned input index {}, which belongs to {:?}",
-                        self.id, i, slot.client
+                        "The index {} is out of bounds, there are only {} input masks.",
+                        i,
+                        d.reserved_indices.len()
                     ),
                     None::<()>,
                 ));
             }
-            Some(AssignedMaskReservation {
-                client: self.id.clone(),
-                reserved_index: i,
-                input_ordinal: slot.label,
-            })
-        } else {
-            None
-        };
 
-        d.reserved_indices[i as usize] = Some(self.id.clone());
+            if d.reserved_indices[i as usize].is_some() {
+                return Err(ErrorObjectOwned::owned(
+                    ErrorCode::ServerError(IndexAlreadyReserved as i32).code(),
+                    format!("Index {} already reserved.", i),
+                    None::<()>,
+                ));
+            }
 
-        let event = Event::ReservedInputEvent {
-            client: self.id.clone(),
-            reserved_index: i,
-        };
-
-        d.n_reserved += 1;
-        d.reserved_index_events.push(event.clone());
-
-        if let Some(assigned_reservation) = assigned_reservation.clone() {
-            d.assigned_reserved_index_events
-                .push(assigned_reservation.clone());
+            // The duplicate-reservation check above only proves the index is free; assigned
+            // input slots also need to be reserved by the client they were bound to.
+            if let Some(slot) = d.input_assignments.get(i as usize) {
+                if slot.client != self.id {
+                    return Err(ErrorObjectOwned::owned(
+                        ErrorCode::ServerError(UnauthorizedClientIo as i32).code(),
+                        format!(
+                            "Client {:?} cannot reserve assigned input index {}, which belongs to {:?}",
+                            self.id, i, slot.client
+                        ),
+                        None::<()>,
+                    ));
+                }
+            }
         }
 
-        // Broadcast reserved index to all subscribed RPC clients. Disconnected
-        // subscribers are pruned; late/restarted nodes replay from event history.
+        let mut assigned_reservations = Vec::new();
+        for &i in &indices {
+            if let Some(slot) = d.input_assignments.get(i as usize) {
+                assigned_reservations.push(AssignedMaskReservation {
+                    client: self.id.clone(),
+                    reserved_index: i,
+                    input_ordinal: slot.label,
+                });
+            }
+
+            d.reserved_indices[i as usize] = Some(self.id.clone());
+            d.n_reserved += 1;
+        }
+
+        // One event carries every index in this batch, so subscribers (and history replay) see
+        // one message per `reserve_mask_index(es)` call instead of one per index.
+        let event = Event::ReservedInputEvent {
+            client: self.id.clone(),
+            reserved_indices: indices,
+        };
+        d.reserved_index_events.push(event.clone());
+        d.assigned_reserved_index_events
+            .extend(assigned_reservations.iter().cloned());
+
+        // Broadcast the batch to all subscribed RPC clients concurrently -- sequential sends
+        // here would hold the coordinator-wide execution lock for as long as the slowest
+        // subscriber takes to drain its socket, stalling every other execution and client on
+        // this coordinator. Disconnected subscribers are pruned; late/restarted nodes replay
+        // from event history.
         let sinks = std::mem::take(&mut d.reserved_index_sinks);
-        for sink in sinks {
+        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            if sink.send(json).await.is_ok() {
+            sink.send(json)
+        }))
+        .await;
+        for (sink, result) in sinks.into_iter().zip(results) {
+            if result.is_ok() {
                 d.reserved_index_sinks.push(sink);
             } else {
                 eprintln!("coordinator reserved-index subscriber disconnected");
             }
         }
-        if let Some(assigned_reservation) = assigned_reservation {
+        if !assigned_reservations.is_empty() {
             let assigned_sinks = std::mem::take(&mut d.assigned_reserved_index_sinks);
-            for sink in assigned_sinks {
+            let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
                 let json =
-                    to_json_raw_value(&assigned_reservation).expect("failed convert to JSON");
-                if sink.send(json).await.is_ok() {
+                    to_json_raw_value(&assigned_reservations).expect("failed convert to JSON");
+                sink.send(json)
+            }))
+            .await;
+            for (sink, result) in assigned_sinks.into_iter().zip(results) {
+                if result.is_ok() {
                     d.assigned_reserved_index_sinks.push(sink);
                 } else {
                     eprintln!("coordinator assigned reserved-index subscriber disconnected");
@@ -2019,14 +2249,19 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
         let mut map: HashMap<ClientIdentity, Vec<u64>> = HashMap::new();
 
-        // Parse reserved index events one after the other.
-        for _ in 0..n_inputs {
+        // Each event now carries every index reserved by one `reserve_mask_index`/
+        // `reserve_mask_indices` call, so a single event can satisfy several of the `n_inputs`
+        // we're waiting for -- keep receiving events (not just `n_inputs` of them) until enough
+        // indices have actually been seen.
+        let mut received = 0u64;
+        while received < n_inputs {
             if let Some(Ok(Event::ReservedInputEvent {
                 client,
-                reserved_index,
+                reserved_indices,
             })) = sub.next().await
             {
-                map.entry(client).or_default().push(reserved_index);
+                received += reserved_indices.len() as u64;
+                map.entry(client).or_default().extend(reserved_indices);
             } else {
                 return Err(CoordinatorError::JSONError(
                     "Subscription ended before event could be received".to_string(),
@@ -2049,22 +2284,31 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
         let mut map: HashMap<ClientIdentity, Vec<(u64, S)>> = HashMap::new();
 
-        // Parse masked input events one after the other.
-        for _ in 0..n_inputs {
+        // Each event now carries every (index, masked input) pair submitted by one
+        // `submit_masked_input`/`submit_masked_inputs` call, so a single event can satisfy
+        // several of the `n_inputs` we're waiting for -- keep receiving events (not just
+        // `n_inputs` of them) until enough inputs have actually been seen.
+        let mut received = 0u64;
+        while received < n_inputs {
             if let Some(Ok(Event::MaskedInputEvent {
                 client,
-                masked_input,
-                reserved_index,
+                masked_inputs,
             })) = sub.next().await
             {
-                let i = reserved_index as usize;
-                let mask_share = &mask_shares[i];
-                let masked_input = S::ValueType::deserialize_compressed(masked_input.as_slice())
-                    .map_err(|_| CoordinatorError::DeserializationError)?;
-                let input = S::compute_masked_input(masked_input, mask_share)
-                    .map_err(|_| CoordinatorError::ShareError)?;
+                received += masked_inputs.len() as u64;
+                for (reserved_index, masked_input) in masked_inputs {
+                    let i = reserved_index as usize;
+                    let mask_share = &mask_shares[i];
+                    let masked_input =
+                        S::ValueType::deserialize_compressed(masked_input.as_slice())
+                            .map_err(|_| CoordinatorError::DeserializationError)?;
+                    let input = S::compute_masked_input(masked_input, mask_share)
+                        .map_err(|_| CoordinatorError::ShareError)?;
 
-                map.entry(client).or_default().push((reserved_index, input));
+                    map.entry(client.clone())
+                        .or_default()
+                        .push((reserved_index, input));
+                }
             } else {
                 return Err(CoordinatorError::JSONError(
                     "Subscription ended before event could be received".to_string(),
@@ -2104,27 +2348,46 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         masked_input: S::ValueType,
         i: u64,
     ) -> Result<(), CoordinatorError> {
-        let mut masked_input_bytes = Vec::new();
-        masked_input
-            .serialize_compressed(&mut masked_input_bytes)
-            .map_err(|_| CoordinatorError::SerializationError)?;
-        match CoordinatorRPCBaseClient::submit_masked_input(
+        self.send_masked_inputs(&[(i, masked_input)]).await
+    }
+
+    async fn send_masked_inputs(
+        &self,
+        inputs: &[(u64, S::ValueType)],
+    ) -> Result<(), CoordinatorError> {
+        let mut reserved_indices = Vec::with_capacity(inputs.len());
+        let mut masked_inputs = Vec::with_capacity(inputs.len());
+        for (i, masked_input) in inputs {
+            let mut masked_input_bytes = Vec::new();
+            masked_input
+                .serialize_compressed(&mut masked_input_bytes)
+                .map_err(|_| CoordinatorError::SerializationError)?;
+            reserved_indices.push(*i);
+            masked_inputs.push(masked_input_bytes);
+        }
+
+        CoordinatorRPCBaseClient::submit_masked_inputs(
             self.rpc(),
             self.execution_id,
-            masked_input_bytes,
-            i,
+            masked_inputs,
+            reserved_indices,
         )
         .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => Err(CoordinatorError::JSONError(e.to_string())),
-        }
+        .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn reserve_mask_index(&mut self, i: u64) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::reserve_mask_index(self.rpc(), self.execution_id, i)
-            .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+        self.reserve_mask_indices(&[i]).await
+    }
+
+    async fn reserve_mask_indices(&mut self, indices: &[u64]) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::reserve_mask_indices(
+            self.rpc(),
+            self.execution_id,
+            indices.to_vec(),
+        )
+        .await
+        .map_err(|e| CoordinatorError::JSONError(e.to_string()))
     }
 
     async fn obtain_outputs(&self) -> Result<Vec<S::ValueType>, CoordinatorError> {
