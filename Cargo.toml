@@ -1,3 +1,6 @@
 [workspace]
 members = ["crates/coord-shared", "crates/off-chain", "crates/on-chain", "crates/bins"]
 resolver = "2"
+
+[patch.crates-io]
+stoffel-vm-types = { path = "../StoffelVM/crates/stoffel-vm-types" }

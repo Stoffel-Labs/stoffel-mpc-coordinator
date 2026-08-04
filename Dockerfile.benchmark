@@ -9,11 +9,12 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=stoffelvm . /StoffelVM
+
 WORKDIR /build
 
 COPY . /build
 
-WORKDIR /build
 RUN cargo build --release --features benchmark && strip target/release/run-coord
 
 FROM debian:bookworm-slim AS runtime
