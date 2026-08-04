@@ -26,11 +26,12 @@ Every program invocation needs one nonzero 256-bit execution ID shared by its co
 nodes, and clients. The commands below use
 `0000000000000000000000000000000000000000000000000000000000000001` as a readable example;
 use a freshly generated value (for example, `openssl rand -hex 32`) for each real invocation.
-Then, run the off-chain coordinator with `cargo run --bin run-coord -- --execution-id 0000000000000000000000000000000000000000000000000000000000000001 --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt,ids/pub/clients/client1.crt`.
+Then, run the off-chain coordinator with `cargo run --bin run-coord -- --one-off 0000000000000000000000000000000000000000000000000000000000000000,0000000000000000000000000000000000000000000000000000000000000001 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt,ids/pub/clients/client1.crt`.
+`--one-off <hash>,<execution-id>` registers that single execution before listening and exits the coordinator once it reaches the ProgramFinished round; omit it to run a standing coordinator that keeps listening and accepts further registrations.
 
 For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
 
-`cargo run --bin run-coord -- --execution-id 0000000000000000000000000000000000000000000000000000000000000001 --hash 0000000000000000000000000000000000000000000000000000000000000000 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
+`cargo run --bin run-coord -- --one-off 0000000000000000000000000000000000000000000000000000000000000000,0000000000000000000000000000000000000000000000000000000000000001 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
 
 The off-chain coordinator also selects the MPC share backend from the `.stflb` manifest. Compile
 programs with `stoffel --mpc-backend honeybadger -b program.stfl` or

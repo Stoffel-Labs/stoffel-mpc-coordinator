@@ -26,7 +26,7 @@ use stoffel_mpc_coordinator_shared::{
     round_before, rpc::RPCServerHandle, Coordinator, CoordinatorError, ExecutionId, Round,
     ShareBound,
 };
-use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
+use tokio::sync::{oneshot, MappedMutexGuard, Mutex, MutexGuard};
 use CoordinatorRPCBaseError::*;
 
 /// KEM, KDF, and AEAD instantiations are needed to encrypt the output shares for an MPC client
@@ -736,6 +736,16 @@ pub trait CoordinatorRPCBase {
     #[method(name = "retire_execution")]
     async fn retire_execution(&self, execution_id: ExecutionId) -> RpcResult<()>;
 
+    /// Explicitly asks the coordinator (as a whole — this is not scoped to any one execution)
+    /// to shut down. Only the designated party may call this, and only once it has itself
+    /// confirmed (e.g. via `sub_round`/`wait_for_round`) that the execution it cares about
+    /// reached `Round::ProgramFinished` — the coordinator does not infer this from the round
+    /// transition on its own, since that would race the response to whichever call caused the
+    /// transition (see `transition`). One-off coordinator invocations exit once this is called;
+    /// standing coordinators reject it.
+    #[method(name = "request_shutdown")]
+    async fn request_shutdown(&self) -> RpcResult<()>;
+
     /// Wait for round `round` to be started.
     #[subscription(name = "sub_round", unsubscribe = "unsub_round", item = Event)]
     async fn sub_round(&self, execution_id: ExecutionId, round: Round) -> SubscriptionResult;
@@ -808,6 +818,7 @@ pub enum CoordinatorRPCBaseError {
     UnauthorizedClientIo = 15,
     ExecutionNotFound = 16,
     ExecutionAlreadyRegistered = 17,
+    ShutdownNotAccepted = 18,
 }
 
 fn execution_not_found(execution_id: ExecutionId) -> ErrorObjectOwned {
@@ -834,6 +845,10 @@ pub struct CoordinatorRPCServerSharedBase {
     mpc_nodes: Vec<ClientIdentity>,
     n: u64,
     executions: HashMap<ExecutionId, CoordinatorExecutionState>,
+    /// Set by one-off coordinator invocations via `watch_for_shutdown_request`. Fired by the
+    /// `request_shutdown` RPC method; absent (and thus rejecting shutdown requests) for standing
+    /// coordinators.
+    shutdown_notify: Option<oneshot::Sender<()>>,
 }
 
 /// All mutable protocol state for one program invocation.
@@ -900,6 +915,7 @@ impl CoordinatorRPCServerSharedBase {
             mpc_nodes: initial_mpc_nodes,
             n,
             executions: HashMap::new(),
+            shutdown_notify: None,
         })
     }
 
@@ -952,6 +968,22 @@ impl CoordinatorRPCServerSharedBase {
         let execution = CoordinatorExecutionState::new(registration.clone(), self.n)?;
         self.executions.insert(registration.execution_id, execution);
         Ok(())
+    }
+
+    /// Returns the current round of the given execution, or `None` if it is not registered
+    /// (either because it never was, or because it has already been retired).
+    pub fn round(&self, execution_id: ExecutionId) -> Option<Round> {
+        self.executions.get(&execution_id).map(|execution| execution.round)
+    }
+
+    /// Returns a receiver that resolves once a party calls the `request_shutdown` RPC method.
+    /// Used by one-off coordinator invocations to know when it is safe to exit, without
+    /// guessing based on internal round state (see `request_shutdown`'s doc comment for why
+    /// that would be racy).
+    pub fn watch_for_shutdown_request(&mut self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.shutdown_notify = Some(tx);
+        rx
     }
 
     pub fn retire_execution(
@@ -1276,6 +1308,29 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                     None::<()>,
                 )
             })
+    }
+
+    async fn request_shutdown(&self) -> RpcResult<()> {
+        let mut shared = self.d.lock().await;
+        let designated_party = shared.mpc_nodes[0].clone();
+        if self.id != designated_party {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(NotDesignatedParty as i32).code(),
+                "Only the designated party can request coordinator shutdown.",
+                None::<()>,
+            ));
+        }
+        match shared.shutdown_notify.take() {
+            Some(tx) => {
+                let _ = tx.send(());
+                Ok(())
+            }
+            None => Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(ShutdownNotAccepted as i32).code(),
+                "This coordinator does not accept shutdown requests.",
+                None::<()>,
+            )),
+        }
     }
 
     async fn sub_round(
@@ -1811,6 +1866,35 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         self.addr.clone()
     }
 
+    /// Runs the coordinator until `shutdown_requested` resolves, then shuts the listener down
+    /// and returns. Intended for one-off invocations that serve exactly one execution: the
+    /// caller arranges for `shutdown_requested` to resolve when a party calls `request_shutdown`
+    /// (e.g. via `CoordinatorRPCServerSharedBase::watch_for_shutdown_request`), before `shared`
+    /// is handed here, so that no client can call it before the coordinator is watching for it.
+    pub async fn start_coord_one_off(
+        shared: C::Internal,
+        addr: &str,
+        port: u16,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+        shutdown_requested: oneshot::Receiver<()>,
+    ) -> Result<(), CoordinatorError> {
+        let rpc_server_data = Arc::new(Mutex::new(shared));
+        let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<C>(
+            addr,
+            port,
+            cert_der,
+            key_der,
+            rpc_server_data,
+        )
+        .await?;
+
+        let _ = shutdown_requested.await;
+
+        server_handle.shutdown().await;
+        Ok(())
+    }
+
     /// Stops the listener. Dropping the server state closes its connections.
     pub async fn shutdown(self) {
         self.server_handle.shutdown().await;
@@ -1867,6 +1951,17 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
 
     pub async fn retire_execution(&self) -> Result<(), CoordinatorError> {
         CoordinatorRPCBaseClient::retire_execution(self.rpc(), self.execution_id)
+            .await
+            .map_err(|error| CoordinatorError::JSONError(error.to_string()))
+    }
+
+    /// Tells a one-off coordinator it may exit. Callers must only call this after they have
+    /// themselves confirmed (e.g. via `wait_for_round(Round::ProgramFinished)`) that the
+    /// execution actually finished — the coordinator does not infer this on its own, since a
+    /// designated party's own round-transition call racing the coordinator's shutdown is exactly
+    /// the bug this RPC method replaces.
+    pub async fn request_shutdown(&self) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::request_shutdown(self.rpc())
             .await
             .map_err(|error| CoordinatorError::JSONError(error.to_string()))
     }

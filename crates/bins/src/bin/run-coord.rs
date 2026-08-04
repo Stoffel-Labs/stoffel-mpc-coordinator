@@ -22,13 +22,13 @@ enum Backend {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Program content hash for an optional initially registered one-shot execution.
-    #[arg(long, requires = "execution_id")]
-    hash: Option<String>,
-
-    /// Optional invocation to register before listening. Omit for a standing coordinator.
-    #[arg(long, value_parser = parse_nonzero_execution_id)]
-    execution_id: Option<ExecutionId>,
+    /// Registers exactly one execution, formatted as <hash>,<execution-id>, before listening,
+    /// and exits once a party explicitly requests it via the `request_shutdown` RPC method
+    /// (stoffel-run's `--one-off` flag does this once it has confirmed the execution reached
+    /// ProgramFinished). Omit for a standing coordinator that keeps running and accepts further
+    /// registrations.
+    #[arg(long, value_parser = parse_one_off)]
+    one_off: Option<OneOff>,
 
     #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     initial_mpc_nodes: Vec<String>,
@@ -75,6 +75,24 @@ fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
         return Err("execution ID must be nonzero".to_string());
     }
     Ok(execution_id)
+}
+
+#[derive(Clone, Debug)]
+struct OneOff {
+    hash: [u8; 32],
+    execution_id: ExecutionId,
+}
+
+fn parse_one_off(value: &str) -> Result<OneOff, String> {
+    let (hash, execution_id) = value
+        .split_once(',')
+        .ok_or_else(|| "--one-off must be formatted as <hash>,<execution-id>".to_string())?;
+    let hash: [u8; 32] = hex::decode(hash)
+        .map_err(|error| format!("invalid hash: {error}"))?
+        .try_into()
+        .map_err(|_| "hash should be 32 bytes".to_string())?;
+    let execution_id = parse_nonzero_execution_id(execution_id)?;
+    Ok(OneOff { hash, execution_id })
 }
 
 type InputAssignmentBuildResult = (InputAssignment, Vec<ClientIdentity>);
@@ -164,6 +182,37 @@ async fn run_coord<C>(
     tokio::time::sleep(tokio::time::Duration::MAX).await;
 }
 
+/// Runs the coordinator for exactly `execution_id`, exiting once a party explicitly requests it
+/// via the `request_shutdown` RPC method (stoffel-run's `--one-off` bootnode does this after it
+/// has itself confirmed the execution reached ProgramFinished).
+async fn run_coord_one_off<C>(
+    mut server_state: CoordinatorRPCServerSharedBase,
+    addr: &str,
+    port: u16,
+    server_cert_der: Vec<u8>,
+    server_key_der: Vec<u8>,
+    execution_id: ExecutionId,
+) where
+    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
+{
+    // Registered before the listener starts, so no client can call request_shutdown before
+    // the coordinator is watching for it.
+    let shutdown_requested = server_state.watch_for_shutdown_request();
+
+    println!("Listening on {}:{} (one-off execution {})", addr, port, execution_id);
+    OffChainCoordinatorServer::<C>::start_coord_one_off(
+        server_state,
+        addr,
+        port,
+        server_cert_der,
+        server_key_der,
+        shutdown_requested,
+    )
+    .await
+    .expect("failed to run coordinator");
+    println!("Shutdown requested, exiting");
+}
+
 #[tokio::main]
 async fn main() {
     rustls::crypto::ring::default_provider()
@@ -233,16 +282,7 @@ async fn main() {
     let port = args.port;
     let mut server_state =
         CoordinatorRPCServerSharedBase::new(n, t, public_keys).expect("invalid coordinator roster");
-    if let Some(execution_id) = args.execution_id {
-        let hash: [u8; 32] = {
-            let h = hex::decode(
-                args.hash
-                    .as_deref()
-                    .expect("--hash is required with --execution-id"),
-            )
-            .expect("invalid hash");
-            h.try_into().expect("hash should be 32 bytes")
-        };
+    let one_off_execution_id = if let Some(OneOff { hash, execution_id }) = args.one_off {
         let (mpc_backend, input_assignment, output_clients, n_inputs) =
             if let Some(program_path) = args.program {
                 let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
@@ -298,16 +338,35 @@ async fn main() {
                 min_output_shares,
             })
             .expect("failed to configure initial execution");
+        Some(execution_id)
+    } else {
+        None
     };
-    run_coord::<HoneyBadgerCoordinatorConnection>(
-        server_state,
-        addr,
-        port,
-        t,
-        server_cert_der,
-        server_key_der,
-    )
-    .await;
+
+    match one_off_execution_id {
+        Some(execution_id) => {
+            run_coord_one_off::<HoneyBadgerCoordinatorConnection>(
+                server_state,
+                addr,
+                port,
+                server_cert_der,
+                server_key_der,
+                execution_id,
+            )
+            .await;
+        }
+        None => {
+            run_coord::<HoneyBadgerCoordinatorConnection>(
+                server_state,
+                addr,
+                port,
+                t,
+                server_cert_der,
+                server_key_der,
+            )
+            .await;
+        }
+    }
 }
 
 #[cfg(test)]
