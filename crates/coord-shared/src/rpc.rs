@@ -1,47 +1,13 @@
 use crate::{self_signed_certs, CoordinatorError};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use jsonrpsee::server::{RpcModule, Server};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use x509_parser::prelude::*;
-
-/// A wrapper around a share element that is serializable and deserializable for use with JSON-RPC.
-#[derive(Clone, Debug)]
-pub struct ValueWrapper<T: CanonicalSerialize + CanonicalDeserialize> {
-    pub value: T,
-}
-
-impl<'d, T: CanonicalSerialize + CanonicalDeserialize> Deserialize<'d> for ValueWrapper<T> {
-    fn deserialize<D>(deserializer: D) -> Result<ValueWrapper<T>, D::Error>
-    where
-        D: Deserializer<'d>,
-    {
-        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::Yes)
-            .map(|value| ValueWrapper::<T> { value })
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-impl<T: CanonicalSerialize + CanonicalDeserialize> Serialize for ValueWrapper<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut bytes = Vec::new();
-        self.value
-            .serialize_with_mode(&mut bytes, Compress::Yes)
-            .map_err(serde::ser::Error::custom)?;
-
-        serializer.serialize_bytes(&bytes)
-    }
-}
 
 /// This represents the JSON-RPC server's state for one client connection. Internally, it refers to
 /// some cross-client shared state of the server and also stores the client's public key.
