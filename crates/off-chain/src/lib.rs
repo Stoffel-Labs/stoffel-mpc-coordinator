@@ -618,19 +618,13 @@ pub mod node_rpc {
             };
             let mut d = d.lock().await;
 
-            if d.assigned_sinks.contains_key(&self.id) {
-                pending
-                    .reject(ErrorObjectOwned::owned(
-                        ErrorCode::InvalidParams.code(),
-                        format!(
-                            "Client {:?} already requested assigned mask shares",
-                            self.id
-                        ),
-                        None::<()>,
-                    ))
-                    .await;
-                return Ok(());
-            }
+            // A new subscription from the same client supersedes any previous one still
+            // pending: the client only ever moves on to the next input after it has consumed
+            // (or given up on) the last one, so a still-registered sink at this point is stale
+            // rather than a genuine conflict (e.g. the client returned early once threshold
+            // shares from other nodes arrived and abandoned this node's still-outstanding
+            // subscription without waiting for the unsubscribe to be processed here first).
+            d.assigned_sinks.remove(&self.id);
 
             let assigned_shares = match d.assigned_mask_shares_for_client(&self.id, start, count) {
                 Ok(assigned_shares) => assigned_shares,

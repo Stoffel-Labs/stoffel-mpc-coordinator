@@ -5,8 +5,9 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     HoneyBadgerCoordinatorRPCServerSharedBase, HoneyBadgerNodeRPCClient, HoneyBadgerNodeRPCServer,
     HoneyBadgerOffChainCoordinatorClient, HoneyBadgerOffChainCoordinatorServer,
 };
+use stoffel_mpc_coordinator_off_chain::node_rpc::OffChainNodeRPCClient;
 use stoffel_mpc_coordinator_off_chain::{
-    CoordinatorRPCBaseClient, ExecutionRegistration, InputAssignment,
+    AssignedMaskReservation, CoordinatorRPCBaseClient, ExecutionRegistration, InputAssignment,
 };
 use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{
@@ -1001,4 +1002,64 @@ async fn output_waiters_receive_threshold_and_later_share_snapshots() {
         .expect("additional-share snapshot must deserialize");
     assert_eq!(snapshot.len(), 4);
     assert!(outputs.iter().all(|output| snapshot.contains(output)));
+}
+
+// A client that abandons a still-pending `receive_assigned_mask_shares` subscription (e.g. it
+// already obtained enough shares from other nodes and moved on to the next input) must not have
+// its next request to the same node mistakenly rejected just because the stale sink is still
+// registered.
+#[tokio::test]
+async fn resubscribing_for_assigned_mask_shares_supersedes_stale_request() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x70);
+
+    let node = start_node_server(execution_id, addr, port, server_cert()).await;
+
+    let requester_cert = client_cert();
+    let requester_id = requester_cert.signing_key.public_key_raw().to_vec();
+    let (cert_der, key_der) = cert_parts(&requester_cert);
+    let client =
+        stoffel_mpc_coordinator_shared::self_signed_certs::setup_client(addr, port, cert_der, key_der)
+            .await
+            .unwrap();
+
+    // Index 0 isn't assigned to anyone yet, so this subscription stays pending, registered as
+    // this client's outstanding request. Kept alive (not dropped) for the rest of the test, so
+    // no unsubscribe is ever sent for it.
+    let _stale_sub =
+        OffChainNodeRPCClient::receive_assigned_mask_shares(&client, execution_id, 0, 1)
+            .await
+            .unwrap();
+
+    // The client moves on to the next input before the first request resolves. Before the fix,
+    // this would be rejected with "already requested assigned mask shares" purely because the
+    // stale subscription above is still registered.
+    let mut sub = OffChainNodeRPCClient::receive_assigned_mask_shares(&client, execution_id, 1, 1)
+        .await
+        .expect("a new request from the same client must supersede the stale one, not be rejected");
+
+    node.add_assigned_reserved_index_for_execution(
+        execution_id,
+        AssignedMaskReservation {
+            client: requester_id,
+            reserved_index: 1,
+            input_ordinal: 1,
+        },
+    )
+    .await
+    .unwrap();
+    node.add_mask_share_for_execution(execution_id, 1, &Fr::from(7))
+        .await
+        .unwrap();
+
+    let assigned_shares = tokio::time::timeout(std::time::Duration::from_secs(1), sub.next())
+        .await
+        .expect("assigned share must be delivered to the superseding subscription")
+        .expect("subscription must remain open")
+        .expect("assigned share must deserialize");
+    assert_eq!(assigned_shares.len(), 1);
+    assert_eq!(assigned_shares[0].reserved_index, 1);
 }
