@@ -1852,20 +1852,6 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
-        let skips_empty_input_rounds = d.masked_inputs.is_empty()
-            && d.round == Round::Preprocessing
-            && next_round == Round::MPCExecution;
-        if round_before(next_round) != Some(d.round) && !skips_empty_input_rounds {
-            return Err(ErrorObjectOwned::owned(
-                ErrorCode::ServerError(WrongRound as i32).code(),
-                format!(
-                    "Cannot transition execution {execution_id} from {:?} to {:?}",
-                    d.round, next_round
-                ),
-                None::<()>,
-            ));
-        }
-
         match next_round {
             Round::Idle => {
                 return Err(ErrorObjectOwned::owned(
