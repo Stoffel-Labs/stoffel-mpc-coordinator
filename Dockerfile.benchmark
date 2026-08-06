@@ -13,7 +13,6 @@ WORKDIR /build
 
 COPY . /build
 
-WORKDIR /build
 RUN cargo build --release --features benchmark && strip target/release/run-coord
 
 FROM debian:bookworm-slim AS runtime
