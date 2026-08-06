@@ -15,7 +15,13 @@ WORKDIR /build
 
 COPY . /build
 
-RUN cargo build --release --features benchmark && strip target/release/run-coord
+RUN --mount=type=cache,id=stoffel-coord-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=stoffel-coord-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=stoffel-coord-target,target=/build/target,sharing=locked \
+    cargo build --release --features benchmark && \
+    strip target/release/run-coord && \
+    mkdir -p /build/artifacts && \
+    cp target/release/run-coord /build/artifacts/run-coord
 
 FROM debian:bookworm-slim AS runtime
 
@@ -28,6 +34,6 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/run-coord /app/run-coord
+COPY --from=builder /build/artifacts/run-coord /app/run-coord
 
 ENTRYPOINT ["/app/run-coord"]
