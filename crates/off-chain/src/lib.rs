@@ -1520,6 +1520,14 @@ impl CoordinatorExecutionState {
             && next_round == Round::MPCExecution
     }
 
+    /// True when this execution has no output clients at all, so `OutputDistribution` carries no
+    /// work and `MPCExecution` advances straight to `ProgramFinished`.
+    fn skips_empty_output_rounds(&self, next_round: Round) -> bool {
+        self.output_clients.is_empty()
+            && self.round == Round::MPCExecution
+            && next_round == Round::ProgramFinished
+    }
+
     /// A reason the coordinator must not enter `next_round` yet, independent of how many parties
     /// proposed it.
     ///
@@ -1549,7 +1557,8 @@ impl CoordinatorExecutionState {
     fn next_quorum_round(&self, quorum: usize) -> Option<Round> {
         ORDERED_ROUNDS.into_iter().find(|&candidate| {
             (round_before(candidate) == Some(self.round)
-                || self.skips_empty_input_rounds(candidate))
+                || self.skips_empty_input_rounds(candidate)
+                || self.skips_empty_output_rounds(candidate))
                 && self
                     .transition_votes
                     .get(&candidate)
