@@ -21,6 +21,17 @@ fn sample_ids(n: usize) -> Vec<usize> {
     (1..=n).collect()
 }
 
+/// Proposes `round` from every party.
+///
+/// Round transitions require a quorum of proposals, so a test that drives the protocol by hand
+/// has to speak for the roster rather than for a single leader — exactly as each node does in a
+/// real deployment once it has finished its own work for the round.
+async fn propose_round(coords: &[HoneyBadgerOffChainCoordinatorClient], round: Round) {
+    for coord in coords {
+        coord.trigger_round(round).await.unwrap();
+    }
+}
+
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.local_addr().unwrap().port()
@@ -327,8 +338,12 @@ async fn trigger_pp() {
 
         let node0 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
         let node1 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
+        let node2 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
 
-        node0.trigger_round(Round::Preprocessing).await.unwrap();
+        // n = 5, t = 1, so three parties must propose the round before it is applied.
+        for node in [&node0, &node1, &node2] {
+            node.trigger_round(Round::Preprocessing).await.unwrap();
+        }
 
         if tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -367,6 +382,7 @@ async fn trigger_pp() {
 
         let node0 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
         let node1 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
+        let node2 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
 
         tokio::spawn({
             let barrier = barrier.clone();
@@ -384,9 +400,186 @@ async fn trigger_pp() {
             }
         });
 
-        node0.trigger_round(Round::Preprocessing).await.unwrap();
+        // node1 is only waiting, so the quorum of three is formed by the other parties.
+        let node3 = start_coord_client(execution_id, addr, port, 1, 5, 1, certs.remove(0)).await;
+        for node in [&node0, &node2, &node3] {
+            node.trigger_round(Round::Preprocessing).await.unwrap();
+        }
         barrier.wait().await;
     }
+}
+
+#[tokio::test]
+async fn transition_needs_a_quorum_and_ignores_which_parties_form_it() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let mut certs = (0..5).map(|_| server_cert()).collect::<Vec<_>>();
+    let public_keys = certs
+        .iter()
+        .map(|c| c.signing_key.public_key_raw().to_vec())
+        .collect::<Vec<_>>();
+
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x51);
+    let server_state = coordinator_state(execution_id, 5, 1, public_keys, 0, vec![]);
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        server_state,
+        addr,
+        port,
+        1,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+
+    // Deliberately never connect certs[0] — the party that used to be the sole proposer. If any
+    // authority still attached to roster position 0, no round below could ever be applied.
+    let _party0 = certs.remove(0);
+    let observer = start_coord_client(execution_id, addr, port, 1, 5, 1, server_cert()).await;
+    let mut proposers = Vec::new();
+    for cert in certs {
+        proposers.push(start_coord_client(execution_id, addr, port, 1, 5, 1, cert).await);
+    }
+
+    // Two of five parties is below the quorum of three, so nothing may happen yet.
+    for proposer in &proposers[..2] {
+        proposer.trigger_round(Round::Preprocessing).await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            observer.wait_for_round(Round::Preprocessing),
+        )
+        .await
+        .is_err(),
+        "a sub-quorum of proposals must not advance the round"
+    );
+
+    // The third proposal completes the quorum without party 0 ever participating.
+    proposers[2]
+        .trigger_round(Round::Preprocessing)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(2_000),
+        observer.wait_for_round(Round::Preprocessing),
+    )
+    .await
+    .expect("quorum of non-designated parties must advance the round")
+    .unwrap();
+
+    // The remaining party is simply late; its proposal must not be an error.
+    proposers[3]
+        .trigger_round(Round::Preprocessing)
+        .await
+        .expect("a proposal for an already-applied round is late, not invalid");
+}
+
+#[tokio::test]
+async fn mpc_execution_waits_for_every_masked_input() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let node_certs = (0..3).map(|_| server_cert()).collect::<Vec<_>>();
+    let client = client_cert();
+    let public_keys = node_certs
+        .iter()
+        .map(|c| c.signing_key.public_key_raw().to_vec())
+        .collect::<Vec<_>>();
+
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x53);
+    // Two input slots, so one client can leave the other empty.
+    let server_state = coordinator_state(execution_id, 3, 1, public_keys, 2, vec![]);
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        server_state,
+        addr,
+        port,
+        1,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+
+    let mut nodes = Vec::new();
+    for cert in node_certs {
+        nodes.push(start_coord_client(execution_id, addr, port, 1, 3, 0, cert).await);
+    }
+    let mut client = start_coord_client(execution_id, addr, port, 1, 3, 0, client).await;
+
+    propose_round(&nodes, Round::Preprocessing).await;
+    propose_round(&nodes, Round::InputMaskReservation).await;
+    client
+        .wait_for_round(Round::InputMaskReservation)
+        .await
+        .unwrap();
+    client.reserve_mask_index(0).await.unwrap();
+    client.reserve_mask_index(1).await.unwrap();
+
+    propose_round(&nodes, Round::InputCollection).await;
+    client.wait_for_round(Round::InputCollection).await.unwrap();
+    client.send_masked_input(Fr::from(7), 0).await.unwrap();
+
+    // Every party proposes MPCExecution while slot 1 is still empty. A malicious proposer that
+    // reached this point would be running the program on a censored input set.
+    propose_round(&nodes, Round::MPCExecution).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            nodes[0].wait_for_round(Round::MPCExecution),
+        )
+        .await
+        .is_err(),
+        "MPCExecution must not begin while an input slot is unfilled"
+    );
+
+    // The proposals are held, not discarded: completing the inputs releases the round without
+    // any party having to propose it again.
+    client.send_masked_input(Fr::from(9), 1).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(2_000),
+        nodes[0].wait_for_round(Round::MPCExecution),
+    )
+    .await
+    .expect("the final input must release the held transition")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn retirement_releases_capacity_without_unanimous_acknowledgement() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let certs = (0..5).map(|_| server_cert()).collect::<Vec<_>>();
+    let public_keys = certs
+        .iter()
+        .map(|c| c.signing_key.public_key_raw().to_vec())
+        .collect::<Vec<_>>();
+    let execution_id = execution(0x52);
+    let mut state = coordinator_state(execution_id, 5, 1, public_keys.clone(), 0, vec![]);
+
+    // Four of five parties acknowledge; the fifth is faulty or partitioned and never will.
+    for public_key in public_keys.iter().take(4) {
+        state.retire_execution(execution_id, public_key).unwrap();
+    }
+
+    assert!(
+        state.is_retired(execution_id),
+        "n - t acknowledgements must seal the execution and free its registration slot"
+    );
+
+    // Re-registering the same id proves the slot was released rather than pinned by the silent
+    // party, and the straggler's eventual acknowledgement must still be accepted.
+    state
+        .retire_execution(execution_id, &public_keys[4])
+        .expect("a late acknowledgement must not fail");
+    assert!(
+        !state.is_retired(execution_id),
+        "unanimity must forget the execution entirely"
+    );
+    state
+        .retire_execution(execution_id, &public_keys[0])
+        .expect("acknowledging a forgotten execution must be a no-op, not an error");
 }
 
 #[tokio::test]
@@ -513,15 +706,12 @@ async fn end_to_end() {
         }
 
         async move {
-            coords[0].trigger_round(Round::Preprocessing).await.unwrap();
+            propose_round(&coords, Round::Preprocessing).await;
             coords[0]
                 .wait_for_round(Round::Preprocessing)
                 .await
                 .unwrap();
-            coords[0]
-                .trigger_round(Round::InputMaskReservation)
-                .await
-                .unwrap();
+            propose_round(&coords, Round::InputMaskReservation).await;
             coords[0]
                 .wait_for_round(Round::InputMaskReservation)
                 .await
@@ -541,10 +731,7 @@ async fn end_to_end() {
                 }
             }
 
-            coords[0]
-                .trigger_round(Round::InputCollection)
-                .await
-                .unwrap();
+            propose_round(&coords, Round::InputCollection).await;
             coords[0]
                 .wait_for_round(Round::InputCollection)
                 .await
@@ -561,12 +748,9 @@ async fn end_to_end() {
                     );
                 }
             }
-            coords[0].trigger_round(Round::MPCExecution).await.unwrap();
+            propose_round(&coords, Round::MPCExecution).await;
             coords[0].wait_for_round(Round::MPCExecution).await.unwrap();
-            coords[0]
-                .trigger_round(Round::OutputDistribution)
-                .await
-                .unwrap();
+            propose_round(&coords, Round::OutputDistribution).await;
             coords[0]
                 .wait_for_round(Round::OutputDistribution)
                 .await
@@ -581,10 +765,7 @@ async fn end_to_end() {
                     .await
                     .unwrap();
             }
-            coords[0]
-                .trigger_round(Round::ProgramFinished)
-                .await
-                .unwrap();
+            propose_round(&coords, Round::ProgramFinished).await;
 
             barrier.wait().await;
         }
@@ -745,12 +926,12 @@ async fn end_to_end_fake_coord() {
         }
 
         async move {
-            coords[0].start_preprocessing().await.unwrap();
+            propose_round(&coords, Round::Preprocessing).await;
             coords[0]
                 .wait_for_round(Round::Preprocessing)
                 .await
                 .unwrap();
-            coords[0].reserve_input_masks().await.unwrap();
+            propose_round(&coords, Round::InputMaskReservation).await;
             coords[0]
                 .wait_for_round(Round::InputMaskReservation)
                 .await
@@ -770,7 +951,7 @@ async fn end_to_end_fake_coord() {
                 }
             }
 
-            coords[0].collect_inputs().await.unwrap();
+            propose_round(&coords, Round::InputCollection).await;
             coords[0]
                 .wait_for_round(Round::InputCollection)
                 .await
@@ -787,9 +968,9 @@ async fn end_to_end_fake_coord() {
                     );
                 }
             }
-            coords[0].start_mpc().await.unwrap();
+            propose_round(&coords, Round::MPCExecution).await;
             coords[0].wait_for_round(Round::MPCExecution).await.unwrap();
-            coords[0].send_output().await.unwrap();
+            propose_round(&coords, Round::OutputDistribution).await;
             coords[0]
                 .wait_for_round(Round::OutputDistribution)
                 .await
@@ -804,7 +985,7 @@ async fn end_to_end_fake_coord() {
                     .await
                     .unwrap();
             }
-            coords[0].finalize().await.unwrap();
+            propose_round(&coords, Round::ProgramFinished).await;
 
             barrier.wait().await;
         }
