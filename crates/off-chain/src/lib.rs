@@ -20,12 +20,12 @@ use jsonrpsee::{
 use p256::{pkcs8::DecodePrivateKey, SecretKey};
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_mpc_coordinator_shared::{
-    round_before, rpc::RPCServerHandle, Coordinator, CoordinatorError, ExecutionId, Round,
-    ShareBound,
+    round_before, round_index, rpc::RPCServerHandle, Coordinator, CoordinatorError, ExecutionId,
+    Round, ShareBound,
 };
 use tokio::sync::{oneshot, MappedMutexGuard, Mutex, MutexGuard};
 use CoordinatorRPCBaseError::*;
@@ -54,6 +54,11 @@ pub type ClientIdentity = Vec<u8>;
 /// listener. Finished executions must be retired before this many more are registered.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 1024;
 const SUBSCRIPTION_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many sealed-but-not-unanimously-acknowledged executions are remembered. A sealed
+/// execution holds no protocol state, so this only has to be large enough that a slow but
+/// honest party can still acknowledge its own executions after the quorum sealed them.
+pub const DEFAULT_MAX_RETIRED_EXECUTIONS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignedMaskReservation {
@@ -948,6 +953,16 @@ pub enum CoordinatorRPCBaseError {
     EmptyBatch = 19,
 }
 
+/// Every round except `Idle`, in protocol order.
+const ORDERED_ROUNDS: [Round; 6] = [
+    Round::Preprocessing,
+    Round::InputMaskReservation,
+    Round::InputCollection,
+    Round::MPCExecution,
+    Round::OutputDistribution,
+    Round::ProgramFinished,
+];
+
 fn execution_not_found(execution_id: ExecutionId) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(
         ErrorCode::ServerError(CoordinatorRPCBaseError::ExecutionNotFound as i32).code(),
@@ -971,17 +986,64 @@ pub struct CoordinatorRPCServerConnectionBase {
 pub struct CoordinatorRPCServerSharedBase {
     mpc_nodes: Vec<ClientIdentity>,
     n: u64,
+    t: u64,
     executions: HashMap<ExecutionId, CoordinatorExecutionState>,
     /// Set by one-off coordinator invocations via `watch_for_shutdown_request`. Fired by the
     /// `request_shutdown` RPC method; absent (and thus rejecting shutdown requests) for standing
     /// coordinators.
     shutdown_notify: Option<oneshot::Sender<()>>,
+    /// Executions that reached the retirement quorum. Their protocol state has been dropped;
+    /// only the acknowledging identities are kept so that stragglers can still retire cleanly.
+    retired: RetiredExecutions,
+}
+
+/// A bounded, insertion-ordered set of executions that have been sealed but not yet
+/// acknowledged by every party. Bounding this (rather than waiting for acknowledgements that
+/// a faulty party may never send) is what keeps a silent party from consuming memory forever.
+#[derive(Default)]
+struct RetiredExecutions {
+    acks: HashMap<ExecutionId, HashSet<ClientIdentity>>,
+    order: VecDeque<ExecutionId>,
+}
+
+impl RetiredExecutions {
+    fn seal(&mut self, execution_id: ExecutionId, acks: HashSet<ClientIdentity>) {
+        if self.acks.insert(execution_id, acks).is_none() {
+            self.order.push_back(execution_id);
+        }
+        while self.order.len() > DEFAULT_MAX_RETIRED_EXECUTIONS {
+            if let Some(evicted) = self.order.pop_front() {
+                self.acks.remove(&evicted);
+            }
+        }
+    }
+
+    /// Records one more acknowledgement, forgetting the execution entirely once every party
+    /// has acknowledged it. Returns false when the execution is not sealed.
+    fn acknowledge(&mut self, execution_id: ExecutionId, party: &ClientIdentity, n: usize) -> bool {
+        let Some(acks) = self.acks.get_mut(&execution_id) else {
+            return false;
+        };
+        acks.insert(party.clone());
+        if acks.len() >= n {
+            self.acks.remove(&execution_id);
+            self.order.retain(|candidate| *candidate != execution_id);
+        }
+        true
+    }
+
+    fn contains(&self, execution_id: ExecutionId) -> bool {
+        self.acks.contains_key(&execution_id)
+    }
 }
 
 /// All mutable protocol state for one program invocation.
 struct CoordinatorExecutionState {
     registration: ExecutionRegistration,
     retirement_acks: HashSet<ClientIdentity>,
+    /// Parties that have proposed each round transition. A round is applied once its proposer
+    /// set reaches the transition quorum, which replaces the previous single designated proposer.
+    transition_votes: HashMap<Round, HashSet<ClientIdentity>>,
     // Contains the sinks of clients, which subscribed to the transition to the given round.
     sinks: HashMap<Round, Vec<SubscriptionSink>>,
     trans_events: HashMap<Round, Event>,
@@ -1010,6 +1072,25 @@ struct CoordinatorExecutionState {
     output_clients: Vec<ClientIdentity>,
     /// Optional index assignments used to prevent clients from reserving indices assigned to others.
     input_assignments: Vec<InputSlotAssignment>,
+}
+
+type TransitionDelivery = (Round, Event, Vec<SubscriptionSink>);
+type OutputDelivery = (Arc<SubscriptionSink>, Vec<(Vec<u8>, Vec<u8>)>);
+
+async fn deliver_transitions(deliveries: Vec<TransitionDelivery>) {
+    for (round, event, sinks) in deliveries {
+        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
+            let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
+        }))
+        .await;
+        if results.iter().any(|result| !matches!(result, Ok(Ok(())))) {
+            eprintln!(
+                "coordinator subscriber disconnected or timed out while broadcasting {:?}",
+                round
+            );
+        }
+    }
 }
 
 impl CoordinatorRPCServerConnectionBase {
@@ -1044,9 +1125,37 @@ impl CoordinatorRPCServerSharedBase {
         Ok(Self {
             mpc_nodes: initial_mpc_nodes,
             n,
+            t,
             executions: HashMap::new(),
             shutdown_notify: None,
+            retired: RetiredExecutions::default(),
         })
+    }
+
+    /// How many distinct parties must propose a round transition before it is applied.
+    ///
+    /// The upper bound is the liveness bound `n - t`: requiring more than that would let `t`
+    /// faulty parties halt every execution simply by staying silent, which is the failure this
+    /// quorum exists to remove. Within that bound we prefer the honest-majority quorum `2t + 1`.
+    /// The lower bound `t + 1` guarantees at least one honest proposer, so a colluding minority
+    /// can never advance a round on its own.
+    ///
+    /// Note that a quorum is not what makes an early transition *safe* — a quorum containing a
+    /// single honest party is still enough to advance. Safety comes from the coordinator-side
+    /// preconditions checked in `blocking_precondition`; the quorum is what removes the single
+    /// designated proposer as a point of failure.
+    fn transition_quorum(&self) -> usize {
+        let liveness_bound = (self.n - self.t) as usize;
+        let honest_majority = (2 * self.t + 1) as usize;
+        honest_majority
+            .min(liveness_bound)
+            .max((self.t + 1) as usize)
+    }
+
+    /// How many parties must acknowledge completion before an execution's protocol state is
+    /// dropped. Bounded by `n - t` for the same reason as [`Self::transition_quorum`].
+    fn retirement_quorum(&self) -> usize {
+        (self.n - self.t) as usize
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1118,19 +1227,54 @@ impl CoordinatorRPCServerSharedBase {
         rx
     }
 
+    /// Acknowledges that `party` has finished with `execution_id`.
+    ///
+    /// Retirement happens in two stages. Once `n - t` parties have acknowledged, the execution's
+    /// protocol state is dropped and its registration slot is released, because at that point the
+    /// execution is terminal for every party that is still reachable. A small record of the
+    /// acknowledging identities is kept so a slow party can still retire without error; that
+    /// record is forgotten on unanimity, or evicted oldest-first if faulty parties never send it.
+    ///
+    /// Waiting for all `n` acknowledgements instead would let a single silent party pin an
+    /// execution — and, once `DEFAULT_MAX_CONCURRENT_EXECUTIONS` of them accumulate, block every
+    /// subsequent registration.
     pub fn retire_execution(
         &mut self,
         execution_id: ExecutionId,
         party: &ClientIdentity,
     ) -> Result<(), CoordinatorError> {
-        let execution = self.executions.get_mut(&execution_id).ok_or_else(|| {
-            CoordinatorError::JSONError(format!("Execution {execution_id} is not registered"))
-        })?;
+        // The RPC entry point already rejects non-parties, but this is a public method and the
+        // acknowledgement count is a quorum: counting an identity that is not on the roster would
+        // let one party's acknowledgements stand in for several.
+        if !self.mpc_nodes.contains(party) {
+            return Err(CoordinatorError::JSONError(
+                "Only configured MPC parties can retire executions".to_owned(),
+            ));
+        }
+        let quorum = self.retirement_quorum();
+        let n = self.mpc_nodes.len();
+        if self.retired.acknowledge(execution_id, party, n) {
+            return Ok(());
+        }
+        let Some(execution) = self.executions.get_mut(&execution_id) else {
+            // Already retired and forgotten. Acknowledging twice is not an error: a party that
+            // retries after a lost connection must not see its cleanup fail.
+            return Ok(());
+        };
         execution.retirement_acks.insert(party.clone());
-        if execution.retirement_acks.len() == self.mpc_nodes.len() {
+        if execution.retirement_acks.len() >= quorum {
+            let acks = execution.retirement_acks.clone();
             self.executions.remove(&execution_id);
+            if acks.len() < n {
+                self.retired.seal(execution_id, acks);
+            }
         }
         Ok(())
+    }
+
+    /// Whether `execution_id` has been sealed by the retirement quorum but not yet forgotten.
+    pub fn is_retired(&self, execution_id: ExecutionId) -> bool {
+        self.retired.contains(execution_id)
     }
 }
 
@@ -1154,6 +1298,15 @@ fn validate_topology(
     if t >= n {
         return Err(CoordinatorError::JSONError(format!(
             "Threshold {t} must be less than the MPC node count {n}"
+        )));
+    }
+    // Every secret-sharing scheme this coordinator serves needs at least `t + 1` honest parties
+    // to reconstruct, and the control-plane quorums below need `n - t >= t + 1` to be both safe
+    // and live. Both reduce to the same bound.
+    if n < 2 * t + 1 {
+        return Err(CoordinatorError::JSONError(format!(
+            "MPC node count {n} must be at least 2t + 1 = {} for threshold {t}",
+            2 * t + 1
         )));
     }
     if initial_mpc_nodes
@@ -1200,6 +1353,7 @@ impl CoordinatorExecutionState {
         Ok(Self {
             registration: registration.clone(),
             retirement_acks: HashSet::new(),
+            transition_votes: HashMap::new(),
             sinks: HashMap::new(),
             trans_events: HashMap::new(),
             reserved_index_events: vec![],
@@ -1310,6 +1464,103 @@ impl CoordinatorExecutionState {
         Ok(())
     }
 
+    /// True when this execution has no client inputs at all, so the two input rounds carry no
+    /// work and `Preprocessing` advances straight to `MPCExecution`.
+    fn skips_empty_input_rounds(&self, next_round: Round) -> bool {
+        self.masked_inputs.is_empty()
+            && self.round == Round::Preprocessing
+            && next_round == Round::MPCExecution
+    }
+
+    /// A reason the coordinator must not enter `next_round` yet, independent of how many parties
+    /// proposed it.
+    ///
+    /// This is what actually protects the protocol from a malicious proposer. Round order alone
+    /// is not enough: entering `MPCExecution` while input slots are still empty would run the
+    /// program on a truncated input set, silently censoring the clients that had not submitted.
+    /// Because every honest party proposes `MPCExecution` only after it has received all inputs,
+    /// this can only ever hold back a proposal that no honest party would have made.
+    fn blocking_precondition(&self, next_round: Round) -> Option<String> {
+        if next_round == Round::MPCExecution && !self.skips_empty_input_rounds(next_round) {
+            let missing = self
+                .masked_inputs
+                .iter()
+                .filter(|input| input.is_none())
+                .count();
+            if missing > 0 {
+                return Some(format!(
+                    "{missing} of {} masked inputs have not been submitted",
+                    self.masked_inputs.len()
+                ));
+            }
+        }
+        None
+    }
+
+    /// The next round that both follows the current one and has reached the proposer quorum.
+    fn next_quorum_round(&self, quorum: usize) -> Option<Round> {
+        ORDERED_ROUNDS.into_iter().find(|&candidate| {
+            (round_before(candidate) == Some(self.round)
+                || self.skips_empty_input_rounds(candidate))
+                && self
+                    .transition_votes
+                    .get(&candidate)
+                    .is_some_and(|voters| voters.len() >= quorum)
+        })
+    }
+
+    /// Applies every round whose proposer quorum is already satisfied.
+    ///
+    /// This cascades rather than applying a single round so that proposals which arrived out of
+    /// order — a fast party proposing round `R + 1` before the coordinator applied `R` — are not
+    /// stranded. It is also why proposals for a future round are recorded rather than rejected.
+    fn try_advance(
+        &mut self,
+        quorum: usize,
+        roster_head: &ClientIdentity,
+    ) -> Vec<TransitionDelivery> {
+        let mut deliveries = Vec::new();
+        while let Some(next_round) = self.next_quorum_round(quorum) {
+            if let Some(reason) = self.blocking_precondition(next_round) {
+                eprintln!(
+                    "coordinator holding {:?} for execution {}: {reason}",
+                    next_round, self.registration.execution_id
+                );
+                return deliveries;
+            }
+
+            let event = match next_round {
+                // `Idle` is never a member of ORDERED_ROUNDS, so it cannot be reached here.
+                Round::Idle => return deliveries,
+                Round::Preprocessing => Event::PreprocessingStarted {
+                    // Informational only: retained so the off-chain event mirrors its on-chain
+                    // counterpart. No party derives authority from this field any more.
+                    designated_party: roster_head.clone(),
+                },
+                Round::InputMaskReservation => Event::InputMaskReservationStarted,
+                Round::InputCollection => Event::InputCollectionStarted,
+                Round::MPCExecution => Event::MPCStarted,
+                Round::OutputDistribution => Event::OutputSendingStarted,
+                Round::ProgramFinished => Event::ExecutionDone,
+            };
+
+            let sinks = self
+                .transition(event.clone(), next_round)
+                .expect("round order validated before transition");
+            deliveries.push((next_round, event, sinks));
+
+            #[cfg(feature = "benchmark")]
+            {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                println!("BENCH_ROUND: {:?} ts={}", next_round, ts);
+            }
+        }
+        deliveries
+    }
+
     fn transition(
         &mut self,
         event: Event,
@@ -1334,7 +1585,7 @@ impl CoordinatorExecutionState {
         &mut self,
         client_id: &ClientIdentity,
         min_shares: usize,
-    ) -> Option<(Arc<SubscriptionSink>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    ) -> Option<OutputDelivery> {
         let waiter = self.output_sinks.get(client_id)?.clone();
         if waiter.is_closed() {
             self.output_sinks.remove(client_id);
@@ -1570,6 +1821,10 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         masked_inputs: Vec<Vec<u8>>,
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()> {
+        let (quorum, roster_head) = {
+            let shared = self.d.lock().await;
+            (shared.transition_quorum(), shared.mpc_nodes[0].clone())
+        };
         let delivery = {
             let d = self.execution_state(execution_id).await?;
             d.masked_input_delivery.clone()
@@ -1663,9 +1918,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
 
         let mut pairs = Vec::with_capacity(reserved_indices.len());
         let mut assigned_events = Vec::new();
-        for (raw_reserved_index, masked_input) in
-            reserved_indices.into_iter().zip(masked_inputs.into_iter())
-        {
+        for (raw_reserved_index, masked_input) in reserved_indices.into_iter().zip(masked_inputs) {
             let reserved_index = raw_reserved_index as usize;
             d.masked_inputs[reserved_index] = Some(masked_input.clone());
 
@@ -1737,6 +1990,13 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                 eprintln!("coordinator assigned masked-input subscriber disconnected or timed out");
             }
         }
+
+        // This input may have been the last one the `MPCExecution` precondition was waiting on.
+        // Re-checking here is what makes the precondition a wait rather than a rejection: parties
+        // propose the round once, and the coordinator applies it as soon as it becomes legal.
+        let transitions = d.try_advance(quorum, &roster_head);
+        drop(d);
+        deliver_transitions(transitions).await;
 
         Ok(())
     }
@@ -1933,74 +2193,60 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         Ok(())
     }
 
+    /// Proposes that `execution_id` advance to `next_round`.
+    ///
+    /// Any configured party may propose. The coordinator applies the transition once a quorum of
+    /// distinct parties has proposed the same round and the round's preconditions hold, so no
+    /// single party — designated or not — can either drive the protocol alone or halt it by
+    /// falling silent.
+    ///
+    /// A proposal is never rejected for arriving early or late: it is recorded, and acted on when
+    /// (or if) it becomes both current and supported. Callers therefore do not need to know how
+    /// far the coordinator has progressed.
     async fn transition(&self, execution_id: ExecutionId, next_round: Round) -> RpcResult<()> {
-        let designated_party = {
+        let (is_party, quorum, roster_head) = {
             let shared = self.d.lock().await;
-            shared.mpc_nodes[0].clone()
+            (
+                shared.mpc_nodes.contains(&self.id),
+                shared.transition_quorum(),
+                shared.mpc_nodes[0].clone(),
+            )
         };
-        let mut d = self.execution_state(execution_id).await?;
 
-        if self.id != designated_party {
+        if !is_party {
             return Err(ErrorObjectOwned::owned(
-                ErrorCode::ServerError(NotDesignatedParty as i32).code(),
-                format!(
-                    "Only designated party {:?} can do transitions.",
-                    designated_party
-                ),
+                ErrorCode::ServerError(NotParty as i32).code(),
+                "Only configured MPC parties can propose transitions.",
+                None::<()>,
+            ));
+        }
+        if round_before(next_round).is_none() {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("Round {:?} cannot be transitioned to", Round::Idle),
                 None::<()>,
             ));
         }
 
-        let event = match next_round {
-            Round::Idle => {
-                return Err(ErrorObjectOwned::owned(
-                    ErrorCode::InvalidParams.code(),
-                    format!("Round {:?} cannot be transitioned to", Round::Idle),
-                    None::<()>,
-                ));
-            }
-            Round::Preprocessing => Event::PreprocessingStarted {
-                designated_party: self.id.clone(),
-            },
-            Round::InputMaskReservation => Event::InputMaskReservationStarted,
-            Round::InputCollection => Event::InputCollectionStarted,
-            Round::MPCExecution => Event::MPCStarted,
-            Round::OutputDistribution => Event::OutputSendingStarted,
-            Round::ProgramFinished => Event::ExecutionDone,
+        let delivery = {
+            let d = self.execution_state(execution_id).await?;
+            d.masked_input_delivery.clone()
         };
-        let sinks = d.transition(event.clone(), next_round).unwrap();
+        let _delivery_guard = delivery.lock().await;
+        let mut d = self.execution_state(execution_id).await?;
+        if round_index(next_round) <= round_index(d.round) {
+            // Already applied. A party that proposes a round the quorum passed without it is
+            // simply late, which is the normal outcome for the slowest `n - quorum` parties.
+            return Ok(());
+        }
+
+        d.transition_votes
+            .entry(next_round)
+            .or_default()
+            .insert(self.id.clone());
+        let transitions = d.try_advance(quorum, &roster_head);
         drop(d);
-        eprintln!(
-            "coordinator execution {execution_id} entered round {:?}",
-            next_round
-        );
-
-        // Phase notifications are one-shot and late subscribers replay the
-        // recorded event, so delivery can safely happen after releasing the
-        // global state lock. Bound each send to prevent a dead peer from
-        // keeping the transition RPC open indefinitely.
-        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
-            let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
-        }))
-        .await;
-        for result in results {
-            if !matches!(result, Ok(Ok(()))) {
-                eprintln!(
-                    "coordinator subscriber disconnected or timed out while broadcasting {:?}",
-                    next_round
-                );
-            }
-        }
-
-        #[cfg(feature = "benchmark")]
-        {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            println!("BENCH_ROUND: {:?} ts={}", next_round, ts);
-        }
+        deliver_transitions(transitions).await;
 
         Ok(())
     }

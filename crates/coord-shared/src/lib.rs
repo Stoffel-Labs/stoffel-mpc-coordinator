@@ -153,6 +153,20 @@ pub enum Round {
     ProgramFinished,
 }
 
+/// The position of a round in the fixed protocol order. Rounds only ever advance, so this
+/// lets a coordinator recognise a proposal for a round it has already passed.
+pub fn round_index(round: Round) -> u8 {
+    match round {
+        Round::Idle => 0,
+        Round::Preprocessing => 1,
+        Round::InputMaskReservation => 2,
+        Round::InputCollection => 3,
+        Round::MPCExecution => 4,
+        Round::OutputDistribution => 5,
+        Round::ProgramFinished => 6,
+    }
+}
+
 pub fn round_before(current: Round) -> Option<Round> {
     match current {
         Round::Idle => None,

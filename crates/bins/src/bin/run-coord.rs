@@ -199,7 +199,10 @@ async fn run_coord_one_off<C>(
     // the coordinator is watching for it.
     let shutdown_requested = server_state.watch_for_shutdown_request();
 
-    println!("Listening on {}:{} (one-off execution {})", addr, port, execution_id);
+    println!(
+        "Listening on {}:{} (one-off execution {})",
+        addr, port, execution_id
+    );
     OffChainCoordinatorServer::<C>::start_coord_one_off(
         server_state,
         addr,
