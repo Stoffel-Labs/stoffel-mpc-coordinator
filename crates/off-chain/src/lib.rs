@@ -1515,16 +1515,14 @@ impl CoordinatorExecutionState {
     /// True when this execution has no client inputs at all, so the two input rounds carry no
     /// work and `Preprocessing` advances straight to `MPCExecution`.
     fn skips_empty_input_rounds(&self, next_round: Round) -> bool {
-        self.masked_inputs.is_empty()
-            && self.round == Round::Preprocessing
+            self.round == Round::Preprocessing
             && next_round == Round::MPCExecution
     }
 
     /// True when this execution has no output clients at all, so `OutputDistribution` carries no
     /// work and `MPCExecution` advances straight to `ProgramFinished`.
     fn skips_empty_output_rounds(&self, next_round: Round) -> bool {
-        self.output_clients.is_empty()
-            && self.round == Round::MPCExecution
+            self.round == Round::MPCExecution
             && next_round == Round::ProgramFinished
     }
 
