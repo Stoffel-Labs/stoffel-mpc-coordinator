@@ -4,7 +4,8 @@ use std::fs;
 use stoffel_mpc_coordinator_off_chain::tests::fake_coord::HoneyBadgerCoordinatorConnection;
 use stoffel_mpc_coordinator_off_chain::{
     ClientIdentity, CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment,
-    InputSlotAssignment, OffChainCoordinatorServer,
+    InputSlotAssignment, OffChainCoordinatorServer, OneOffShutdownConfig,
+    DEFAULT_ONE_OFF_SHUTDOWN_GRACE,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
 use stoffel_mpc_coordinator_shared::{CoordinatorError, ExecutionId};
@@ -29,6 +30,11 @@ struct Args {
     /// registrations.
     #[arg(long, value_parser = parse_one_off)]
     one_off: Option<OneOff>,
+
+    /// Maximum time after a one-off shutdown request to wait for every MPC party to acknowledge
+    /// ProgramFinished. The coordinator exits sooner as soon as all parties acknowledge.
+    #[arg(long, default_value_t = DEFAULT_ONE_OFF_SHUTDOWN_GRACE.as_secs())]
+    one_off_shutdown_grace_secs: u64,
 
     #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     initial_mpc_nodes: Vec<String>,
@@ -192,12 +198,13 @@ async fn run_coord_one_off<C>(
     server_cert_der: Vec<u8>,
     server_key_der: Vec<u8>,
     execution_id: ExecutionId,
+    shutdown_grace: std::time::Duration,
 ) where
     C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
 {
     // Registered before the listener starts, so no client can call request_shutdown before
     // the coordinator is watching for it.
-    let shutdown_requested = server_state.watch_for_shutdown_request();
+    let shutdown_requested = server_state.watch_for_shutdown_request(execution_id);
 
     println!(
         "Listening on {}:{} (one-off execution {})",
@@ -210,6 +217,10 @@ async fn run_coord_one_off<C>(
         server_cert_der,
         server_key_der,
         shutdown_requested,
+        OneOffShutdownConfig {
+            execution_id,
+            grace: shutdown_grace,
+        },
     )
     .await
     .expect("failed to run coordinator");
@@ -361,6 +372,7 @@ async fn main() {
                 server_cert_der,
                 server_key_der,
                 execution_id,
+                std::time::Duration::from_secs(args.one_off_shutdown_grace_secs),
             )
             .await;
         }

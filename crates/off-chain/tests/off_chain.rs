@@ -8,6 +8,7 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
 };
 use stoffel_mpc_coordinator_off_chain::{
     AssignedMaskReservation, CoordinatorRPCBaseClient, ExecutionRegistration, InputAssignment,
+    OneOffShutdownConfig,
 };
 use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{
@@ -277,6 +278,130 @@ async fn coordinator_shutdown_closes_connections_and_releases_port() {
     .await
     .unwrap();
     replacement.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_off_shutdown_does_not_disconnect_a_slow_party_before_terminal_replay() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let certs = (0..5).map(|_| server_cert()).collect::<Vec<_>>();
+    let public_keys = certs
+        .iter()
+        .map(|cert| cert.signing_key.public_key_raw().to_vec())
+        .collect::<Vec<_>>();
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x53);
+    let mut state = coordinator_state(execution_id, 5, 1, public_keys, 0, vec![]);
+    let shutdown_requested = state.watch_for_shutdown_request(execution_id);
+    let (server_cert_der, server_key_der) = cert_parts(&server_cert());
+    let server_task = tokio::spawn(HoneyBadgerOffChainCoordinatorServer::start_coord_one_off(
+        state,
+        addr,
+        port,
+        server_cert_der,
+        server_key_der,
+        shutdown_requested,
+        OneOffShutdownConfig {
+            execution_id,
+            grace: std::time::Duration::from_secs(2),
+        },
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut coords = Vec::new();
+    for cert in &certs {
+        coords.push(start_coord_client(execution_id, addr, port, 1, 5, 0, cert.clone()).await);
+    }
+
+    // A quorum of low-latency parties drives the execution to completion while the fifth party
+    // has not yet observed MPCExecution. This is the ordering from the multi-region failure log.
+    for round in [
+        Round::Preprocessing,
+        Round::MPCExecution,
+        Round::OutputDistribution,
+        Round::ProgramFinished,
+    ] {
+        for coord in coords.iter().take(3) {
+            coord.trigger_round(round).await.unwrap();
+        }
+    }
+    coords[0]
+        .wait_for_round(Round::ProgramFinished)
+        .await
+        .unwrap();
+    coords[0].request_shutdown().await.unwrap();
+    for coord in coords.iter().take(4) {
+        coord.retire_execution().await.unwrap();
+    }
+    assert!(
+        !server_task.is_finished(),
+        "n - t fast acknowledgements must not discard one-off round history"
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        coords[4].wait_for_round(Round::MPCExecution),
+    )
+    .await
+    .expect("slow party must receive the already-completed MPCExecution round")
+    .expect("one-off coordinator must remain connected for terminal replay");
+
+    assert!(
+        !server_task.is_finished(),
+        "the coordinator must not close before every live party acknowledges"
+    );
+    coords[4].retire_execution().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+        .await
+        .expect("coordinator must close promptly after unanimous acknowledgement")
+        .expect("one-off coordinator task must not panic")
+        .expect("one-off coordinator must shut down cleanly");
+}
+
+#[tokio::test]
+async fn one_off_shutdown_grace_bounds_a_missing_party() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let cert = server_cert();
+    let public_key = cert.signing_key.public_key_raw().to_vec();
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x54);
+    let mut state = coordinator_state(execution_id, 1, 0, vec![public_key], 0, vec![]);
+    let shutdown_requested = state.watch_for_shutdown_request(execution_id);
+    let (server_cert_der, server_key_der) = cert_parts(&server_cert());
+    let server_task = tokio::spawn(HoneyBadgerOffChainCoordinatorServer::start_coord_one_off(
+        state,
+        addr,
+        port,
+        server_cert_der,
+        server_key_der,
+        shutdown_requested,
+        OneOffShutdownConfig {
+            execution_id,
+            grace: std::time::Duration::from_millis(100),
+        },
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let coord = start_coord_client(execution_id, addr, port, 0, 1, 0, cert).await;
+    for round in [
+        Round::Preprocessing,
+        Round::MPCExecution,
+        Round::OutputDistribution,
+        Round::ProgramFinished,
+    ] {
+        coord.trigger_round(round).await.unwrap();
+    }
+    coord.wait_for_round(Round::ProgramFinished).await.unwrap();
+    coord.request_shutdown().await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+        .await
+        .expect("missing retirement acknowledgement must only delay shutdown by the grace period")
+        .expect("one-off coordinator task must not panic")
+        .expect("one-off coordinator must shut down cleanly after its grace period");
 }
 
 #[tokio::test]

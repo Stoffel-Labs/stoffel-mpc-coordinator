@@ -54,6 +54,17 @@ pub type ClientIdentity = Vec<u8>;
 /// listener. Finished executions must be retired before this many more are registered.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 1024;
 const SUBSCRIPTION_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a one-off coordinator waits for parties to acknowledge the terminal round after the
+/// designated party requests shutdown. Unanimous acknowledgement closes immediately; the bound
+/// preserves liveness when a faulty party never acknowledges.
+pub const DEFAULT_ONE_OFF_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+const ONE_OFF_RETIREMENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug)]
+pub struct OneOffShutdownConfig {
+    pub execution_id: ExecutionId,
+    pub grace: Duration,
+}
 
 /// How many sealed-but-not-unanimously-acknowledged executions are remembered. A sealed
 /// execution holds no protocol state, so this only has to be large enough that a slow but
@@ -992,6 +1003,9 @@ pub struct CoordinatorRPCServerSharedBase {
     /// `request_shutdown` RPC method; absent (and thus rejecting shutdown requests) for standing
     /// coordinators.
     shutdown_notify: Option<oneshot::Sender<()>>,
+    /// The execution served by a one-off coordinator. Unlike standing executions, its round
+    /// history remains live until every party acknowledges it or the one-off grace period expires.
+    one_off_execution: Option<ExecutionId>,
     /// Executions that reached the retirement quorum. Their protocol state has been dropped;
     /// only the acknowledging identities are kept so that stragglers can still retire cleanly.
     retired: RetiredExecutions,
@@ -1128,6 +1142,7 @@ impl CoordinatorRPCServerSharedBase {
             t,
             executions: HashMap::new(),
             shutdown_notify: None,
+            one_off_execution: None,
             retired: RetiredExecutions::default(),
         })
     }
@@ -1221,9 +1236,13 @@ impl CoordinatorRPCServerSharedBase {
     /// Used by one-off coordinator invocations to know when it is safe to exit, without
     /// guessing based on internal round state (see `request_shutdown`'s doc comment for why
     /// that would be racy).
-    pub fn watch_for_shutdown_request(&mut self) -> oneshot::Receiver<()> {
+    pub fn watch_for_shutdown_request(
+        &mut self,
+        execution_id: ExecutionId,
+    ) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         self.shutdown_notify = Some(tx);
+        self.one_off_execution = Some(execution_id);
         rx
     }
 
@@ -1251,7 +1270,15 @@ impl CoordinatorRPCServerSharedBase {
                 "Only configured MPC parties can retire executions".to_owned(),
             ));
         }
-        let quorum = self.retirement_quorum();
+        // A standing coordinator may release bulky execution state at `n - t` and retain a small
+        // tombstone for stragglers. A one-off coordinator is about to exit anyway, so retaining the
+        // complete round history until unanimity lets a healthy but slow party replay every round
+        // it missed instead of observing ExecutionNotFound or a closed WebSocket.
+        let quorum = if self.one_off_execution == Some(execution_id) {
+            self.n as usize
+        } else {
+            self.retirement_quorum()
+        };
         let n = self.mpc_nodes.len();
         if self.retired.acknowledge(execution_id, party, n) {
             return Ok(());
@@ -1275,6 +1302,19 @@ impl CoordinatorRPCServerSharedBase {
     /// Whether `execution_id` has been sealed by the retirement quorum but not yet forgotten.
     pub fn is_retired(&self, execution_id: ExecutionId) -> bool {
         self.retired.contains(execution_id)
+    }
+
+    fn retirement_progress(&self, execution_id: ExecutionId) -> (usize, usize, bool) {
+        let n = self.mpc_nodes.len();
+        if let Some(execution) = self.executions.get(&execution_id) {
+            return (execution.retirement_acks.len(), n, false);
+        }
+        if let Some(acks) = self.retired.acks.get(&execution_id) {
+            return (acks.len(), n, false);
+        }
+        // The one-off execution is registered before the listener starts and can only leave both
+        // maps after unanimous retirement, so absence here is its completed drain state.
+        (n, n, true)
     }
 }
 
@@ -1686,6 +1726,20 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(NotDesignatedParty as i32).code(),
                 "Only the designated party can request coordinator shutdown.",
+                None::<()>,
+            ));
+        }
+        let Some(execution_id) = shared.one_off_execution else {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(ShutdownNotAccepted as i32).code(),
+                "This coordinator does not accept shutdown requests.",
+                None::<()>,
+            ));
+        };
+        if shared.round(execution_id) != Some(Round::ProgramFinished) {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(WrongRound as i32).code(),
+                "The one-off coordinator cannot shut down before ProgramFinished.",
                 None::<()>,
             ));
         }
@@ -2453,18 +2507,49 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
         shutdown_requested: oneshot::Receiver<()>,
-    ) -> Result<(), CoordinatorError> {
+        shutdown: OneOffShutdownConfig,
+    ) -> Result<(), CoordinatorError>
+    where
+        C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection<
+            Internal = CoordinatorRPCServerSharedBase,
+        >,
+    {
         let rpc_server_data = Arc::new(Mutex::new(shared));
         let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<C>(
             addr,
             port,
             cert_der,
             key_der,
-            rpc_server_data,
+            rpc_server_data.clone(),
         )
         .await?;
 
         let _ = shutdown_requested.await;
+
+        let drained = tokio::time::timeout(shutdown.grace, async {
+            loop {
+                let complete = {
+                    let shared = rpc_server_data.lock().await;
+                    shared.retirement_progress(shutdown.execution_id).2
+                };
+                if complete {
+                    break;
+                }
+                tokio::time::sleep(ONE_OFF_RETIREMENT_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !drained {
+            let (acknowledged, parties, _) = {
+                let shared = rpc_server_data.lock().await;
+                shared.retirement_progress(shutdown.execution_id)
+            };
+            eprintln!(
+                "one-off coordinator shutdown grace expired after {:?}: {acknowledged}/{parties} parties acknowledged ProgramFinished",
+                shutdown.grace
+            );
+        }
 
         server_handle.shutdown().await;
         Ok(())
