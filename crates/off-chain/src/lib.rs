@@ -22,6 +22,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use stoffel_mpc_coordinator_shared::{
     round_before, rpc::RPCServerHandle, Coordinator, CoordinatorError, ExecutionId, Round,
     ShareBound,
@@ -52,6 +53,7 @@ pub type ClientIdentity = Vec<u8>;
 /// A deliberately small, explicit bound for the number of live executions owned by one RPC
 /// listener. Finished executions must be retired before this many more are registered.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 1024;
+const SUBSCRIPTION_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignedMaskReservation {
@@ -397,8 +399,11 @@ pub mod node_rpc {
                 // affected client whether its pending range request can be satisfied.
                 for id in touched_clients {
                     if let Some(request) = d.assigned_sinks.remove(&id) {
-                        match d.assigned_mask_shares_for_client(&id, request.start, request.count)?
-                        {
+                        match d.assigned_mask_shares_for_client(
+                            &id,
+                            request.start,
+                            request.count,
+                        )? {
                             Some(assigned_shares) => {
                                 let json = to_json_raw_value(&assigned_shares)
                                     .map_err(|_| NodeRPCError::SerializationError)?;
@@ -506,8 +511,11 @@ pub mod node_rpc {
                 // client whether its pending range request can be satisfied.
                 for id in touched_clients {
                     if let Some(request) = d.assigned_sinks.remove(&id) {
-                        match d.assigned_mask_shares_for_client(&id, request.start, request.count)?
-                        {
+                        match d.assigned_mask_shares_for_client(
+                            &id,
+                            request.start,
+                            request.count,
+                        )? {
                             Some(assigned_shares) => {
                                 let json = to_json_raw_value(&assigned_shares)
                                     .map_err(|_| NodeRPCError::SerializationError)?;
@@ -868,7 +876,11 @@ pub trait CoordinatorRPCBase {
     /// loop -- one round trip per input is what makes large client counts blow past the RPC
     /// client's request timeout under load.
     #[method(name = "reserve_mask_indices")]
-    async fn reserve_mask_indices(&self, execution_id: ExecutionId, indices: Vec<u64>) -> RpcResult<()>;
+    async fn reserve_mask_indices(
+        &self,
+        execution_id: ExecutionId,
+        indices: Vec<u64>,
+    ) -> RpcResult<()>;
 
     /// An MPC client uses this to submit a masked input `masked_input`, for which it has
     /// previously reserved the index `reserved_index`.
@@ -981,6 +993,9 @@ struct CoordinatorExecutionState {
     masked_input_sinks: Vec<SubscriptionSink>,
     assigned_masked_input_events: Vec<AssignedMaskedInputEvent>,
     assigned_masked_input_sinks: Vec<SubscriptionSink>,
+    /// Serializes client input broadcasts without holding the coordinator-wide
+    /// execution-state mutex across subscription I/O.
+    masked_input_delivery: Arc<Mutex<()>>,
     n_reserved: u64,
     reserved_indices: Vec<Option<ClientIdentity>>,
     masked_inputs: Vec<Option<Vec<u8>>>,
@@ -1088,7 +1103,9 @@ impl CoordinatorRPCServerSharedBase {
     /// Returns the current round of the given execution, or `None` if it is not registered
     /// (either because it never was, or because it has already been retired).
     pub fn round(&self, execution_id: ExecutionId) -> Option<Round> {
-        self.executions.get(&execution_id).map(|execution| execution.round)
+        self.executions
+            .get(&execution_id)
+            .map(|execution| execution.round)
     }
 
     /// Returns a receiver that resolves once a party calls the `request_shutdown` RPC method.
@@ -1193,6 +1210,7 @@ impl CoordinatorExecutionState {
             masked_input_sinks: vec![],
             assigned_masked_input_events: vec![],
             assigned_masked_input_sinks: vec![],
+            masked_input_delivery: Arc::new(Mutex::new(())),
             n_reserved: 0,
             reserved_indices: vec![None; n_inputs],
             masked_inputs: vec![None; n_inputs],
@@ -1204,44 +1222,19 @@ impl CoordinatorExecutionState {
         })
     }
 
-    async fn subscribe_oneshot(
-        &mut self,
-        pending: PendingSubscriptionSink,
-        round: Round,
-    ) -> SubscriptionResult {
-        if round_before(round).is_none() {
-            pending
-                .reject(ErrorObjectOwned::owned(
-                    ErrorCode::InvalidParams.code(),
-                    format!("Cannot subscribe to round {:?}", round),
-                    None::<()>,
-                ))
-                .await;
-            return Ok(());
-        }
-
-        let sink = pending.accept().await?;
-
-        if let Some(event) = self.trans_events.get(&round) {
-            let json = to_json_raw_value(event).expect("failed convert to JSON");
-            sink.send(json).await?;
-            return Ok(());
-        }
-
-        self.sinks.entry(round).or_default().push(sink);
-        Ok(())
-    }
-
-    async fn subscribe_reserved_indices(
-        &mut self,
-        pending: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
-        let sink = pending.accept().await?;
-
+    async fn subscribe_reserved_indices(&mut self, sink: SubscriptionSink) -> SubscriptionResult {
         if !self.reserved_index_events.is_empty() {
             for event in &self.reserved_index_events {
                 let json = to_json_raw_value(event).expect("failed convert to JSON");
-                sink.send(json).await?;
+                if !matches!(
+                    tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json)).await,
+                    Ok(Ok(()))
+                ) {
+                    eprintln!(
+                        "coordinator reserved-index subscriber disconnected or timed out during replay"
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -1249,16 +1242,19 @@ impl CoordinatorExecutionState {
         Ok(())
     }
 
-    async fn subscribe_masked_inputs(
-        &mut self,
-        pending: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
-        let sink = pending.accept().await?;
-
+    async fn subscribe_masked_inputs(&mut self, sink: SubscriptionSink) -> SubscriptionResult {
         if !self.masked_input_events.is_empty() {
             for event in &self.masked_input_events {
                 let json = to_json_raw_value(event).expect("failed convert to JSON");
-                sink.send(json).await?;
+                if !matches!(
+                    tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json)).await,
+                    Ok(Ok(()))
+                ) {
+                    eprintln!(
+                        "coordinator masked-input subscriber disconnected or timed out during replay"
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -1268,16 +1264,22 @@ impl CoordinatorExecutionState {
 
     async fn subscribe_assigned_reserved_indices(
         &mut self,
-        pending: PendingSubscriptionSink,
+        sink: SubscriptionSink,
     ) -> SubscriptionResult {
-        let sink = pending.accept().await?;
-
         // Replay history as a single batch, matching the one-message-per-reservation-call shape
         // that live broadcasts use.
         if !self.assigned_reserved_index_events.is_empty() {
             let json = to_json_raw_value(&self.assigned_reserved_index_events)
                 .expect("failed convert to JSON");
-            sink.send(json).await?;
+            if !matches!(
+                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json)).await,
+                Ok(Ok(()))
+            ) {
+                eprintln!(
+                    "coordinator assigned reserved-index subscriber disconnected or timed out during replay"
+                );
+                return Ok(());
+            }
         }
 
         self.assigned_reserved_index_sinks.push(sink);
@@ -1286,23 +1288,33 @@ impl CoordinatorExecutionState {
 
     async fn subscribe_assigned_masked_inputs(
         &mut self,
-        pending: PendingSubscriptionSink,
+        sink: SubscriptionSink,
     ) -> SubscriptionResult {
-        let sink = pending.accept().await?;
-
         // Replay history as a single batch, matching the one-message-per-submission-call shape
         // that live broadcasts use.
         if !self.assigned_masked_input_events.is_empty() {
             let json = to_json_raw_value(&self.assigned_masked_input_events)
                 .expect("failed convert to JSON");
-            sink.send(json).await?;
+            if !matches!(
+                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json)).await,
+                Ok(Ok(()))
+            ) {
+                eprintln!(
+                    "coordinator assigned masked-input subscriber disconnected or timed out during replay"
+                );
+                return Ok(());
+            }
         }
 
         self.assigned_masked_input_sinks.push(sink);
         Ok(())
     }
 
-    async fn transition(&mut self, event: Event, round: Round) -> Result<(), CoordinatorError> {
+    fn transition(
+        &mut self,
+        event: Event,
+        round: Round,
+    ) -> Result<Vec<SubscriptionSink>, CoordinatorError> {
         if round_before(round).is_none() {
             return Err(CoordinatorError::CannotTransitionToIdle);
         }
@@ -1315,22 +1327,7 @@ impl CoordinatorExecutionState {
 
         self.round = round;
 
-        // Broadcast event to all subscribed RPC clients concurrently.
-        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
-            let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            sink.send(json)
-        }))
-        .await;
-        for result in results {
-            if result.is_err() {
-                eprintln!(
-                    "coordinator subscriber disconnected while broadcasting {:?}",
-                    round
-                );
-            }
-        }
-
-        Ok(())
+        Ok(sinks)
     }
 
     fn ready_output_snapshot(
@@ -1460,11 +1457,56 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         execution_id: ExecutionId,
         round: Round,
     ) -> SubscriptionResult {
-        let Ok(mut d) = self.execution_state(execution_id).await else {
+        if round_before(round).is_none() {
+            pending
+                .reject(ErrorObjectOwned::owned(
+                    ErrorCode::InvalidParams.code(),
+                    format!("Cannot subscribe to round {:?}", round),
+                    None::<()>,
+                ))
+                .await;
+            return Ok(());
+        }
+
+        // Accepting a JSON-RPC subscription performs WebSocket I/O. Never do
+        // that while holding the coordinator-wide execution-state mutex: a
+        // slow handshake for one execution must not block phase transitions or
+        // client input delivery for every other execution.
+        let execution_exists = {
+            let shared = self.d.lock().await;
+            shared.executions.contains_key(&execution_id)
+        };
+        if !execution_exists {
             pending.reject(execution_not_found(execution_id)).await;
             return Ok(());
+        }
+        let sink = pending.accept().await?;
+
+        let replay = {
+            let Ok(mut d) = self.execution_state(execution_id).await else {
+                // The execution was retired while the subscription handshake
+                // was in flight. Dropping the accepted sink closes it.
+                return Ok(());
+            };
+            if let Some(event) = d.trans_events.get(&round) {
+                event.clone()
+            } else {
+                d.sinks.entry(round).or_default().push(sink);
+                return Ok(());
+            }
         };
-        d.subscribe_oneshot(pending, round).await
+
+        let json = to_json_raw_value(&replay).expect("failed convert to JSON");
+        if !matches!(
+            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json)).await,
+            Ok(Ok(()))
+        ) {
+            eprintln!(
+                "coordinator round subscriber disconnected or timed out while replaying {:?}",
+                round
+            );
+        }
+        Ok(())
     }
 
     async fn available_input_masks(&self, execution_id: ExecutionId) -> RpcResult<u64> {
@@ -1477,11 +1519,19 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
-        let Ok(mut d) = self.execution_state(execution_id).await else {
+        let execution_exists = {
+            let shared = self.d.lock().await;
+            shared.executions.contains_key(&execution_id)
+        };
+        if !execution_exists {
             pending.reject(execution_not_found(execution_id)).await;
             return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            return Ok(());
         };
-        d.subscribe_assigned_reserved_indices(pending).await
+        d.subscribe_assigned_reserved_indices(sink).await
     }
 
     async fn sub_assigned_masked_inputs(
@@ -1489,11 +1539,19 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
-        let Ok(mut d) = self.execution_state(execution_id).await else {
+        let execution_exists = {
+            let shared = self.d.lock().await;
+            shared.executions.contains_key(&execution_id)
+        };
+        if !execution_exists {
             pending.reject(execution_not_found(execution_id)).await;
             return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            return Ok(());
         };
-        d.subscribe_assigned_masked_inputs(pending).await
+        d.subscribe_assigned_masked_inputs(sink).await
     }
 
     async fn submit_masked_input(
@@ -1512,6 +1570,13 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         masked_inputs: Vec<Vec<u8>>,
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()> {
+        let delivery = {
+            let d = self.execution_state(execution_id).await?;
+            d.masked_input_delivery.clone()
+        };
+        // Preserve submission order while allowing unrelated coordinator RPCs
+        // and executions to progress during subscription delivery.
+        let _delivery_guard = delivery.lock().await;
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputCollection {
@@ -1626,37 +1691,50 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         d.assigned_masked_input_events
             .extend(assigned_events.iter().cloned());
 
-        // Broadcast the batch to all subscribed RPC clients concurrently -- sequential sends
-        // here would hold the coordinator-wide execution lock for as long as the slowest
-        // subscriber takes to drain its socket, stalling every other execution and client on
-        // this coordinator. Disconnected subscribers are pruned; late/restarted nodes replay
-        // from event history.
+        // Snapshot the sinks under the state lock, then release it before any
+        // WebSocket I/O. The per-execution delivery guard above prevents a
+        // concurrent submitter from observing the temporarily empty sink lists.
         let sinks = std::mem::take(&mut d.masked_input_sinks);
+        let assigned_sinks = if assigned_events.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut d.assigned_masked_input_sinks)
+        };
+        drop(d);
+
         let results = futures_util::future::join_all(sinks.iter().map(|sink| {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            sink.send(json)
+            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
         }))
         .await;
-        for (sink, result) in sinks.into_iter().zip(results) {
-            if result.is_ok() {
-                d.masked_input_sinks.push(sink);
-            } else {
-                eprintln!("coordinator masked-input subscriber disconnected");
-            }
-        }
-        if !assigned_events.is_empty() {
-            let assigned_sinks = std::mem::take(&mut d.assigned_masked_input_sinks);
+        let assigned_results = if assigned_sinks.is_empty() {
+            Vec::new()
+        } else {
             let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
                 let json = to_json_raw_value(&assigned_events).expect("failed convert to JSON");
-                sink.send(json)
+                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
             }))
             .await;
-            for (sink, result) in assigned_sinks.into_iter().zip(results) {
-                if result.is_ok() {
-                    d.assigned_masked_input_sinks.push(sink);
-                } else {
-                    eprintln!("coordinator assigned masked-input subscriber disconnected");
-                }
+            results
+        };
+
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            // Delivery completed, but the execution was retired before its
+            // subscription lists could be pruned.
+            return Ok(());
+        };
+        for (sink, result) in sinks.into_iter().zip(results) {
+            if matches!(result, Ok(Ok(()))) {
+                d.masked_input_sinks.push(sink);
+            } else {
+                eprintln!("coordinator masked-input subscriber disconnected or timed out");
+            }
+        }
+        for (sink, result) in assigned_sinks.into_iter().zip(assigned_results) {
+            if matches!(result, Ok(Ok(()))) {
+                d.assigned_masked_input_sinks.push(sink);
+            } else {
+                eprintln!("coordinator assigned masked-input subscriber disconnected or timed out");
             }
         }
 
@@ -1668,11 +1746,19 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
-        let Ok(mut d) = self.execution_state(execution_id).await else {
+        let execution_exists = {
+            let shared = self.d.lock().await;
+            shared.executions.contains_key(&execution_id)
+        };
+        if !execution_exists {
             pending.reject(execution_not_found(execution_id)).await;
             return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            return Ok(());
         };
-        d.subscribe_reserved_indices(pending).await
+        d.subscribe_reserved_indices(sink).await
     }
 
     async fn sub_masked_inputs(
@@ -1680,11 +1766,19 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
-        let Ok(mut d) = self.execution_state(execution_id).await else {
+        let execution_exists = {
+            let shared = self.d.lock().await;
+            shared.executions.contains_key(&execution_id)
+        };
+        if !execution_exists {
             pending.reject(execution_not_found(execution_id)).await;
             return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            return Ok(());
         };
-        d.subscribe_masked_inputs(pending).await
+        d.subscribe_masked_inputs(sink).await
     }
 
     async fn reserve_mask_index(&self, execution_id: ExecutionId, i: u64) -> RpcResult<()> {
@@ -1722,7 +1816,10 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         // owns any entry in `reserved_indices`, it gets no second call to add more piecemeal.
         // An empty batch is rejected above, so every successful call leaves at least one such
         // entry -- no separate "has this client reserved" bookkeeping is needed.
-        if d.reserved_indices.iter().any(|owner| owner.as_ref() == Some(&self.id)) {
+        if d.reserved_indices
+            .iter()
+            .any(|owner| owner.as_ref() == Some(&self.id))
+        {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(ClientAlreadyReserved as i32).code(),
                 format!(
@@ -1804,14 +1901,14 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         let sinks = std::mem::take(&mut d.reserved_index_sinks);
         let results = futures_util::future::join_all(sinks.iter().map(|sink| {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            sink.send(json)
+            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
         }))
         .await;
         for (sink, result) in sinks.into_iter().zip(results) {
-            if result.is_ok() {
+            if matches!(result, Ok(Ok(()))) {
                 d.reserved_index_sinks.push(sink);
             } else {
-                eprintln!("coordinator reserved-index subscriber disconnected");
+                eprintln!("coordinator reserved-index subscriber disconnected or timed out");
             }
         }
         if !assigned_reservations.is_empty() {
@@ -1819,14 +1916,16 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
                 let json =
                     to_json_raw_value(&assigned_reservations).expect("failed convert to JSON");
-                sink.send(json)
+                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
             }))
             .await;
             for (sink, result) in assigned_sinks.into_iter().zip(results) {
-                if result.is_ok() {
+                if matches!(result, Ok(Ok(()))) {
                     d.assigned_reserved_index_sinks.push(sink);
                 } else {
-                    eprintln!("coordinator assigned reserved-index subscriber disconnected");
+                    eprintln!(
+                        "coordinator assigned reserved-index subscriber disconnected or timed out"
+                    );
                 }
             }
         }
@@ -1852,7 +1951,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
-        match next_round {
+        let event = match next_round {
             Round::Idle => {
                 return Err(ErrorObjectOwned::owned(
                     ErrorCode::InvalidParams.code(),
@@ -1860,33 +1959,39 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                     None::<()>,
                 ));
             }
-            Round::Preprocessing => d
-                .transition(
-                    Event::PreprocessingStarted {
-                        designated_party: self.id.clone(),
-                    },
-                    next_round,
-                )
-                .await
-                .unwrap(),
-            Round::InputMaskReservation => d
-                .transition(Event::InputMaskReservationStarted, next_round)
-                .await
-                .unwrap(),
-            Round::InputCollection => d
-                .transition(Event::InputCollectionStarted, next_round)
-                .await
-                .unwrap(),
-            Round::MPCExecution => d.transition(Event::MPCStarted, next_round).await.unwrap(),
-            Round::OutputDistribution => d
-                .transition(Event::OutputSendingStarted, next_round)
-                .await
-                .unwrap(),
-            Round::ProgramFinished => d
-                .transition(Event::ExecutionDone, next_round)
-                .await
-                .unwrap(),
+            Round::Preprocessing => Event::PreprocessingStarted {
+                designated_party: self.id.clone(),
+            },
+            Round::InputMaskReservation => Event::InputMaskReservationStarted,
+            Round::InputCollection => Event::InputCollectionStarted,
+            Round::MPCExecution => Event::MPCStarted,
+            Round::OutputDistribution => Event::OutputSendingStarted,
+            Round::ProgramFinished => Event::ExecutionDone,
         };
+        let sinks = d.transition(event.clone(), next_round).unwrap();
+        drop(d);
+        eprintln!(
+            "coordinator execution {execution_id} entered round {:?}",
+            next_round
+        );
+
+        // Phase notifications are one-shot and late subscribers replay the
+        // recorded event, so delivery can safely happen after releasing the
+        // global state lock. Bound each send to prevent a dead peer from
+        // keeping the transition RPC open indefinitely.
+        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
+            let json = to_json_raw_value(&event).expect("failed convert to JSON");
+            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
+        }))
+        .await;
+        for result in results {
+            if !matches!(result, Ok(Ok(()))) {
+                eprintln!(
+                    "coordinator subscriber disconnected or timed out while broadcasting {:?}",
+                    next_round
+                );
+            }
+        }
 
         #[cfg(feature = "benchmark")]
         {
@@ -1956,37 +2061,51 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
-        let Ok(mut d) = self.execution_state(execution_id).await else {
-            pending.reject(execution_not_found(execution_id)).await;
-            return Ok(());
-        };
-
-        if !d.output_clients.contains(&self.id) {
-            pending
-                .reject(ErrorObjectOwned::owned(
-                    ErrorCode::ServerError(NotOutputClient as i32).code(),
-                    format!("Client {:?} is not an authorized output client.", self.id),
-                    None::<()>,
-                ))
-                .await;
-            return Ok(());
-        }
-
-        if d.output_sinks
-            .get(&self.id)
-            .is_some_and(|sink| !sink.is_closed())
-        {
-            pending
-                .reject(ErrorObjectOwned::owned(
+        // Validate under the execution lock, but never hold that lock while
+        // completing the WebSocket subscription handshake. A client may open
+        // this subscription concurrently with its masked-input RPC; awaiting
+        // `accept` while locked can otherwise block that RPC response and all
+        // round transitions for the execution.
+        let rejection = match self.execution_state(execution_id).await {
+            Err(error) => Some(error),
+            Ok(d) if !d.output_clients.contains(&self.id) => Some(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(NotOutputClient as i32).code(),
+                format!("Client {:?} is not an authorized output client.", self.id),
+                None::<()>,
+            )),
+            Ok(d)
+                if d.output_sinks
+                    .get(&self.id)
+                    .is_some_and(|sink| !sink.is_closed()) =>
+            {
+                Some(ErrorObjectOwned::owned(
                     ErrorCode::ServerError(OutputSharesAlreadyRequested as i32).code(),
                     "Output shares already requested.",
                     None::<()>,
                 ))
-                .await;
+            }
+            Ok(_) => None,
+        };
+        if let Some(error) = rejection {
+            pending.reject(error).await;
             return Ok(());
         }
 
         let sink = pending.accept().await?;
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            // The execution was retired during the handshake. Dropping the
+            // accepted sink closes this subscription cleanly.
+            return Ok(());
+        };
+        // Recheck after reacquiring the lock in case another subscription for
+        // the same identity won the handshake race.
+        if !d.output_clients.contains(&self.id)
+            || d.output_sinks
+                .get(&self.id)
+                .is_some_and(|current| !current.is_closed())
+        {
+            return Ok(());
+        }
         d.output_sinks.insert(self.id.clone(), Arc::new(sink));
         let min_shares = d.registration.min_output_shares as usize;
         drop(d);
