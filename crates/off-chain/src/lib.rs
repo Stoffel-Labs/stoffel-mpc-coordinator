@@ -92,15 +92,39 @@ pub struct AssignedMaskShare {
     pub share_bytes: Vec<u8>,
 }
 
+/// One global input slot, expanded from an `InputClientRange`. Not sent over the wire — see
+/// `InputAssignment` for why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSlotAssignment {
-    pub client: ClientIdentity,
+    /// Index into the owning `InputAssignment::clients`.
+    pub client_index: u32,
     pub label: u64,
+}
+
+/// One client's contiguous block of global input slots. A client's own inputs are always
+/// numbered `0..count` (see every `InputAssignment` producer), so the wire format only needs
+/// one entry per *client* rather than one per *input*: `register_execution`'s global slot index
+/// `i` falls in the range starting at the sum of every earlier range's `count`, with per-client
+/// label `i - that_start`. Expanded into one `InputSlotAssignment` per slot on receipt (see
+/// `CoordinatorExecutionState::new`) — that expansion only costs memory, not JSON bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputClientRange {
+    /// Index into the owning `InputAssignment::clients`.
+    pub client_index: u32,
+    /// Number of contiguous global input slots this client owns.
+    pub count: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputAssignment {
-    pub input_slots: Vec<InputSlotAssignment>,
+    /// Every client referenced by `ranges`, indexed by `InputClientRange::client_index`.
+    pub clients: Vec<ClientIdentity>,
+    /// One entry per client with at least one input, in global-slot order. Deliberately not one
+    /// entry per input slot — with a wide client roster and many inputs per client (e.g. a
+    /// federated-learning model vector), a flat per-slot list turns `register_execution`'s
+    /// payload into `O(n_inputs)` JSON entries instead of `O(clients.len())`, which is enough on
+    /// its own to blow past jsonrpsee's request-size cap even with no duplicated data.
+    pub ranges: Vec<InputClientRange>,
 }
 
 /// Immutable data that binds one invocation to its program and client I/O layout.
@@ -1369,6 +1393,23 @@ fn validate_topology(
     Ok(())
 }
 
+/// Expands the wire-compact per-client `ranges` into one `InputSlotAssignment` per global input
+/// slot, in range order, with each range's own labels numbered `0..count`. Purely an in-memory
+/// expansion — see `InputAssignment` for why the wire format itself stays range-based.
+fn expand_input_ranges(ranges: &[InputClientRange]) -> Vec<InputSlotAssignment> {
+    let total = ranges.iter().map(|range| range.count).sum::<u64>();
+    let mut slots = Vec::with_capacity(total.min(usize::MAX as u64) as usize);
+    for range in ranges {
+        for label in 0..range.count {
+            slots.push(InputSlotAssignment {
+                client_index: range.client_index,
+                label,
+            });
+        }
+    }
+    slots
+}
+
 impl CoordinatorExecutionState {
     fn new(registration: ExecutionRegistration, n: u64) -> Result<Self, CoordinatorError> {
         if registration.execution_id.is_zero() {
@@ -1381,13 +1422,29 @@ impl CoordinatorExecutionState {
                 "program hash must be nonzero".to_string(),
             ));
         }
-        if !registration.input_assignment.input_slots.is_empty()
-            && registration.n_inputs as usize != registration.input_assignment.input_slots.len()
+        let ranges_total: u64 = registration
+            .input_assignment
+            .ranges
+            .iter()
+            .map(|range| range.count)
+            .sum();
+        if !registration.input_assignment.ranges.is_empty() && registration.n_inputs != ranges_total
         {
             return Err(CoordinatorError::JSONError(format!(
-                "Input assignment has {} inputs, but coordinator was configured with {} inputs",
-                registration.input_assignment.input_slots.len(),
+                "Input assignment covers {ranges_total} inputs, but coordinator was configured with {} inputs",
                 registration.n_inputs
+            )));
+        }
+        let n_clients = registration.input_assignment.clients.len();
+        if let Some(range) = registration
+            .input_assignment
+            .ranges
+            .iter()
+            .find(|range| range.client_index as usize >= n_clients)
+        {
+            return Err(CoordinatorError::JSONError(format!(
+                "Input range references client_index {}, but only {n_clients} clients were provided",
+                range.client_index
             )));
         }
         if registration.min_output_shares == 0 || registration.min_output_shares > n {
@@ -1420,8 +1477,19 @@ impl CoordinatorExecutionState {
             output_shares: HashMap::new(),
             output_sinks: HashMap::new(),
             output_clients: registration.output_clients.clone(),
-            input_assignments: registration.input_assignment.input_slots.clone(),
+            input_assignments: expand_input_ranges(&registration.input_assignment.ranges),
         })
+    }
+
+    /// Resolves an input slot's owning client identity. `client_index` is validated against
+    /// `input_assignment.clients` in `new`, so this only returns `None` for a slot that isn't
+    /// one of `self.input_assignments` (i.e. an out-of-range slot index, not an out-of-range
+    /// `client_index`).
+    fn input_slot_client(&self, slot: &InputSlotAssignment) -> Option<&ClientIdentity> {
+        self.registration
+            .input_assignment
+            .clients
+            .get(slot.client_index as usize)
     }
 
     async fn subscribe_reserved_indices(&mut self, sink: SubscriptionSink) -> SubscriptionResult {
@@ -1515,15 +1583,13 @@ impl CoordinatorExecutionState {
     /// True when this execution has no client inputs at all, so the two input rounds carry no
     /// work and `Preprocessing` advances straight to `MPCExecution`.
     fn skips_empty_input_rounds(&self, next_round: Round) -> bool {
-            self.round == Round::Preprocessing
-            && next_round == Round::MPCExecution
+        self.round == Round::Preprocessing && next_round == Round::MPCExecution
     }
 
     /// True when this execution has no output clients at all, so `OutputDistribution` carries no
     /// work and `MPCExecution` advances straight to `ProgramFinished`.
     fn skips_empty_output_rounds(&self, next_round: Round) -> bool {
-            self.round == Round::MPCExecution
-            && next_round == Round::ProgramFinished
+        self.round == Round::MPCExecution && next_round == Round::ProgramFinished
     }
 
     /// A reason the coordinator must not enter `next_round` yet, independent of how many parties
@@ -2185,12 +2251,13 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             // The duplicate-reservation check above only proves the index is free; assigned
             // input slots also need to be reserved by the client they were bound to.
             if let Some(slot) = d.input_assignments.get(i as usize) {
-                if slot.client != self.id {
+                let owner = d.input_slot_client(slot);
+                if owner != Some(&self.id) {
                     return Err(ErrorObjectOwned::owned(
                         ErrorCode::ServerError(UnauthorizedClientIo as i32).code(),
                         format!(
                             "Client {:?} cannot reserve assigned input index {}, which belongs to {:?}",
-                            self.id, i, slot.client
+                            self.id, i, owner
                         ),
                         None::<()>,
                     ));

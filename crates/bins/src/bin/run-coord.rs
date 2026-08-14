@@ -4,7 +4,7 @@ use std::fs;
 use stoffel_mpc_coordinator_off_chain::tests::fake_coord::HoneyBadgerCoordinatorConnection;
 use stoffel_mpc_coordinator_off_chain::{
     ClientIdentity, CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment,
-    InputSlotAssignment, OffChainCoordinatorServer, OneOffShutdownConfig,
+    InputClientRange, OffChainCoordinatorServer, OneOffShutdownConfig,
     DEFAULT_ONE_OFF_SHUTDOWN_GRACE,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
@@ -141,7 +141,8 @@ fn build_input_assignment(
     }
 
     let mut seen_clients = std::collections::HashSet::new();
-    let mut input_slots = Vec::new();
+    let mut clients = Vec::new();
+    let mut ranges = Vec::new();
     let mut output_clients = Vec::new();
     for (client, _client_slot, input_count, output_count) in bound_clients {
         if !seen_clients.insert(client.clone()) {
@@ -152,15 +153,20 @@ fn build_input_assignment(
         if output_count > 0 {
             output_clients.push(client.clone());
         }
-        for input_ordinal in 0..input_count {
-            input_slots.push(InputSlotAssignment {
-                client: client.clone(),
-                label: input_ordinal,
-            });
+        if input_count == 0 {
+            continue;
         }
+        let client_index = u32::try_from(clients.len()).map_err(|_| {
+            CoordinatorError::JSONError("too many distinct input clients".to_string())
+        })?;
+        clients.push(client);
+        ranges.push(InputClientRange {
+            client_index,
+            count: input_count,
+        });
     }
 
-    Ok((InputAssignment { input_slots }, output_clients))
+    Ok((InputAssignment { clients, ranges }, output_clients))
 }
 
 async fn run_coord<C>(
@@ -327,7 +333,11 @@ async fn main() {
                 let (input_assignment, output_clients) =
                     build_input_assignment(binary.client_io_manifest, client_bindings)
                         .expect("failed to bind client IO manifest");
-                let n_inputs = input_assignment.input_slots.len() as u64;
+                let n_inputs = input_assignment
+                    .ranges
+                    .iter()
+                    .map(|range| range.count)
+                    .sum::<u64>();
                 (mpc_backend, input_assignment, output_clients, n_inputs)
             } else {
                 let n_inputs = args
@@ -427,9 +437,12 @@ mod tests {
         let (bool_layout, bool_outputs) =
             build_input_assignment(bool_manifest, vec![(0, client.clone())]).unwrap();
 
-        assert_eq!(int_layout.input_slots[0].client, client);
-        assert_eq!(int_layout.input_slots[0].label, 0);
-        assert_eq!(int_layout.input_slots.len(), bool_layout.input_slots.len());
+        assert_eq!(
+            int_layout.clients[int_layout.ranges[0].client_index as usize],
+            client
+        );
+        assert_eq!(int_layout.ranges[0].count, 1);
+        assert_eq!(int_layout.ranges.len(), bool_layout.ranges.len());
         assert_eq!(int_outputs, bool_outputs);
     }
 
