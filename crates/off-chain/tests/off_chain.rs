@@ -8,7 +8,7 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
 };
 use stoffel_mpc_coordinator_off_chain::{
     AssignedMaskReservation, CoordinatorRPCBaseClient, ExecutionRegistration, InputAssignment,
-    OneOffShutdownConfig,
+    OneOffShutdownConfig, DEFAULT_MAX_CONCURRENT_EXECUTIONS,
 };
 use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{
@@ -672,7 +672,7 @@ async fn mpc_execution_waits_for_every_masked_input() {
 }
 
 #[tokio::test]
-async fn retirement_releases_capacity_without_unanimous_acknowledgement() {
+async fn retirement_drains_healthy_stragglers_without_pinning_capacity() {
     stoffel_mpc_coordinator_shared::setup_test();
 
     let certs = (0..5).map(|_| server_cert()).collect::<Vec<_>>();
@@ -690,11 +690,39 @@ async fn retirement_releases_capacity_without_unanimous_acknowledgement() {
 
     assert!(
         state.is_retired(execution_id),
-        "n - t acknowledgements must seal the execution and free its registration slot"
+        "n - t acknowledgements must make the execution reclaimable"
+    );
+    assert!(
+        state.round(execution_id).is_some(),
+        "round history must remain available to a healthy straggler"
     );
 
-    // Re-registering the same id proves the slot was released rather than pinned by the silent
-    // party, and the straggler's eventual acknowledgement must still be accepted.
+    // A genuinely absent party cannot pin admission forever. Fill every remaining slot, then
+    // prove the next registration compacts the only quorum-retired execution.
+    let registration = |number: usize| {
+        let mut bytes = [0u8; 32];
+        bytes[24..].copy_from_slice(&(number as u64).to_be_bytes());
+        ExecutionRegistration {
+            execution_id: ExecutionId::from_bytes(bytes),
+            program_hash: [1; 32],
+            n_inputs: 0,
+            output_clients: vec![],
+            input_assignment: InputAssignment::default(),
+            min_output_shares: 4,
+        }
+    };
+    for number in 1..DEFAULT_MAX_CONCURRENT_EXECUTIONS {
+        state.register_execution(registration(number)).unwrap();
+    }
+    state
+        .register_execution(registration(DEFAULT_MAX_CONCURRENT_EXECUTIONS))
+        .expect("capacity pressure must compact a quorum-retired execution");
+    assert!(
+        state.round(execution_id).is_none(),
+        "capacity reclamation must release the complete execution state"
+    );
+
+    // The straggler's eventual acknowledgement still drains the bounded tombstone.
     state
         .retire_execution(execution_id, &public_keys[4])
         .expect("a late acknowledgement must not fail");

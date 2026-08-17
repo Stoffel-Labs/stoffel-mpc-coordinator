@@ -1214,10 +1214,32 @@ impl CoordinatorRPCServerSharedBase {
             )));
         }
         if self.executions.len() >= DEFAULT_MAX_CONCURRENT_EXECUTIONS {
-            return Err(CoordinatorError::JSONError(format!(
-                "Execution capacity {} reached",
-                DEFAULT_MAX_CONCURRENT_EXECUTIONS
-            )));
+            // Healthy stragglers need the completed round history until they have also reached
+            // ProgramFinished. Keep that history during normal operation, and only compact a
+            // quorum-retired execution when its slot is actually needed. This preserves bounded
+            // memory without racing a live fifth party merely because the first `n - t` parties
+            // finished slightly earlier.
+            let retirement_quorum = self.retirement_quorum();
+            let evictable = self
+                .executions
+                .iter()
+                .find_map(|(execution_id, execution)| {
+                    (self.one_off_execution != Some(*execution_id)
+                        && execution.retirement_acks.len() >= retirement_quorum)
+                        .then_some(*execution_id)
+                });
+            if let Some(execution_id) = evictable {
+                let execution = self
+                    .executions
+                    .remove(&execution_id)
+                    .expect("eviction candidate came from the execution map");
+                self.retired.seal(execution_id, execution.retirement_acks);
+            } else {
+                return Err(CoordinatorError::JSONError(format!(
+                    "Execution capacity {} reached",
+                    DEFAULT_MAX_CONCURRENT_EXECUTIONS
+                )));
+            }
         }
         let execution = CoordinatorExecutionState::new(registration.clone(), self.n)?;
         self.executions.insert(registration.execution_id, execution);
@@ -1248,15 +1270,11 @@ impl CoordinatorRPCServerSharedBase {
 
     /// Acknowledges that `party` has finished with `execution_id`.
     ///
-    /// Retirement happens in two stages. Once `n - t` parties have acknowledged, the execution's
-    /// protocol state is dropped and its registration slot is released, because at that point the
-    /// execution is terminal for every party that is still reachable. A small record of the
-    /// acknowledging identities is kept so a slow party can still retire without error; that
-    /// record is forgotten on unanimity, or evicted oldest-first if faulty parties never send it.
-    ///
-    /// Waiting for all `n` acknowledgements instead would let a single silent party pin an
-    /// execution — and, once `DEFAULT_MAX_CONCURRENT_EXECUTIONS` of them accumulate, block every
-    /// subsequent registration.
+    /// Retirement happens in two stages. Once `n - t` parties have acknowledged, the execution is
+    /// eligible for capacity reclamation, but its complete round history stays live so a healthy
+    /// straggler can still finish. Unanimity removes it immediately. If faulty parties leave the
+    /// coordinator at capacity, registration compacts a quorum-retired execution into a bounded
+    /// acknowledgement-only tombstone before admitting new work.
     pub fn retire_execution(
         &mut self,
         execution_id: ExecutionId,
@@ -1270,15 +1288,6 @@ impl CoordinatorRPCServerSharedBase {
                 "Only configured MPC parties can retire executions".to_owned(),
             ));
         }
-        // A standing coordinator may release bulky execution state at `n - t` and retain a small
-        // tombstone for stragglers. A one-off coordinator is about to exit anyway, so retaining the
-        // complete round history until unanimity lets a healthy but slow party replay every round
-        // it missed instead of observing ExecutionNotFound or a closed WebSocket.
-        let quorum = if self.one_off_execution == Some(execution_id) {
-            self.n as usize
-        } else {
-            self.retirement_quorum()
-        };
         let n = self.mpc_nodes.len();
         if self.retired.acknowledge(execution_id, party, n) {
             return Ok(());
@@ -1289,19 +1298,18 @@ impl CoordinatorRPCServerSharedBase {
             return Ok(());
         };
         execution.retirement_acks.insert(party.clone());
-        if execution.retirement_acks.len() >= quorum {
-            let acks = execution.retirement_acks.clone();
+        if execution.retirement_acks.len() >= n {
             self.executions.remove(&execution_id);
-            if acks.len() < n {
-                self.retired.seal(execution_id, acks);
-            }
         }
         Ok(())
     }
 
-    /// Whether `execution_id` has been sealed by the retirement quorum but not yet forgotten.
+    /// Whether `execution_id` has reached its retirement quorum but not yet been forgotten.
     pub fn is_retired(&self, execution_id: ExecutionId) -> bool {
         self.retired.contains(execution_id)
+            || self.executions.get(&execution_id).is_some_and(|execution| {
+                execution.retirement_acks.len() >= self.retirement_quorum()
+            })
     }
 
     fn retirement_progress(&self, execution_id: ExecutionId) -> (usize, usize, bool) {
