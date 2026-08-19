@@ -1089,6 +1089,9 @@ struct CoordinatorExecutionState {
     reserved_index_sinks: Vec<SubscriptionSink>,
     assigned_reserved_index_events: Vec<AssignedMaskReservation>,
     assigned_reserved_index_sinks: Vec<SubscriptionSink>,
+    /// Serializes reservation broadcasts without holding the coordinator-wide
+    /// execution-state mutex across subscription I/O.
+    reserved_index_delivery: Arc<Mutex<()>>,
     masked_input_events: Vec<Event>,
     masked_input_sinks: Vec<SubscriptionSink>,
     assigned_masked_input_events: Vec<AssignedMaskedInputEvent>,
@@ -1465,6 +1468,7 @@ impl CoordinatorExecutionState {
             reserved_index_sinks: vec![],
             assigned_reserved_index_events: vec![],
             assigned_reserved_index_sinks: vec![],
+            reserved_index_delivery: Arc::new(Mutex::new(())),
             masked_input_events: vec![],
             masked_input_sinks: vec![],
             assigned_masked_input_events: vec![],
@@ -2185,6 +2189,13 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         execution_id: ExecutionId,
         indices: Vec<u64>,
     ) -> RpcResult<()> {
+        let delivery = {
+            let d = self.execution_state(execution_id).await?;
+            d.reserved_index_delivery.clone()
+        };
+        // Preserve broadcast order while allowing unrelated coordinator RPCs
+        // and executions to progress during subscription delivery.
+        let _delivery_guard = delivery.lock().await;
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputMaskReservation {
@@ -2289,17 +2300,40 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         d.assigned_reserved_index_events
             .extend(assigned_reservations.iter().cloned());
 
-        // Broadcast the batch to all subscribed RPC clients concurrently -- sequential sends
-        // here would hold the coordinator-wide execution lock for as long as the slowest
-        // subscriber takes to drain its socket, stalling every other execution and client on
-        // this coordinator. Disconnected subscribers are pruned; late/restarted nodes replay
-        // from event history.
+        // Snapshot the sinks under the state lock, then release it before any WebSocket I/O --
+        // holding it across the broadcast below would stall every other execution and client on
+        // this coordinator for as long as the slowest subscriber takes to drain its socket (or
+        // times out). The per-execution delivery guard above prevents a concurrent reservation
+        // from observing the temporarily empty sink lists or interleaving its own broadcast.
         let sinks = std::mem::take(&mut d.reserved_index_sinks);
+        let assigned_sinks = if assigned_reservations.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut d.assigned_reserved_index_sinks)
+        };
+        drop(d);
+
         let results = futures_util::future::join_all(sinks.iter().map(|sink| {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
             tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
         }))
         .await;
+        let assigned_results = if assigned_sinks.is_empty() {
+            Vec::new()
+        } else {
+            futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
+                let json =
+                    to_json_raw_value(&assigned_reservations).expect("failed convert to JSON");
+                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
+            }))
+            .await
+        };
+
+        let Ok(mut d) = self.execution_state(execution_id).await else {
+            // Delivery completed, but the execution was retired before its
+            // subscription lists could be pruned.
+            return Ok(());
+        };
         for (sink, result) in sinks.into_iter().zip(results) {
             if matches!(result, Ok(Ok(()))) {
                 d.reserved_index_sinks.push(sink);
@@ -2307,22 +2341,13 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                 eprintln!("coordinator reserved-index subscriber disconnected or timed out");
             }
         }
-        if !assigned_reservations.is_empty() {
-            let assigned_sinks = std::mem::take(&mut d.assigned_reserved_index_sinks);
-            let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
-                let json =
-                    to_json_raw_value(&assigned_reservations).expect("failed convert to JSON");
-                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
-            }))
-            .await;
-            for (sink, result) in assigned_sinks.into_iter().zip(results) {
-                if matches!(result, Ok(Ok(()))) {
-                    d.assigned_reserved_index_sinks.push(sink);
-                } else {
-                    eprintln!(
-                        "coordinator assigned reserved-index subscriber disconnected or timed out"
-                    );
-                }
+        for (sink, result) in assigned_sinks.into_iter().zip(assigned_results) {
+            if matches!(result, Ok(Ok(()))) {
+                d.assigned_reserved_index_sinks.push(sink);
+            } else {
+                eprintln!(
+                    "coordinator assigned reserved-index subscriber disconnected or timed out"
+                );
             }
         }
 
