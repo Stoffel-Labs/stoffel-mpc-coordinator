@@ -24,6 +24,7 @@ use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use stoffel_mpc_coordinator_shared::{
     round_before, round_index, rpc::RPCServerHandle, Coordinator, CoordinatorError, ExecutionId,
@@ -1093,14 +1094,55 @@ pub struct CoordinatorRPCServerConnectionBase {
     d: Arc<Mutex<CoordinatorRPCServerSharedBase>>,
     /// The connected client's identity, which is the client's public key in DER format.
     id: ClientIdentity,
+    /// Lazily populated on this connection's first roster read and reused for every RPC call
+    /// after that, so a connection takes the coordinator-wide mutex for the immutable roster at
+    /// most once, instead of once per call. See `Roster` for why this is sound.
+    roster: Arc<OnceLock<Arc<Roster>>>,
+}
+
+/// The MPC node roster and threshold, fixed for the lifetime of a `CoordinatorRPCServerSharedBase`
+/// (there is no method that mutates `mpc_nodes`, `n`, or `t` after `CoordinatorRPCServerSharedBase::new`).
+/// Held behind an `Arc` rather than as plain fields so that `CoordinatorRPCServerConnectionBase` can
+/// cache its own clone after the first read and stop taking the coordinator-wide mutex for roster
+/// reads entirely -- see `CoordinatorRPCServerConnectionBase::roster`.
+struct Roster {
+    mpc_nodes: Vec<ClientIdentity>,
+    n: u64,
+    t: u64,
+}
+
+impl Roster {
+    /// How many distinct parties must propose a round transition before it is applied.
+    ///
+    /// The upper bound is the liveness bound `n - t`: requiring more than that would let `t`
+    /// faulty parties halt every execution simply by staying silent, which is the failure this
+    /// quorum exists to remove. Within that bound we prefer the honest-majority quorum `2t + 1`.
+    /// The lower bound `t + 1` guarantees at least one honest proposer, so a colluding minority
+    /// can never advance a round on its own.
+    ///
+    /// Note that a quorum is not what makes an early transition *safe* — a quorum containing a
+    /// single honest party is still enough to advance. Safety comes from the coordinator-side
+    /// preconditions checked in `blocking_precondition`; the quorum is what removes the single
+    /// designated proposer as a point of failure.
+    fn transition_quorum(&self) -> usize {
+        let liveness_bound = (self.n - self.t) as usize;
+        let honest_majority = (2 * self.t + 1) as usize;
+        honest_majority
+            .min(liveness_bound)
+            .max((self.t + 1) as usize)
+    }
+
+    /// How many parties must acknowledge completion before an execution's protocol state is
+    /// dropped. Bounded by `n - t` for the same reason as [`Self::transition_quorum`].
+    fn retirement_quorum(&self) -> usize {
+        (self.n - self.t) as usize
+    }
 }
 
 /// The basic internal state of the coordinator RPC server.
 /// Can be extended by the developer.
 pub struct CoordinatorRPCServerSharedBase {
-    mpc_nodes: Vec<ClientIdentity>,
-    n: u64,
-    t: u64,
+    roster: Arc<Roster>,
     executions: HashMap<ExecutionId, ExecutionEntry>,
     /// Set by one-off coordinator invocations via `watch_for_shutdown_request`. Fired by the
     /// `request_shutdown` RPC method; absent (and thus rejecting shutdown requests) for standing
@@ -1274,7 +1316,27 @@ async fn deliver_transitions(deliveries: Vec<TransitionDelivery>) {
 
 impl CoordinatorRPCServerConnectionBase {
     pub fn new(internal: Arc<Mutex<CoordinatorRPCServerSharedBase>>, id: ClientIdentity) -> Self {
-        Self { d: internal, id }
+        Self {
+            d: internal,
+            id,
+            roster: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Returns this coordinator's roster, taking the coordinator-wide mutex on this
+    /// connection's first call and reusing that result (via the shared `OnceLock`) for every
+    /// call after that. Sound because `Roster` is fixed for the lifetime of the shared state --
+    /// see `Roster`'s doc comment.
+    async fn roster(&self) -> Arc<Roster> {
+        if let Some(roster) = self.roster.get() {
+            return roster.clone();
+        }
+        let roster = self.d.lock().await.roster.clone();
+        // Lost a race with another call on this same connection: harmless, since both computed
+        // the same immutable roster. Whichever value ends up cached, use ours -- no need to
+        // re-read the one that won.
+        let _ = self.roster.set(roster.clone());
+        roster
     }
 
     /// Locks only the target execution's state, not the coordinator-wide map: the outer lock is
@@ -1305,40 +1367,16 @@ impl CoordinatorRPCServerSharedBase {
     ) -> Result<Self, CoordinatorError> {
         validate_topology(n, t, &initial_mpc_nodes)?;
         Ok(Self {
-            mpc_nodes: initial_mpc_nodes,
-            n,
-            t,
+            roster: Arc::new(Roster {
+                mpc_nodes: initial_mpc_nodes,
+                n,
+                t,
+            }),
             executions: HashMap::new(),
             shutdown_notify: None,
             one_off_execution: None,
             retired: RetiredExecutions::default(),
         })
-    }
-
-    /// How many distinct parties must propose a round transition before it is applied.
-    ///
-    /// The upper bound is the liveness bound `n - t`: requiring more than that would let `t`
-    /// faulty parties halt every execution simply by staying silent, which is the failure this
-    /// quorum exists to remove. Within that bound we prefer the honest-majority quorum `2t + 1`.
-    /// The lower bound `t + 1` guarantees at least one honest proposer, so a colluding minority
-    /// can never advance a round on its own.
-    ///
-    /// Note that a quorum is not what makes an early transition *safe* — a quorum containing a
-    /// single honest party is still enough to advance. Safety comes from the coordinator-side
-    /// preconditions checked in `blocking_precondition`; the quorum is what removes the single
-    /// designated proposer as a point of failure.
-    fn transition_quorum(&self) -> usize {
-        let liveness_bound = (self.n - self.t) as usize;
-        let honest_majority = (2 * self.t + 1) as usize;
-        honest_majority
-            .min(liveness_bound)
-            .max((self.t + 1) as usize)
-    }
-
-    /// How many parties must acknowledge completion before an execution's protocol state is
-    /// dropped. Bounded by `n - t` for the same reason as [`Self::transition_quorum`].
-    fn retirement_quorum(&self) -> usize {
-        (self.n - self.t) as usize
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1387,7 +1425,7 @@ impl CoordinatorRPCServerSharedBase {
             // quorum-retired execution when its slot is actually needed. This preserves bounded
             // memory without racing a live fifth party merely because the first `n - t` parties
             // finished slightly earlier.
-            let retirement_quorum = self.retirement_quorum();
+            let retirement_quorum = self.roster.retirement_quorum();
             let evictable = self.executions.iter().find_map(|(execution_id, entry)| {
                 (self.one_off_execution != Some(*execution_id)
                     && entry.retirement_acks.len() >= retirement_quorum)
@@ -1408,7 +1446,7 @@ impl CoordinatorRPCServerSharedBase {
         }
         let execution_id = registration.execution_id;
         let entry_registration = registration.clone();
-        let execution = CoordinatorExecutionState::new(registration, self.n)?;
+        let execution = CoordinatorExecutionState::new(registration, self.roster.n)?;
         self.executions.insert(
             execution_id,
             ExecutionEntry {
@@ -1457,12 +1495,12 @@ impl CoordinatorRPCServerSharedBase {
         // The RPC entry point already rejects non-parties, but this is a public method and the
         // acknowledgement count is a quorum: counting an identity that is not on the roster would
         // let one party's acknowledgements stand in for several.
-        if !self.mpc_nodes.contains(party) {
+        if !self.roster.mpc_nodes.contains(party) {
             return Err(CoordinatorError::JSONError(
                 "Only configured MPC parties can retire executions".to_owned(),
             ));
         }
-        let n = self.mpc_nodes.len();
+        let n = self.roster.mpc_nodes.len();
         if self.retired.acknowledge(execution_id, party, n) {
             return Ok(());
         }
@@ -1484,11 +1522,11 @@ impl CoordinatorRPCServerSharedBase {
             || self
                 .executions
                 .get(&execution_id)
-                .is_some_and(|entry| entry.retirement_acks.len() >= self.retirement_quorum())
+                .is_some_and(|entry| entry.retirement_acks.len() >= self.roster.retirement_quorum())
     }
 
     fn retirement_progress(&self, execution_id: ExecutionId) -> (usize, usize, bool) {
-        let n = self.mpc_nodes.len();
+        let n = self.roster.mpc_nodes.len();
         if let Some(execution) = self.executions.get(&execution_id) {
             return (execution.retirement_acks.len(), n, false);
         }
@@ -1925,7 +1963,7 @@ async fn deliver_ready_output_waiters(
 impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     async fn register_execution(&self, registration: ExecutionRegistration) -> RpcResult<()> {
         let mut shared = self.d.lock().await;
-        if !shared.mpc_nodes.contains(&self.id) {
+        if !shared.roster.mpc_nodes.contains(&self.id) {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(NotParty as i32).code(),
                 "Only configured MPC parties can register executions.",
@@ -1943,7 +1981,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
 
     async fn retire_execution(&self, execution_id: ExecutionId) -> RpcResult<()> {
         let mut shared = self.d.lock().await;
-        if !shared.mpc_nodes.contains(&self.id) {
+        if !shared.roster.mpc_nodes.contains(&self.id) {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(NotParty as i32).code(),
                 "Only configured MPC parties can retire executions.",
@@ -1963,7 +2001,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
 
     async fn request_shutdown(&self) -> RpcResult<()> {
         let mut shared = self.d.lock().await;
-        let designated_party = shared.mpc_nodes[0].clone();
+        let designated_party = shared.roster.mpc_nodes[0].clone();
         if self.id != designated_party {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(NotDesignatedParty as i32).code(),
@@ -2117,10 +2155,8 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         masked_inputs: Vec<WireBytes>,
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()> {
-        let (quorum, roster_head) = {
-            let shared = self.d.lock().await;
-            (shared.transition_quorum(), shared.mpc_nodes[0].clone())
-        };
+        let roster = self.roster().await;
+        let (quorum, roster_head) = (roster.transition_quorum(), roster.mpc_nodes[0].clone());
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputCollection {
@@ -2455,14 +2491,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     /// (or if) it becomes both current and supported. Callers therefore do not need to know how
     /// far the coordinator has progressed.
     async fn transition(&self, execution_id: ExecutionId, next_round: Round) -> RpcResult<()> {
-        let (is_party, quorum, roster_head) = {
-            let shared = self.d.lock().await;
-            (
-                shared.mpc_nodes.contains(&self.id),
-                shared.transition_quorum(),
-                shared.mpc_nodes[0].clone(),
-            )
-        };
+        let roster = self.roster().await;
+        let (is_party, quorum, roster_head) = (
+            roster.mpc_nodes.contains(&self.id),
+            roster.transition_quorum(),
+            roster.mpc_nodes[0].clone(),
+        );
 
         if !is_party {
             return Err(ErrorObjectOwned::owned(
@@ -2503,10 +2537,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         client_id: ClientIdentity,
         enc_shares: EncryptedOutputShares,
     ) -> RpcResult<()> {
-        let is_party = {
-            let shared = self.d.lock().await;
-            shared.mpc_nodes.contains(&self.id)
-        };
+        let is_party = self.roster().await.mpc_nodes.contains(&self.id);
         let mut d = self.execution_state(execution_id).await?;
 
         if !is_party {
@@ -2621,7 +2652,7 @@ impl stoffel_mpc_coordinator_shared::rpc::RPCServerConnection
     type Internal = CoordinatorRPCServerSharedBase;
 
     fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
-        Self { d: internal, id }
+        Self::new(internal, id)
     }
 
     fn into_rpc(self) -> RpcModule<Self> {
