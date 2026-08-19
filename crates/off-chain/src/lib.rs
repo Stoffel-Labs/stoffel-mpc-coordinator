@@ -27,7 +27,7 @@ use stoffel_mpc_coordinator_shared::{
     round_before, round_index, rpc::RPCServerHandle, Coordinator, CoordinatorError, ExecutionId,
     Round, ShareBound,
 };
-use tokio::sync::{oneshot, MappedMutexGuard, Mutex, MutexGuard};
+use tokio::sync::{oneshot, Mutex, OwnedMutexGuard};
 use CoordinatorRPCBaseError::*;
 
 /// KEM, KDF, and AEAD instantiations are needed to encrypt the output shares for an MPC client
@@ -1022,7 +1022,7 @@ pub struct CoordinatorRPCServerSharedBase {
     mpc_nodes: Vec<ClientIdentity>,
     n: u64,
     t: u64,
-    executions: HashMap<ExecutionId, CoordinatorExecutionState>,
+    executions: HashMap<ExecutionId, ExecutionEntry>,
     /// Set by one-off coordinator invocations via `watch_for_shutdown_request`. Fired by the
     /// `request_shutdown` RPC method; absent (and thus rejecting shutdown requests) for standing
     /// coordinators.
@@ -1075,10 +1075,30 @@ impl RetiredExecutions {
     }
 }
 
-/// All mutable protocol state for one program invocation.
-struct CoordinatorExecutionState {
+/// One execution's entry in the coordinator-wide map. `registration` and `retirement_acks` are
+/// read and written under the outer `CoordinatorRPCServerSharedBase` mutex only -- they're small,
+/// touched only by admission/retirement bookkeeping, and (for `registration`) immutable after
+/// insertion, so giving them their own per-execution lock would only add overhead. `state` holds
+/// everything that changes during the protocol (rounds, reservations, subscriptions, ...) behind
+/// its own lock, so that one execution's work never blocks another's, or blocks admission and
+/// retirement of unrelated executions.
+struct ExecutionEntry {
     registration: ExecutionRegistration,
     retirement_acks: HashSet<ClientIdentity>,
+    state: Arc<Mutex<CoordinatorExecutionState>>,
+}
+
+/// All mutable protocol state for one program invocation. Reached only through its own
+/// `Arc<Mutex<_>>` in `ExecutionEntry::state` -- never nest a lock acquisition for a *different*
+/// execution's state, or for the outer `CoordinatorRPCServerSharedBase`, inside a critical section
+/// that already holds this lock, or a future waiting on one execution's lock could be blocked
+/// behind a future that's waiting on the other, with neither able to proceed.
+struct CoordinatorExecutionState {
+    /// Duplicated from `ExecutionEntry::registration` so that code already holding this
+    /// execution's lock (i.e. everything reached via `CoordinatorRPCServerConnectionBase::
+    /// execution_state`) doesn't need the outer lock too. Safe because it's immutable after
+    /// `CoordinatorExecutionState::new`.
+    registration: ExecutionRegistration,
     /// Parties that have proposed each round transition. A round is applied once its proposer
     /// set reaches the transition quorum, which replaces the previous single designated proposer.
     transition_votes: HashMap<Round, HashSet<ClientIdentity>>,
@@ -1139,20 +1159,23 @@ impl CoordinatorRPCServerConnectionBase {
         Self { d: internal, id }
     }
 
+    /// Locks only the target execution's state, not the coordinator-wide map: the outer lock is
+    /// held just long enough to look up and clone the execution's `Arc`, so unrelated executions
+    /// (and admission/retirement of other executions) are never blocked behind whatever the
+    /// caller does with the returned guard.
     async fn execution_state(
         &self,
         execution_id: ExecutionId,
-    ) -> Result<MappedMutexGuard<'_, CoordinatorExecutionState>, ErrorObjectOwned> {
-        let shared = self.d.lock().await;
-        if !shared.executions.contains_key(&execution_id) {
-            return Err(execution_not_found(execution_id));
-        }
-        Ok(MutexGuard::map(shared, |shared| {
+    ) -> Result<OwnedMutexGuard<CoordinatorExecutionState>, ErrorObjectOwned> {
+        let state = {
+            let shared = self.d.lock().await;
             shared
                 .executions
-                .get_mut(&execution_id)
-                .expect("execution presence checked before mapping")
-        }))
+                .get(&execution_id)
+                .map(|entry| entry.state.clone())
+                .ok_or_else(|| execution_not_found(execution_id))?
+        };
+        Ok(state.lock_owned().await)
     }
 }
 
@@ -1247,20 +1270,17 @@ impl CoordinatorRPCServerSharedBase {
             // memory without racing a live fifth party merely because the first `n - t` parties
             // finished slightly earlier.
             let retirement_quorum = self.retirement_quorum();
-            let evictable = self
-                .executions
-                .iter()
-                .find_map(|(execution_id, execution)| {
-                    (self.one_off_execution != Some(*execution_id)
-                        && execution.retirement_acks.len() >= retirement_quorum)
-                        .then_some(*execution_id)
-                });
+            let evictable = self.executions.iter().find_map(|(execution_id, entry)| {
+                (self.one_off_execution != Some(*execution_id)
+                    && entry.retirement_acks.len() >= retirement_quorum)
+                    .then_some(*execution_id)
+            });
             if let Some(execution_id) = evictable {
-                let execution = self
+                let entry = self
                     .executions
                     .remove(&execution_id)
                     .expect("eviction candidate came from the execution map");
-                self.retired.seal(execution_id, execution.retirement_acks);
+                self.retired.seal(execution_id, entry.retirement_acks);
             } else {
                 return Err(CoordinatorError::JSONError(format!(
                     "Execution capacity {} reached",
@@ -1268,17 +1288,26 @@ impl CoordinatorRPCServerSharedBase {
                 )));
             }
         }
-        let execution = CoordinatorExecutionState::new(registration.clone(), self.n)?;
-        self.executions.insert(registration.execution_id, execution);
+        let execution_id = registration.execution_id;
+        let entry_registration = registration.clone();
+        let execution = CoordinatorExecutionState::new(registration, self.n)?;
+        self.executions.insert(
+            execution_id,
+            ExecutionEntry {
+                registration: entry_registration,
+                retirement_acks: HashSet::new(),
+                state: Arc::new(Mutex::new(execution)),
+            },
+        );
         Ok(())
     }
 
     /// Returns the current round of the given execution, or `None` if it is not registered
     /// (either because it never was, or because it has already been retired).
-    pub fn round(&self, execution_id: ExecutionId) -> Option<Round> {
-        self.executions
-            .get(&execution_id)
-            .map(|execution| execution.round)
+    pub async fn round(&self, execution_id: ExecutionId) -> Option<Round> {
+        let state = self.executions.get(&execution_id)?.state.clone();
+        let round = state.lock().await.round;
+        Some(round)
     }
 
     /// Returns a receiver that resolves once a party calls the `request_shutdown` RPC method.
@@ -1319,13 +1348,13 @@ impl CoordinatorRPCServerSharedBase {
         if self.retired.acknowledge(execution_id, party, n) {
             return Ok(());
         }
-        let Some(execution) = self.executions.get_mut(&execution_id) else {
+        let Some(entry) = self.executions.get_mut(&execution_id) else {
             // Already retired and forgotten. Acknowledging twice is not an error: a party that
             // retries after a lost connection must not see its cleanup fail.
             return Ok(());
         };
-        execution.retirement_acks.insert(party.clone());
-        if execution.retirement_acks.len() >= n {
+        entry.retirement_acks.insert(party.clone());
+        if entry.retirement_acks.len() >= n {
             self.executions.remove(&execution_id);
         }
         Ok(())
@@ -1334,9 +1363,10 @@ impl CoordinatorRPCServerSharedBase {
     /// Whether `execution_id` has reached its retirement quorum but not yet been forgotten.
     pub fn is_retired(&self, execution_id: ExecutionId) -> bool {
         self.retired.contains(execution_id)
-            || self.executions.get(&execution_id).is_some_and(|execution| {
-                execution.retirement_acks.len() >= self.retirement_quorum()
-            })
+            || self
+                .executions
+                .get(&execution_id)
+                .is_some_and(|entry| entry.retirement_acks.len() >= self.retirement_quorum())
     }
 
     fn retirement_progress(&self, execution_id: ExecutionId) -> (usize, usize, bool) {
@@ -1460,7 +1490,6 @@ impl CoordinatorExecutionState {
             .map_err(|_| CoordinatorError::U64ToUsizeError)?;
         Ok(Self {
             registration: registration.clone(),
-            retirement_acks: HashSet::new(),
             transition_votes: HashMap::new(),
             sinks: HashMap::new(),
             trans_events: HashMap::new(),
@@ -1737,28 +1766,35 @@ async fn deliver_ready_output_waiters(
     client_id: &ClientIdentity,
     min_shares: usize,
 ) {
-    let Some((waiter, output_shares)) = ({
-        let mut shared = shared.lock().await;
+    // Look the execution's state up under the coordinator-wide lock, then release it: every
+    // access below goes through the per-execution lock, so this never blocks other executions.
+    let state = {
+        let shared = shared.lock().await;
         shared
             .executions
-            .get_mut(&execution_id)
+            .get(&execution_id)
             .expect("output execution remains registered")
-            .ready_output_snapshot(client_id, min_shares)
-    }) else {
+            .state
+            .clone()
+    };
+
+    let snapshot = state
+        .lock()
+        .await
+        .ready_output_snapshot(client_id, min_shares);
+    let Some((waiter, output_shares)) = snapshot else {
         return;
     };
 
     let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
     if waiter.send(json).await.is_err() {
-        let mut shared = shared.lock().await;
-        if let Some(execution) = shared.executions.get_mut(&execution_id) {
-            if execution
-                .output_sinks
-                .get(client_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &waiter))
-            {
-                execution.output_sinks.remove(client_id);
-            }
+        let mut execution = state.lock().await;
+        if execution
+            .output_sinks
+            .get(client_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &waiter))
+        {
+            execution.output_sinks.remove(client_id);
         }
     }
 }
@@ -1821,7 +1857,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                 None::<()>,
             ));
         };
-        if shared.round(execution_id) != Some(Round::ProgramFinished) {
+        if shared.round(execution_id).await != Some(Round::ProgramFinished) {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(WrongRound as i32).code(),
                 "The one-off coordinator cannot shut down before ProgramFinished.",

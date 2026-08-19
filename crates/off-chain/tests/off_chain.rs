@@ -693,7 +693,7 @@ async fn retirement_drains_healthy_stragglers_without_pinning_capacity() {
         "n - t acknowledgements must make the execution reclaimable"
     );
     assert!(
-        state.round(execution_id).is_some(),
+        state.round(execution_id).await.is_some(),
         "round history must remain available to a healthy straggler"
     );
 
@@ -718,7 +718,7 @@ async fn retirement_drains_healthy_stragglers_without_pinning_capacity() {
         .register_execution(registration(DEFAULT_MAX_CONCURRENT_EXECUTIONS))
         .expect("capacity pressure must compact a quorum-retired execution");
     assert!(
-        state.round(execution_id).is_none(),
+        state.round(execution_id).await.is_none(),
         "capacity reclamation must release the complete execution state"
     );
 
