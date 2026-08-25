@@ -299,7 +299,7 @@ pub mod node_rpc {
                 }
             }
 
-            let mut outputs = Vec::with_capacity(share_sets.len());
+            let mut shares_by_index = Vec::with_capacity(share_sets.len());
             for reserved_index in expected_indices {
                 let Some(mask_shares) = share_sets.remove(&reserved_index) else {
                     return Err(CoordinatorError::MaskReconstructionFailed(0));
@@ -309,12 +309,16 @@ pub mod node_rpc {
                         mask_shares.len(),
                     ));
                 }
-                let (_, mask) = S::recover_secret(&mask_shares, self.n, self.t)
-                    .map_err(|_| CoordinatorError::MaskReconstructionFailed(mask_shares.len()))?;
-                outputs.push(mask);
+                shares_by_index.push(mask_shares);
             }
+            let share_count = shares_by_index.first().map_or(0, Vec::len);
 
-            Ok(outputs)
+            // Every entry's shares come from the same senders: each node's subscription answers
+            // for this whole range in one message (checked above), or not at all. That is what
+            // `batch_recover_secret` requires, and what lets it amortize the interpolation setup
+            // across the whole batch instead of redoing it per index.
+            S::batch_recover_secret(&shares_by_index, self.n, self.t)
+                .map_err(|_| CoordinatorError::MaskReconstructionFailed(share_count))
         }
     }
 
