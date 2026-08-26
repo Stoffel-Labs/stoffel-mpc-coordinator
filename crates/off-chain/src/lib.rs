@@ -193,6 +193,9 @@ pub mod node_rpc {
     pub struct NodeRPCClient<F: FftField, S: ShareBound<F>> {
         /// The per-node client handles for each connection to a node.
         node_rpcs: Vec<Client>,
+        /// The address of each entry in `node_rpcs`, same order -- kept only so
+        /// `receive_assigned_masks` can name a node in its timing diagnostics.
+        addrs: Vec<(String, u16)>,
         /// Total number of MPC nodes in the network (used for share reconstruction).
         n: usize,
         /// The threshold value.
@@ -226,6 +229,7 @@ pub mod node_rpc {
 
             Ok(Self {
                 node_rpcs,
+                addrs,
                 n,
                 t,
                 execution_id,
@@ -244,21 +248,43 @@ pub mod node_rpc {
             if count == 0 {
                 return Ok(Vec::new());
             }
+
+            // Diagnostic timing only: splits this call's wall time into (a) issuing the n
+            // subscription requests, (b) waiting on each node's response individually, and
+            // (c) reconstruction, so a slow `receive_assigned_masks` can be attributed to a
+            // specific node or to network wait vs. compute instead of only seeing the total.
+            let t0 = std::time::Instant::now();
+            eprintln!(
+                "[receive_assigned_masks] start={start} count={count} nodes={} at +{:.3}s",
+                self.node_rpcs.len(),
+                t0.elapsed().as_secs_f64()
+            );
+
             let mut share_futures = JoinSet::new();
 
-            for rpc in self.node_rpcs.iter() {
+            for (idx, rpc) in self.node_rpcs.iter().enumerate() {
                 let mut sub = rpc
                     .receive_assigned_mask_shares(self.execution_id, start, count)
                     .await
                     .map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
-                share_futures.spawn(async move { sub.next().await });
+                let (addr, port) = self
+                    .addrs
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| ("?".to_string(), 0));
+                eprintln!(
+                    "[receive_assigned_masks] subscribed to node {idx} ({addr}:{port}) at +{:.3}s",
+                    t0.elapsed().as_secs_f64()
+                );
+                share_futures.spawn(async move { (idx, addr, port, sub.next().await) });
             }
 
             let mut share_sets: HashMap<u64, Vec<S>> = HashMap::new();
             let expected_indices = (start..end).collect::<Vec<_>>();
+            let mut responded = 0usize;
 
             while let Some(share_result) = share_futures.join_next().await {
-                let assigned_shares_option =
+                let (idx, addr, port, assigned_shares_option) =
                     share_result.map_err(|e| CoordinatorError::SubscriptionError(e.to_string()))?;
                 let assigned_shares = match assigned_shares_option {
                     Some(res) => {
@@ -266,6 +292,15 @@ pub mod node_rpc {
                     }
                     None => continue,
                 };
+                responded += 1;
+                let payload_bytes: usize =
+                    assigned_shares.iter().map(|s| s.share_bytes.len()).sum();
+                eprintln!(
+                    "[receive_assigned_masks] node {idx} ({addr}:{port}) responded: {} shares, {payload_bytes} bytes, at +{:.3}s (responded so far: {responded}/{})",
+                    assigned_shares.len(),
+                    t0.elapsed().as_secs_f64(),
+                    self.node_rpcs.len()
+                );
 
                 let mut indices = assigned_shares
                     .iter()
@@ -295,6 +330,11 @@ pub mod node_rpc {
                         .get(reserved_index)
                         .is_some_and(|shares| shares.len() >= S::min_shares(self.t))
                 }) {
+                    eprintln!(
+                        "[receive_assigned_masks] have min_shares={} from {responded} node(s) at +{:.3}s",
+                        S::min_shares(self.t),
+                        t0.elapsed().as_secs_f64()
+                    );
                     break;
                 }
             }
@@ -317,8 +357,17 @@ pub mod node_rpc {
             // for this whole range in one message (checked above), or not at all. That is what
             // `batch_recover_secret` requires, and what lets it amortize the interpolation setup
             // across the whole batch instead of redoing it per index.
-            S::batch_recover_secret(&shares_by_index, self.n, self.t)
-                .map_err(|_| CoordinatorError::MaskReconstructionFailed(share_count))
+            eprintln!(
+                "[receive_assigned_masks] reconstructing {count} secret(s) at +{:.3}s",
+                t0.elapsed().as_secs_f64()
+            );
+            let result = S::batch_recover_secret(&shares_by_index, self.n, self.t)
+                .map_err(|_| CoordinatorError::MaskReconstructionFailed(share_count));
+            eprintln!(
+                "[receive_assigned_masks] done at +{:.3}s",
+                t0.elapsed().as_secs_f64()
+            );
+            result
         }
     }
 
