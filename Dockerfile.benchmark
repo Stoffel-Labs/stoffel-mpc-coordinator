@@ -20,26 +20,41 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
+ARG PROFILE_BUILD=false
+
 COPY --from=planner /build/recipe.json /build/recipe.json
 
 RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=stoffel-coordinator-target,target=/build/target,sharing=locked \
+    --mount=type=cache,id=stoffel-coordinator-target-${PROFILE_BUILD},target=/build/target,sharing=locked \
+    if [ "$PROFILE_BUILD" = "true" ]; then \
+        export CARGO_PROFILE_RELEASE_DEBUG=2; \
+        export CARGO_PROFILE_RELEASE_STRIP=none; \
+        export RUSTFLAGS="-C force-frame-pointers=yes"; \
+    fi; \
     cargo chef cook --release --recipe-path recipe.json --features benchmark
 
 COPY . .
 
 RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=stoffel-coordinator-target,target=/build/target,sharing=locked \
+    --mount=type=cache,id=stoffel-coordinator-target-${PROFILE_BUILD},target=/build/target,sharing=locked \
+    if [ "$PROFILE_BUILD" = "true" ]; then \
+        export CARGO_PROFILE_RELEASE_DEBUG=2; \
+        export CARGO_PROFILE_RELEASE_STRIP=none; \
+        export RUSTFLAGS="-C force-frame-pointers=yes"; \
+    fi; \
     cargo build --release --features benchmark && \
-    strip target/release/run-coord && \
+    if [ "$PROFILE_BUILD" != "true" ]; then \
+        strip target/release/run-coord; \
+    fi; \
     mkdir -p /build/artifacts && \
     cp target/release/run-coord /build/artifacts/run-coord
 
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y \
+    bpftrace \
     ca-certificates \
     libssl3 \
     net-tools \
@@ -50,5 +65,6 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=builder /build/artifacts/run-coord /app/run-coord
+COPY docker/profile.bt /app/profile.bt
 
 ENTRYPOINT ["/app/run-coord"]
