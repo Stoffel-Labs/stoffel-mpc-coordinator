@@ -804,17 +804,28 @@ pub mod node_rpc {
                     .await;
                 return Ok(());
             };
-            let mut d = d.lock().await;
 
-            // A new subscription from the same client supersedes any previous one still
-            // pending: the client only ever moves on to the next input after it has consumed
-            // (or given up on) the last one, so a still-registered sink at this point is stale
-            // rather than a genuine conflict (e.g. the client returned early once threshold
-            // shares from other nodes arrived and abandoned this node's still-outstanding
-            // subscription without waiting for the unsubscribe to be processed here first).
-            d.assigned_sinks.remove(&self.id);
+            // Only mutate/read shared state while holding this execution's lock; the
+            // subscription handshake (`pending.accept()`) and payload delivery
+            // (`sink.send()`) below are real network I/O and must not run while every
+            // other client's call to this same RPC sits blocked behind this lock — that
+            // used to serialize all N clients' subscribes into one queue, with a single
+            // client's accept/send round trip gating everyone behind it.
+            let assigned_shares = {
+                let mut guard = d.lock().await;
 
-            let assigned_shares = match d.assigned_mask_shares_for_client(&self.id, start, count) {
+                // A new subscription from the same client supersedes any previous one still
+                // pending: the client only ever moves on to the next input after it has consumed
+                // (or given up on) the last one, so a still-registered sink at this point is stale
+                // rather than a genuine conflict (e.g. the client returned early once threshold
+                // shares from other nodes arrived and abandoned this node's still-outstanding
+                // subscription without waiting for the unsubscribe to be processed here first).
+                guard.assigned_sinks.remove(&self.id);
+
+                guard.assigned_mask_shares_for_client(&self.id, start, count)
+            };
+
+            let assigned_shares = match assigned_shares {
                 Ok(assigned_shares) => assigned_shares,
                 Err(e) => {
                     pending
@@ -849,9 +860,32 @@ pub mod node_rpc {
                 return Ok(());
             }
 
+            // Not ready yet: accept the subscription (network I/O, no lock held), then
+            // register it so add_mask_shares_for_execution /
+            // add_assigned_reserved_indices_for_execution can find and satisfy it once
+            // the shares/reservations actually land. Re-check readiness after
+            // re-acquiring the lock, in case the shares showed up while `accept()` was
+            // in flight -- otherwise this subscription could register itself just after
+            // the one delivery attempt that would have satisfied it, and then never
+            // hear from anyone again.
             let sink = pending.accept().await?;
-            d.assigned_sinks
-                .insert(self.id.clone(), AssignedMaskRequest { start, count, sink });
+            let mut guard = d.lock().await;
+            match guard.assigned_mask_shares_for_client(&self.id, start, count) {
+                Ok(Some(assigned_shares)) => {
+                    drop(guard);
+                    if let Ok(json) = to_json_raw_value(&assigned_shares) {
+                        let _ = sink.send(json).await;
+                    }
+                }
+                Ok(None) => {
+                    guard
+                        .assigned_sinks
+                        .insert(self.id.clone(), AssignedMaskRequest { start, count, sink });
+                }
+                Err(_) => {
+                    // Leave unregistered; the client's subscription will simply time out.
+                }
+            }
 
             Ok(())
         }
