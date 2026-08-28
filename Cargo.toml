@@ -17,9 +17,9 @@ readme = "README.md"
 [workspace.dependencies]
 stoffel-mpc-coordinator-shared = { version = "0.1.0", path = "crates/coord-shared" }
 stoffel-mpc-coordinator-off-chain = { path = "crates/off-chain" }
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
-stoffelnet = "0.1.0"
-stoffel-vm-types = "0.1.0"
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.1" }
+stoffelnet = "0.1.1"
+stoffel-vm-types = "0.1.1"
 stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", rev = "269fadfade9ad33cf2b3fb05b927a08ac95dc43a" }
 stoffel-solidity-bindings-test = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", rev = "269fadfade9ad33cf2b3fb05b927a08ac95dc43a" }
 alloy = { version = "1.5.2", features = ["full", "node-bindings"] }
