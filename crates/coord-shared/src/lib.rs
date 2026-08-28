@@ -1,6 +1,6 @@
 // The coordinator is generic over the share type `S` used to represent shares in the underlying
-// MPC protocol. Concretely, `S` must implement `ShareBound`, which is `SecretSharingScheme` from
-// mpc-protocols plus some additional bounds to make the code work.
+// MPC protocol. Concretely, `S` must implement `ShareBound`, which is `stoffelcrypto`'s
+// `SecretSharingScheme` plus some additional bounds to make the code work.
 // Every struct and trait in this library that touches shares is parametrized as `<F: FftField, S: ShareBound<F>>`;
 // the generic type `F` comes directly from the definition of `SecretSharingScheme`.
 //
@@ -25,13 +25,78 @@ use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Once;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::share::ShareError;
 use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use thiserror::Error;
+
+/// Uniquely identifies one MPC program invocation.
+///
+/// A program hash is deliberately not used as the execution identity: two invocations of the
+/// same program must be able to overlap without sharing coordinator or node state. The all-zero
+/// value is reserved and rejected by persistent/concurrent RPC paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExecutionId([u8; 32]);
+
+impl ExecutionId {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 32]
+    }
+}
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl FromStr for ExecutionId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err(format!(
+                "execution ID must contain exactly 64 hexadecimal characters, got {}",
+                value.len()
+            ));
+        }
+        let bytes = hex::decode(value).map_err(|error| format!("invalid execution ID: {error}"))?;
+        Ok(Self(
+            bytes.try_into().expect("validated execution ID length"),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod execution_id_tests {
+    use super::*;
+
+    #[test]
+    fn hex_round_trip_is_strict_and_stable() {
+        let id = ExecutionId::from_bytes([0xab; 32]);
+        let encoded = id.to_string();
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(encoded.parse::<ExecutionId>().unwrap(), id);
+        assert!("ab".parse::<ExecutionId>().is_err());
+        assert!(format!("{}z", &encoded[..63])
+            .parse::<ExecutionId>()
+            .is_err());
+    }
+}
 
 pub trait ShareBound<F: FftField>:
     SecretSharingScheme<F, SecretType = Self::ValueType>
@@ -88,6 +153,20 @@ pub enum Round {
     ProgramFinished,
 }
 
+/// The position of a round in the fixed protocol order. Rounds only ever advance, so this
+/// lets a coordinator recognise a proposal for a round it has already passed.
+pub fn round_index(round: Round) -> u8 {
+    match round {
+        Round::Idle => 0,
+        Round::Preprocessing => 1,
+        Round::InputMaskReservation => 2,
+        Round::InputCollection => 3,
+        Round::MPCExecution => 4,
+        Round::OutputDistribution => 5,
+        Round::ProgramFinished => 6,
+    }
+}
+
 pub fn round_before(current: Round) -> Option<Round> {
     match current {
         Round::Idle => None,
@@ -114,11 +193,44 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
 
     fn reserve_mask_index(&mut self, i: u64) -> impl Future<Output = Result<(), CoordinatorError>>;
 
+    /// Reserves several input-mask indices in one call. The default implementation just calls
+    /// `reserve_mask_index` in a loop, so implementors get this for free; `off-chain` overrides
+    /// it with a single round trip, since reserving indices one at a time is what makes clients
+    /// with many inputs blow past the RPC timeout under load.
+    fn reserve_mask_indices(
+        &mut self,
+        indices: &[u64],
+    ) -> impl Future<Output = Result<(), CoordinatorError>> {
+        async move {
+            for &i in indices {
+                self.reserve_mask_index(i).await?;
+            }
+            Ok(())
+        }
+    }
+
     fn send_masked_input(
         &self,
         masked_input: S::ValueType,
         i: u64,
     ) -> impl Future<Output = Result<(), CoordinatorError>>;
+
+    /// Submits several masked inputs in one call. The default implementation just calls
+    /// `send_masked_input` in a loop, so implementors get this for free; `off-chain` overrides
+    /// it with a single round trip, for the same reason `reserve_mask_indices` overrides
+    /// `reserve_mask_index`: submitting inputs one at a time is what makes clients with many
+    /// inputs blow past the RPC timeout under load.
+    fn send_masked_inputs(
+        &self,
+        inputs: &[(u64, S::ValueType)],
+    ) -> impl Future<Output = Result<(), CoordinatorError>> {
+        async move {
+            for (i, masked_input) in inputs {
+                self.send_masked_input(masked_input.clone(), *i).await?;
+            }
+            Ok(())
+        }
+    }
 
     fn wait_for_inputs(
         &self,
@@ -139,8 +251,6 @@ pub trait Coordinator<F: FftField, S: ShareBound<F>> {
         key: Vec<u8>,
         output_shares: Vec<S>,
     ) -> impl Future<Output = Result<(), CoordinatorError>>;
-
-    fn reset_coord(&self) -> impl Future<Output = Result<(), CoordinatorError>>;
 }
 
 #[derive(Error, Clone, Debug, Serialize, Deserialize)]
@@ -193,6 +303,8 @@ pub enum CoordinatorError {
 
 #[derive(Error, Clone, Debug)]
 pub enum NodeRPCError {
+    #[error("Execution is not registered or is ambiguous")]
+    ExecutionNotFound,
     #[error("Index already added")]
     IndexAlreadyAdded,
     #[error("Index not added")]

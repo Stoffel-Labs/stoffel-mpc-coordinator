@@ -1,25 +1,40 @@
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
 use std::fs;
-use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
-    AvssCoordinatorConnection, HoneyBadgerCoordinatorConnection,
-};
+use stoffel_mpc_coordinator_off_chain::tests::fake_coord::HoneyBadgerCoordinatorConnection;
 use stoffel_mpc_coordinator_off_chain::{
-    ClientIdentity, CoordinatorRPCServerSharedBase, InputAssignment, InputSlotAssignment,
-    OffChainCoordinatorServer,
+    ClientIdentity, CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment,
+    InputClientRange, OffChainCoordinatorServer, OneOffShutdownConfig,
+    DEFAULT_ONE_OFF_SHUTDOWN_GRACE,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
-use stoffel_mpc_coordinator_shared::tests::fake_coord::{AvssValueType, HoneyBadgerValueType};
-use stoffel_mpc_coordinator_shared::CoordinatorError;
+use stoffel_mpc_coordinator_shared::{CoordinatorError, ExecutionId};
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
 use x509_parser::prelude::*;
+
+#[derive(ValueEnum, Clone, Debug, Default)]
+#[clap(rename_all = "lower")]
+enum Backend {
+    #[default]
+    HoneyBadger,
+    Avss,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long)]
-    hash: String,
+    /// Registers exactly one execution, formatted as <hash>,<execution-id>, before listening,
+    /// and exits once a party explicitly requests it via the `request_shutdown` RPC method
+    /// (stoffel-run's `--one-off` flag does this once it has confirmed the execution reached
+    /// ProgramFinished). Omit for a standing coordinator that keeps running and accepts further
+    /// registrations.
+    #[arg(long, value_parser = parse_one_off)]
+    one_off: Option<OneOff>,
+
+    /// Maximum time after a one-off shutdown request to wait for every MPC party to acknowledge
+    /// ProgramFinished. The coordinator exits sooner as soon as all parties acknowledge.
+    #[arg(long, default_value_t = DEFAULT_ONE_OFF_SHUTDOWN_GRACE.as_secs())]
+    one_off_shutdown_grace_secs: u64,
 
     #[arg(long, required=true, value_delimiter=',', num_args=1..)]
     initial_mpc_nodes: Vec<String>,
@@ -39,7 +54,7 @@ struct Args {
     #[arg(long)]
     n_inputs: Option<u64>,
 
-    #[arg(long, required=true, value_delimiter=',', num_args=1..)]
+    #[arg(long, value_delimiter=',', num_args=0..)]
     output_clients: Vec<String>,
 
     #[arg(long)]
@@ -50,6 +65,40 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1")]
     addr: String,
+
+    #[arg(long, default_value_t = 31415)]
+    port: u16,
+
+    #[arg(long, default_value = "honeybadger")]
+    backend: Backend,
+}
+
+fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
+    let execution_id = value
+        .parse::<ExecutionId>()
+        .map_err(|error| error.to_string())?;
+    if execution_id.is_zero() {
+        return Err("execution ID must be nonzero".to_string());
+    }
+    Ok(execution_id)
+}
+
+#[derive(Clone, Debug)]
+struct OneOff {
+    hash: [u8; 32],
+    execution_id: ExecutionId,
+}
+
+fn parse_one_off(value: &str) -> Result<OneOff, String> {
+    let (hash, execution_id) = value
+        .split_once(',')
+        .ok_or_else(|| "--one-off must be formatted as <hash>,<execution-id>".to_string())?;
+    let hash: [u8; 32] = hex::decode(hash)
+        .map_err(|error| format!("invalid hash: {error}"))?
+        .try_into()
+        .map_err(|_| "hash should be 32 bytes".to_string())?;
+    let execution_id = parse_nonzero_execution_id(execution_id)?;
+    Ok(OneOff { hash, execution_id })
 }
 
 type InputAssignmentBuildResult = (InputAssignment, Vec<ClientIdentity>);
@@ -92,7 +141,8 @@ fn build_input_assignment(
     }
 
     let mut seen_clients = std::collections::HashSet::new();
-    let mut input_slots = Vec::new();
+    let mut clients = Vec::new();
+    let mut ranges = Vec::new();
     let mut output_clients = Vec::new();
     for (client, _client_slot, input_count, output_count) in bound_clients {
         if !seen_clients.insert(client.clone()) {
@@ -103,26 +153,31 @@ fn build_input_assignment(
         if output_count > 0 {
             output_clients.push(client.clone());
         }
-        for input_ordinal in 0..input_count {
-            input_slots.push(InputSlotAssignment {
-                client: client.clone(),
-                label: input_ordinal,
-            });
+        if input_count == 0 {
+            continue;
         }
+        let client_index = u32::try_from(clients.len()).map_err(|_| {
+            CoordinatorError::JSONError("too many distinct input clients".to_string())
+        })?;
+        clients.push(client);
+        ranges.push(InputClientRange {
+            client_index,
+            count: input_count,
+        });
     }
 
-    Ok((InputAssignment { input_slots }, output_clients))
+    Ok((InputAssignment { clients, ranges }, output_clients))
 }
 
-async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
-    server_state: CoordinatorRPCServerSharedBase<T>,
+async fn run_coord<C>(
+    server_state: CoordinatorRPCServerSharedBase,
     addr: &str,
     port: u16,
     t: u64,
     server_cert_der: Vec<u8>,
     server_key_der: Vec<u8>,
 ) where
-    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase<T>>,
+    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
 {
     let _coord = OffChainCoordinatorServer::<C>::start_coord(
         server_state,
@@ -139,8 +194,52 @@ async fn run_coord<T: CanonicalSerialize + CanonicalDeserialize + Clone, C>(
     tokio::time::sleep(tokio::time::Duration::MAX).await;
 }
 
+/// Runs the coordinator for exactly `execution_id`, exiting once a party explicitly requests it
+/// via the `request_shutdown` RPC method (stoffel-run's `--one-off` bootnode does this after it
+/// has itself confirmed the execution reached ProgramFinished).
+async fn run_coord_one_off<C>(
+    mut server_state: CoordinatorRPCServerSharedBase,
+    addr: &str,
+    port: u16,
+    server_cert_der: Vec<u8>,
+    server_key_der: Vec<u8>,
+    execution_id: ExecutionId,
+    shutdown_grace: std::time::Duration,
+) where
+    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
+{
+    // Registered before the listener starts, so no client can call request_shutdown before
+    // the coordinator is watching for it.
+    let shutdown_requested = server_state.watch_for_shutdown_request(execution_id);
+
+    println!(
+        "Listening on {}:{} (one-off execution {})",
+        addr, port, execution_id
+    );
+    OffChainCoordinatorServer::<C>::start_coord_one_off(
+        server_state,
+        addr,
+        port,
+        server_cert_der,
+        server_key_der,
+        shutdown_requested,
+        OneOffShutdownConfig {
+            execution_id,
+            grace: shutdown_grace,
+        },
+    )
+    .await
+    .expect("failed to run coordinator");
+    println!("Shutdown requested, exiting");
+}
+
 #[tokio::main]
 async fn main() {
+    println!(
+        "Executing: {}",
+        std::env::args().collect::<Vec<_>>().join(" ")
+    );
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install default crypto provider");
@@ -149,11 +248,6 @@ async fn main() {
 
     let n = args.n;
     let t = args.t;
-    let hash: [u8; 32] = {
-        let h = hex::decode(args.hash).expect("invalid hash");
-        h.try_into().expect("hash should be 32 bytes")
-    };
-
     let parse_public_keys = |cert_files: &[String]| -> Vec<Vec<u8>> {
         cert_files
             .iter()
@@ -175,6 +269,19 @@ async fn main() {
     };
 
     let public_keys = parse_public_keys(&args.initial_mpc_nodes);
+    assert!(n > 0, "--n must be greater than zero");
+    assert_eq!(
+        public_keys.len(),
+        usize::try_from(n).expect("--n does not fit in usize"),
+        "--n must match the number of --initial-mpc-nodes"
+    );
+    assert!(t < n, "--t must be less than --n");
+    let unique_public_keys = public_keys.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique_public_keys.len(),
+        public_keys.len(),
+        "--initial-mpc-nodes must contain unique identities"
+    );
     let output_client_keys = parse_public_keys(&args.output_clients);
     let binding_keys = |bindings: &[String]| -> Vec<(u64, Vec<u8>)> {
         bindings
@@ -193,76 +300,94 @@ async fn main() {
             .collect()
     };
 
-    let server_cert_der = fs::read(args.server_cert).unwrap();
+    let server_cert_der = fs::read(&args.server_cert)
+        .unwrap_or_else(|_| panic!("could not read certificate file {}", args.server_cert));
     let server_key_der = fs::read(args.server_key).unwrap();
 
     let addr = args.addr.as_str();
-    let port = 31415;
-    let (mpc_backend, server_state) = if let Some(program_path) = args.program {
-        let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
-            .expect("failed to load Stoffel bytecode");
-        let mpc_backend = binary.client_io_manifest.mpc_backend;
-        let client_bindings = if args.client_bindings.is_empty() {
-            let mut schemas = binary.client_io_manifest.clients.clone();
-            schemas.sort_by_key(|schema| schema.client_slot);
-            assert_eq!(
+    let port = args.port;
+    let mut server_state =
+        CoordinatorRPCServerSharedBase::new(n, t, public_keys).expect("invalid coordinator roster");
+    let one_off_execution_id = if let Some(OneOff { hash, execution_id }) = args.one_off {
+        let (mpc_backend, input_assignment, output_clients, n_inputs) =
+            if let Some(program_path) = args.program {
+                let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
+                    .expect("failed to load Stoffel bytecode");
+                let mpc_backend = binary.client_io_manifest.mpc_backend;
+                let client_bindings = if args.client_bindings.is_empty() {
+                    let mut schemas = binary.client_io_manifest.clients.clone();
+                    schemas.sort_by_key(|schema| schema.client_slot);
+                    assert_eq!(
                 schemas.len(),
                 output_client_keys.len(),
                 "without --client-bindings, --output-clients must match manifest client count"
             );
-            schemas
-                .into_iter()
-                .zip(output_client_keys)
-                .map(|(schema, key)| (schema.client_slot, key))
-                .collect()
-        } else {
-            binding_keys(&args.client_bindings)
+                    schemas
+                        .into_iter()
+                        .zip(output_client_keys)
+                        .map(|(schema, key)| (schema.client_slot, key))
+                        .collect()
+                } else {
+                    binding_keys(&args.client_bindings)
+                };
+                let (input_assignment, output_clients) =
+                    build_input_assignment(binary.client_io_manifest, client_bindings)
+                        .expect("failed to bind client IO manifest");
+                let n_inputs = input_assignment
+                    .ranges
+                    .iter()
+                    .map(|range| range.count)
+                    .sum::<u64>();
+                (mpc_backend, input_assignment, output_clients, n_inputs)
+            } else {
+                let n_inputs = args
+                    .n_inputs
+                    .expect("--n-inputs is required when --program is not provided");
+                let mpc_backend = match args.backend {
+                    Backend::HoneyBadger => MpcBackend::HoneyBadger,
+                    Backend::Avss => MpcBackend::Avss,
+                };
+                (
+                    mpc_backend,
+                    InputAssignment::default(),
+                    output_client_keys,
+                    n_inputs,
+                )
+            };
+        let min_output_shares = match mpc_backend {
+            MpcBackend::HoneyBadger => 2 * t + 1,
+            MpcBackend::Avss => t + 1,
         };
-        let (input_assignment, output_clients) =
-            build_input_assignment(binary.client_io_manifest, client_bindings)
-                .expect("failed to bind client IO manifest");
-        let n_inputs = input_assignment.input_slots.len() as u64;
-        let server_state = CoordinatorRPCServerSharedBase::new_with_input_assignment(
-            hash,
-            n,
-            t,
-            public_keys,
-            n_inputs,
-            output_clients,
-            input_assignment,
-        )
-        .expect("failed to configure bound client IO");
-        (mpc_backend, server_state)
-    } else {
-        let n_inputs = args
-            .n_inputs
-            .expect("--n-inputs is required when --program is not provided");
-        (
-            MpcBackend::HoneyBadger,
-            CoordinatorRPCServerSharedBase::new(
-                hash,
-                n,
-                t,
-                public_keys,
+        server_state
+            .register_execution(ExecutionRegistration {
+                execution_id,
+                program_hash: hash,
                 n_inputs,
-                output_client_keys,
-            ),
-        )
+                output_clients,
+                input_assignment,
+                min_output_shares,
+            })
+            .expect("failed to configure initial execution");
+        Some(execution_id)
+    } else {
+        None
     };
-    match mpc_backend {
-        MpcBackend::HoneyBadger => {
-            run_coord::<HoneyBadgerValueType, HoneyBadgerCoordinatorConnection>(
+
+    match one_off_execution_id {
+        Some(execution_id) => {
+            run_coord_one_off::<HoneyBadgerCoordinatorConnection>(
                 server_state,
                 addr,
                 port,
-                t,
                 server_cert_der,
                 server_key_der,
+                execution_id,
+                std::time::Duration::from_secs(args.one_off_shutdown_grace_secs),
             )
             .await;
         }
-        MpcBackend::Avss => {
-            run_coord::<AvssValueType, AvssCoordinatorConnection>(
+        None => {
+            run_coord::<HoneyBadgerCoordinatorConnection>(
                 server_state,
                 addr,
                 port,
@@ -312,9 +437,22 @@ mod tests {
         let (bool_layout, bool_outputs) =
             build_input_assignment(bool_manifest, vec![(0, client.clone())]).unwrap();
 
-        assert_eq!(int_layout.input_slots[0].client, client);
-        assert_eq!(int_layout.input_slots[0].label, 0);
-        assert_eq!(int_layout.input_slots.len(), bool_layout.input_slots.len());
+        assert_eq!(
+            int_layout.clients[int_layout.ranges[0].client_index as usize],
+            client
+        );
+        assert_eq!(int_layout.ranges[0].count, 1);
+        assert_eq!(int_layout.ranges.len(), bool_layout.ranges.len());
         assert_eq!(int_outputs, bool_outputs);
+    }
+
+    #[test]
+    fn execution_id_validation_rejects_zero() {
+        assert!(parse_nonzero_execution_id(&"00".repeat(32)).is_err());
+        let execution_id = ExecutionId::from_bytes([7; 32]);
+        assert_eq!(
+            parse_nonzero_execution_id(&execution_id.to_string()).unwrap(),
+            execution_id,
+        );
     }
 }

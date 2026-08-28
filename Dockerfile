@@ -18,8 +18,6 @@ RUN cargo build --release && strip target/release/run-coord
 
 FROM debian:bookworm-slim AS runtime
 
-ARG IDS_PATH="ids"
-
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
@@ -29,6 +27,5 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=builder /build/target/release/run-coord /app/run-coord
-COPY $IDS_PATH /app/ids
 
 ENTRYPOINT ["/app/run-coord"]
