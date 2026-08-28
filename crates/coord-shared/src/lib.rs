@@ -323,8 +323,9 @@ static INIT: Once = Once::new();
 
 pub fn setup_test() {
     INIT.call_once(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("Failed to install default crypto provider");
+        // Installing a crypto provider is process-global. Another dependency may
+        // have installed one before this helper runs, which is already a valid
+        // test setup and must not poison the initializer.
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. stoffel-mpc-coordinator-libs-v0.1.0"
+        description: "Release tag, e.g. stoffel-mpc-coordinator-libs-v0.2.0"
         required: true
         type: string
 
@@ -15,9 +15,9 @@ permissions:
   contents: write
 
 env:
-  # Library crates to publish, listed leaf-first. cargo resolves the actual
-  # dependency order, so off-chain (which depends on shared) is safe to list
-  # after it. Add "stoffel-mpc-coordinator-on-chain" here once its Solidity
+  # Library crates to publish in dependency order. Cargo's multi-package
+  # publish overlay lets off-chain verify against the shared package prepared
+  # in the same invocation. Add "stoffel-mpc-coordinator-on-chain" here once its Solidity
   # bindings no longer come from git and it drops publish = false.
   PUBLISH_CRATES: "stoffel-mpc-coordinator-shared stoffel-mpc-coordinator-off-chain"
 

@@ -1,11 +1,28 @@
-# Stoffel MPC Coordinator Library
+# Stoffel MPC Coordinator Libraries
 
 `stoffel-mpc-coordinator` provides coordinator primitives for Stoffel MPC workflows. It manages the full protocol lifecycle: preprocessing, input-mask reservation, input collection, MPC execution, and output distribution.
 
-The crate supports two coordinator transports:
+The workspace contains these libraries:
 
-- **On-chain**: Ethereum smart-contract coordination via Alloy and the Stoffel Solidity bindings.
-- **Off-chain**: secure JSON-RPC over mutual TLS for local or non-chain deployments.
+- [`stoffel-mpc-coordinator-shared`](https://crates.io/crates/stoffel-mpc-coordinator-shared): shared coordinator traits, execution identifiers, protocol rounds, RPC utilities, and test helpers.
+- [`stoffel-mpc-coordinator-off-chain`](https://crates.io/crates/stoffel-mpc-coordinator-off-chain): secure JSON-RPC coordination over mutual TLS for local or non-chain deployments.
+- `stoffel-mpc-coordinator-on-chain`: Ethereum smart-contract coordination via Alloy and the Stoffel Solidity bindings; currently workspace-only.
+- `stoffel-mpc-coordinator-bins`: deployment and local-development binaries; currently workspace-only.
+
+## Installation
+
+Add the off-chain coordinator library with:
+
+```toml
+[dependencies]
+stoffel-mpc-coordinator-off-chain = "0.2.0"
+```
+
+The shared crate is pulled in automatically. Depend on `stoffel-mpc-coordinator-shared = "0.2.0"` directly when implementing against transport-independent coordinator traits and types.
+
+## Package status
+
+Version `0.2.0` publishes the shared and off-chain libraries. The on-chain and binary crates remain excluded from crates.io because they depend on pinned Stoffel Solidity SDK binding crates from Git.
 
 ## Deploying the coordinator
 
@@ -92,7 +109,7 @@ The off-chain coordinator operates over JSON-RPC (WebSockets) with mutual TLS, w
 
 Key behaviors:
 
-- **Round management**: parties triggers transitions by calling `transition(Round)` over RPC; all subscribers receive the corresponding event.
+- **Round management**: parties trigger transitions by calling `transition(Round)` over RPC; all subscribers receive the corresponding event.
 - **Index reservation**: clients call `reserve_mask_index(i)` during `InputMaskReservation`. The event is broadcast to all `sub_reserved_indices` subscribers, including MPC nodes.
 - **Mask-share distribution**: each MPC node runs a `node_rpc::NodeRPCServer`. After learning a client's reserved index from the coordinator, the node delivers its mask share to the client over a dedicated WebSocket subscription authenticated by mTLS. The client collects `2t + 1` shares and reconstructs the mask locally.
 - **Output distribution**: MPC nodes HPKE-encrypt their output shares under the client's P-256 public key and call `send_output_shares`. Once `2t + 1` shares have arrived at the coordinator, they are forwarded to the client's `obtain_output_shares` subscription.
@@ -111,4 +128,4 @@ The off-chain coordinator is split into two RPC trait layers:
 
 - **HPKE encryption**: output shares are encrypted.
 - **Threshold**: secret reconstruction requires `2t + 1` shares; both the coordinator and clients enforce this before forwarding or accepting outputs.
-- **Testing utilities**: `self_signed_certs` provides `server_cert()` / `client_cert()` helpers. `setup_test()` installs the default `rustls` crypto provider required before any TLS connections are made in tests.
+- **Testing utilities**: `self_signed_certs` provides `server_cert()` / `client_cert()` helpers. `setup_test()` ensures a default `rustls` crypto provider is available before tests create TLS connections.
