@@ -1,29 +1,37 @@
-name: Publish coordinator libraries
+name: Release
+
+# NOTE: as of this repo's README, stoffel-mpc-coordinator cannot publish to
+# crates.io yet. It depends on pinned Stoffel Solidity SDK binding crates that
+# are not on crates.io, so `cargo publish --dry-run` and `cargo publish` will
+# both fail on the unresolvable dependency graph.
+#
+# This workflow therefore defaults to producing a SIGNED GitHub Release only.
+# Flip publish_crates to true (or change the default below) once those binding
+# crates are published or dropped from the public dependency graph.
 
 on:
   push:
     tags:
-      - "stoffel-mpc-coordinator-libs-v*.*.*"
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. stoffel-mpc-coordinator-libs-v0.2.0"
+        description: "Release tag to publish, e.g. v0.1.0"
         required: true
         type: string
+      publish_crates:
+        description: "Also publish to crates.io (requires the Solidity SDK bindings to be published)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
-
-env:
-  # Library crates to publish in dependency order. Cargo's multi-package
-  # publish overlay lets off-chain verify against the shared package prepared
-  # in the same invocation. Add "stoffel-mpc-coordinator-on-chain" here once its Solidity
-  # bindings no longer come from git and it drops publish = false.
-  PUBLISH_CRATES: "stoffel-mpc-coordinator-shared stoffel-mpc-coordinator-off-chain"
+  id-token: write
 
 jobs:
-  publish:
-    name: Publish library crates to crates.io
+  release:
+    name: Package, sign, and create GitHub Release
     runs-on: ubuntu-latest
 
     steps:
@@ -31,92 +39,202 @@ jobs:
         id: ref
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
-            echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "ref=refs/tags/${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           else
-            tag="${GITHUB_REF_NAME}"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             echo "ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
           fi
-          version="${tag#stoffel-mpc-coordinator-libs-v}"
-          if [ "$version" = "$tag" ]; then
-            echo "Tag '$tag' is not of the form 'stoffel-mpc-coordinator-libs-v<version>'"; exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.ref.outputs.ref }}
           fetch-depth: 0
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
 
-      # Fails fast if a selected crate is at the wrong version, is missing
-      # description/license (crates.io rejects those), or is publish=false.
-      - name: Validate selected crates
-        env:
-          VERSION: ${{ steps.ref.outputs.version }}
-          PUBLISH_CRATES: ${{ env.PUBLISH_CRATES }}
+      - name: Verify Anvil is available
+        run: anvil --version
+
+      # Works for both a root package and a crates/ workspace: cargo metadata
+      # --no-deps returns every workspace member either way.
+      - name: Read workspace metadata
+        id: meta
         run: |
-          python3 - <<'PY'
-          import json, subprocess, os, sys
-          want = os.environ["VERSION"]
-          crates = os.environ["PUBLISH_CRATES"].split()
-          md = json.loads(subprocess.check_output(
-              ["cargo", "metadata", "--no-deps", "--format-version", "1"]))
-          by_name = {p["name"]: p for p in md["packages"]}
-          errs = []
-          for c in crates:
-              p = by_name.get(c)
-              if p is None:
-                  errs.append(f"{c}: not a workspace member"); continue
-              if p["version"] != want:
-                  errs.append(f"{c}: version {p['version']} != tag {want}")
-              if not p.get("description"):
-                  errs.append(f"{c}: missing `description` (crates.io requires it)")
-              if not p.get("license") and not p.get("license_file"):
-                  errs.append(f"{c}: missing `license` (crates.io requires it)")
-              if p.get("publish") == []:
-                  errs.append(f"{c}: marked publish=false")
-          if errs:
-              sys.exit("Cannot publish:\n  " + "\n  ".join(errs))
-          print(f"OK: {', '.join(crates)} all at {want} with required metadata")
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import subprocess
+
+          metadata = json.loads(
+              subprocess.check_output([
+                  "cargo", "metadata", "--no-deps", "--format-version", "1"
+              ])
+          )
+
+          # Keep only publishable members (publish == [] means publish = false).
+          members = [p for p in metadata["packages"] if p.get("publish") != []]
+
+          versions = {p["version"] for p in members}
+          assert len(versions) == 1, f"workspace member versions are not synced: {versions}"
+
+          names = sorted(p["name"] for p in members)
+          print(f"version={versions.pop()}")
+          print(f"names={' '.join(names)}")
           PY
+
+      - name: Check tag matches workspace version
+        run: |
+          tag_version="${{ steps.ref.outputs.tag }}"
+          tag_version="${tag_version#v}"
+          crate_version="${{ steps.meta.outputs.version }}"
+
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "Tag ${{ steps.ref.outputs.tag }} does not match workspace version $crate_version"
+            exit 1
+          fi
 
       - name: Check tag commit is contained in main
         run: |
           git fetch origin main
           git branch -r --contains "$GITHUB_SHA" | grep -q 'origin/main'
 
-      # Packages and verifies both crates together (off-chain against the
-      # about-to-be-published shared, via cargo's registry overlay). No token.
-      - name: Verify packaging (dry run)
+      - name: Validate release
         run: |
-          args=""
-          for c in $PUBLISH_CRATES; do args="$args -p $c"; done
-          cargo publish --locked --dry-run $args 
+          cargo fmt --check
+          cargo check --workspace
+          cargo test --doc --workspace
+          cargo clippy --workspace --all-targets
+          cargo test --workspace
 
-      - name: Determine which crates still need publishing
-        id: plan
+      # `cargo publish --workspace --dry-run` is the right check once the
+      # dependency graph is publishable. Until then `cargo package` gives us
+      # the .crate artifacts to sign without resolving against crates.io.
+      - name: Package workspace members
         run: |
           args=""
-          for c in $PUBLISH_CRATES; do
-            code="$(curl -sS -o /dev/null -w '%{http_code}' \
-              -A "coordinator-release-ci (+https://github.com/${{ github.repository }})" \
-              "https://crates.io/api/v1/crates/$c/${{ steps.ref.outputs.version }}")"
-            echo "$c@${{ steps.ref.outputs.version }} -> HTTP $code"
-            if [ "$code" != "200" ]; then args="$args -p $c"; fi
+          for name in ${{ steps.meta.outputs.names }}; do
+            args="$args -p $name"
           done
-          echo "pkg_args=$args" >> "$GITHUB_OUTPUT"
 
-      - name: Publish to crates.io
-        if: steps.plan.outputs.pkg_args != ''
-        run: cargo publish --locked ${{ steps.plan.outputs.pkg_args }} 
+          if [ "${{ inputs.publish_crates }}" = "true" ]; then
+            cargo publish $args --dry-run
+          else
+            cargo package $args --no-verify --allow-dirty
+          fi
+
+      # Snapshot the packaged crates outside target/package before anything
+      # else can touch them. cargo publish repackages into target/package, so
+      # signing there would attest to bytes that later get overwritten.
+      - name: Stage release artifacts
+        id: stage
+        run: |
+          stage="$RUNNER_TEMP/artifacts"
+          mkdir -p "$stage"
+
+          for name in ${{ steps.meta.outputs.names }}; do
+            base="$name-${{ steps.meta.outputs.version }}.crate"
+            src="target/package/$base"
+            if [ ! -f "$src" ]; then
+              echo "Expected $src but it is not there" >&2
+              exit 1
+            fi
+            cp "$src" "$stage/$base"
+          done
+
+          echo "----- staged -----"
+          ls -1 "$stage"
+
+          echo "dir=$stage" >> "$GITHUB_OUTPUT"
+
+      - name: Compute crate checksums
+        id: checksum
+        run: |
+          stage="${{ steps.stage.outputs.dir }}"
+
+          # Let sha256sum write its own format so `sha256sum -c` accepts it.
+          ( cd "$stage" && sha256sum *.crate ) > "$stage/SHA256SUMS"
+
+          echo "----- SHA256SUMS -----"
+          cat "$stage/SHA256SUMS"
+
+          echo "sha_file=$stage/SHA256SUMS" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: 'v3.1.3'
+
+      - name: Check Cosign install
+        run: cosign version
+
+      - name: Sign packaged crates
+        id: sign
+        run: |
+          stage="${{ steps.stage.outputs.dir }}"
+          bundle_dir="$RUNNER_TEMP/bundles"
+          mkdir -p "$bundle_dir"
+
+          for name in ${{ steps.meta.outputs.names }}; do
+            base="$name-${{ steps.meta.outputs.version }}.crate"
+            echo "Signing $base"
+            cosign sign-blob --yes \
+              --bundle "$bundle_dir/$base.bundle" \
+              "$stage/$base"
+          done
+
+          echo "bundle_dir=$bundle_dir" >> "$GITHUB_OUTPUT"
+
+      # Fail the release here rather than in a user's terminal. This also
+      # exercises the exact identity regexp published in the docs.
+      - name: Verify signatures before publishing
+        run: |
+          stage="${{ steps.stage.outputs.dir }}"
+          bundles="${{ steps.sign.outputs.bundle_dir }}"
+
+          for name in ${{ steps.meta.outputs.names }}; do
+            base="$name-${{ steps.meta.outputs.version }}.crate"
+            echo "Verifying $base"
+            cosign verify-blob \
+              --bundle "$bundles/$base.bundle" \
+              --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/(tags|heads)/.+$" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$stage/$base"
+          done
+
+          ( cd "$stage" && sha256sum -c SHA256SUMS )
+
+      - name: Check whether this version is already published
+        id: published
+        if: inputs.publish_crates == true
+        run: |
+          all_exist=true
+          for name in ${{ steps.meta.outputs.names }}; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "stoffel-coordinator-release-ci (+https://github.com/${{ github.repository }})" \
+              "https://crates.io/api/v1/crates/$name/${{ steps.meta.outputs.version }}")"
+            echo "$name@${{ steps.meta.outputs.version }} -> HTTP $code"
+            if [ "$code" != "200" ]; then
+              all_exist=false
+            fi
+          done
+          echo "all_exist=$all_exist" >> "$GITHUB_OUTPUT"
+
+      # To move to Trusted Publishing, register this repo + workflow as a
+      # trusted publisher for EACH workspace member on crates.io, then replace
+      # the env block below with rust-lang/crates-io-auth-action@v1 and delete
+      # the CARGO_REGISTRY_TOKEN secret.
+      - name: Publish workspace to crates.io
+        if: inputs.publish_crates == true && steps.published.outputs.all_exist == 'false'
+        run: cargo publish --workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -126,18 +244,37 @@ jobs:
         run: |
           notes_file="$(mktemp)"
           {
-            echo "Coordinator libraries ${{ steps.ref.outputs.tag }} (version ${{ steps.ref.outputs.version }})."
+            echo "Released from tag ${{ steps.ref.outputs.tag }} (version ${{ steps.meta.outputs.version }})."
             echo
-            echo "Crates:"
-            for c in $PUBLISH_CRATES; do
-              echo "- $c: https://crates.io/crates/$c/${{ steps.ref.outputs.version }}"
+            echo "Crates in this release:"
+            for name in ${{ steps.meta.outputs.names }}; do
+              echo "- $name"
             done
+            echo
+            echo "commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo "Crate checksums are attached as the SHA256SUMS asset."
+            echo
+            echo "Each .crate is signed with Sigstore and has a matching .bundle. Verify with:"
+            echo
+            echo "    cosign verify-blob \\"
+            echo "      --bundle <crate>.bundle \\"
+            echo "      --certificate-identity-regexp '^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/(tags|heads)/.+\$' \\"
+            echo "      --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "      <crate>"
           } > "$notes_file"
 
           if gh release view "${{ steps.ref.outputs.tag }}" >/dev/null 2>&1; then
             gh release edit "${{ steps.ref.outputs.tag }}" \
-              --title "${{ steps.ref.outputs.tag }}" --notes-file "$notes_file"
+              --title "${{ steps.ref.outputs.tag }}" \
+              --notes-file "$notes_file"
           else
             gh release create "${{ steps.ref.outputs.tag }}" \
-              --title "${{ steps.ref.outputs.tag }}" --notes-file "$notes_file"
+              --title "${{ steps.ref.outputs.tag }}" \
+              --notes-file "$notes_file"
           fi
+
+          gh release upload "${{ steps.ref.outputs.tag }}" \
+            "${{ steps.stage.outputs.dir }}"/*.crate \
+            "${{ steps.checksum.outputs.sha_file }}" \
+            "${{ steps.sign.outputs.bundle_dir }}"/*.bundle \
+            --clobber
