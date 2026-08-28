@@ -210,6 +210,14 @@ pub mod node_rpc {
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
         ) -> Result<Self, CoordinatorError> {
+            for (addr, port) in &addrs {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    addr = %addr,
+                    port,
+                    "sending connection request to a node"
+                );
+            }
             let node_rpcs: Vec<Client> =
                 futures_util::future::join_all(addrs.iter().map(|(addr, port)| {
                     stoffel_mpc_coordinator_shared::self_signed_certs::setup_client(
@@ -222,6 +230,10 @@ pub mod node_rpc {
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
+            tracing::info!(
+                execution_id = %execution_id,
+                "received established connections from all nodes"
+            );
 
             Ok(Self {
                 node_rpcs,
@@ -246,6 +258,12 @@ pub mod node_rpc {
             let mut share_futures = JoinSet::new();
 
             for rpc in self.node_rpcs.iter() {
+                tracing::info!(
+                    execution_id = %self.execution_id,
+                    start,
+                    count,
+                    "sending receive_assigned_mask_shares subscription request to a node"
+                );
                 let mut sub = rpc
                     .receive_assigned_mask_shares(self.execution_id, start, count)
                     .await
@@ -265,6 +283,11 @@ pub mod node_rpc {
                     }
                     None => continue,
                 };
+                tracing::info!(
+                    execution_id = %self.execution_id,
+                    count = assigned_shares.len(),
+                    "received assigned mask shares from a node"
+                );
 
                 let mut indices = assigned_shares
                     .iter()
@@ -458,6 +481,10 @@ pub mod node_rpc {
             }
 
             for (sink, json) in pending_sends {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    "sending assigned mask shares to a previously pending subscriber"
+                );
                 let _ = sink.send(json).await;
             }
 
@@ -570,6 +597,10 @@ pub mod node_rpc {
             }
 
             for (sink, json) in pending_sends {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    "sending assigned mask shares to a previously pending subscriber"
+                );
                 let _ = sink.send(json).await;
             }
 
@@ -740,6 +771,14 @@ pub mod node_rpc {
         ) -> SubscriptionResult {
             use OffChainNodeRPCServerError::*;
 
+            tracing::info!(
+                execution_id = %execution_id,
+                client = ?self.id,
+                start,
+                count,
+                "received receive_assigned_mask_shares subscription request"
+            );
+
             let Some(d) = self.execution_state(execution_id).await else {
                 pending
                     .reject(ErrorObjectOwned::owned(
@@ -790,6 +829,11 @@ pub mod node_rpc {
                 };
 
                 let sink = pending.accept().await?;
+                tracing::info!(
+                    execution_id = %execution_id,
+                    client = ?self.id,
+                    "sending assigned mask shares immediately"
+                );
                 sink.send(json).await?;
 
                 return Ok(());
@@ -1117,11 +1161,19 @@ type OutputDelivery = (Arc<SubscriptionSink>, Vec<(Vec<u8>, Vec<u8>)>);
 
 async fn deliver_transitions(deliveries: Vec<TransitionDelivery>) {
     for (round, event, sinks) in deliveries {
+        let broadcast_start = std::time::Instant::now();
+        tracing::info!(?round, subscribers = sinks.len(), "sending round transition event");
         let results = futures_util::future::join_all(sinks.iter().map(|sink| {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
             tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
         }))
         .await;
+        tracing::info!(
+            ?round,
+            elapsed = ?broadcast_start.elapsed(),
+            timed_out = results.iter().filter(|r| !matches!(r, Ok(Ok(())))).count(),
+            "finished sending round transition event"
+        );
         if results.iter().any(|result| !matches!(result, Ok(Ok(())))) {
             eprintln!(
                 "coordinator subscriber disconnected or timed out while broadcasting {:?}",
@@ -1494,6 +1546,10 @@ impl CoordinatorExecutionState {
 
     async fn subscribe_reserved_indices(&mut self, sink: SubscriptionSink) -> SubscriptionResult {
         if !self.reserved_index_events.is_empty() {
+            tracing::info!(
+                events = self.reserved_index_events.len(),
+                "sending reserved-index history replay to a new subscriber"
+            );
             for event in &self.reserved_index_events {
                 let json = to_json_raw_value(event).expect("failed convert to JSON");
                 if !matches!(
@@ -1514,6 +1570,10 @@ impl CoordinatorExecutionState {
 
     async fn subscribe_masked_inputs(&mut self, sink: SubscriptionSink) -> SubscriptionResult {
         if !self.masked_input_events.is_empty() {
+            tracing::info!(
+                events = self.masked_input_events.len(),
+                "sending masked-input history replay to a new subscriber"
+            );
             for event in &self.masked_input_events {
                 let json = to_json_raw_value(event).expect("failed convert to JSON");
                 if !matches!(
@@ -1539,6 +1599,10 @@ impl CoordinatorExecutionState {
         // Replay history as a single batch, matching the one-message-per-reservation-call shape
         // that live broadcasts use.
         if !self.assigned_reserved_index_events.is_empty() {
+            tracing::info!(
+                events = self.assigned_reserved_index_events.len(),
+                "sending assigned reserved-index history replay to a new subscriber"
+            );
             let json = to_json_raw_value(&self.assigned_reserved_index_events)
                 .expect("failed convert to JSON");
             if !matches!(
@@ -1563,6 +1627,10 @@ impl CoordinatorExecutionState {
         // Replay history as a single batch, matching the one-message-per-submission-call shape
         // that live broadcasts use.
         if !self.assigned_masked_input_events.is_empty() {
+            tracing::info!(
+                events = self.assigned_masked_input_events.len(),
+                "sending assigned masked-input history replay to a new subscriber"
+            );
             let json = to_json_raw_value(&self.assigned_masked_input_events)
                 .expect("failed convert to JSON");
             if !matches!(
@@ -1745,6 +1813,12 @@ async fn deliver_ready_output_waiters(
     };
 
     let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
+    tracing::info!(
+        execution_id = %execution_id,
+        client = ?client_id,
+        shares = output_shares.len(),
+        "sending output shares to a client"
+    );
     if waiter.send(json).await.is_err() {
         let mut shared = shared.lock().await;
         if let Some(execution) = shared.executions.get_mut(&execution_id) {
@@ -1763,6 +1837,11 @@ async fn deliver_ready_output_waiters(
 #[async_trait]
 impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     async fn register_execution(&self, registration: ExecutionRegistration) -> RpcResult<()> {
+        tracing::info!(
+            execution_id = %registration.execution_id,
+            client = ?self.id,
+            "received register_execution request"
+        );
         let mut shared = self.d.lock().await;
         if !shared.mpc_nodes.contains(&self.id) {
             return Err(ErrorObjectOwned::owned(
@@ -1781,6 +1860,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     }
 
     async fn retire_execution(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            "received retire_execution request"
+        );
         let mut shared = self.d.lock().await;
         if !shared.mpc_nodes.contains(&self.id) {
             return Err(ErrorObjectOwned::owned(
@@ -1801,6 +1885,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     }
 
     async fn request_shutdown(&self) -> RpcResult<()> {
+        tracing::info!(client = ?self.id, "received request_shutdown request");
         let mut shared = self.d.lock().await;
         let designated_party = shared.mpc_nodes[0].clone();
         if self.id != designated_party {
@@ -1843,6 +1928,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         execution_id: ExecutionId,
         round: Round,
     ) -> SubscriptionResult {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            ?round,
+            "received sub_round subscription request"
+        );
         if round_before(round).is_none() {
             pending
                 .reject(ErrorObjectOwned::owned(
@@ -1883,6 +1974,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         };
 
         let json = to_json_raw_value(&replay).expect("failed convert to JSON");
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            ?round,
+            "sending round transition replay to a late subscriber"
+        );
         if !matches!(
             tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json)).await,
             Ok(Ok(()))
@@ -1896,6 +1993,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     }
 
     async fn available_input_masks(&self, execution_id: ExecutionId) -> RpcResult<u64> {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            "received available_input_masks request"
+        );
         let d = self.execution_state(execution_id).await?;
         Ok(d.masked_inputs.len() as u64 - d.n_reserved)
     }
@@ -1905,6 +2007,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            "received sub_assigned_reserved_indices subscription request"
+        );
         let execution_exists = {
             let shared = self.d.lock().await;
             shared.executions.contains_key(&execution_id)
@@ -1925,6 +2032,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            "received sub_assigned_masked_inputs subscription request"
+        );
         let execution_exists = {
             let shared = self.d.lock().await;
             shared.executions.contains_key(&execution_id)
@@ -1946,6 +2058,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         masked_input: Vec<u8>,
         reserved_index: u64,
     ) -> RpcResult<()> {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            reserved_index,
+            "received submit_masked_input request"
+        );
         self.submit_masked_inputs(execution_id, vec![masked_input], vec![reserved_index])
             .await
     }
@@ -1956,6 +2074,13 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         masked_inputs: Vec<Vec<u8>>,
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()> {
+        let handler_start = std::time::Instant::now();
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            count = reserved_indices.len(),
+            "received submit_masked_inputs request"
+        );
         let (quorum, roster_head) = {
             let shared = self.d.lock().await;
             (shared.transition_quorum(), shared.mpc_nodes[0].clone())
@@ -1966,7 +2091,19 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         };
         // Preserve submission order while allowing unrelated coordinator RPCs
         // and executions to progress during subscription delivery.
+        //
+        // This lock is held for the rest of the function, including the subscriber broadcast
+        // below -- every `submit_masked_input(s)` call for this execution is therefore fully
+        // serialized. A `waited` time much larger than 0 here means earlier callers are stuck
+        // in that broadcast (see the `SUBSCRIPTION_SEND_TIMEOUT` sends further down), and this
+        // call is simply queued behind them.
+        let lock_wait_start = std::time::Instant::now();
         let _delivery_guard = delivery.lock().await;
+        tracing::info!(
+            execution_id = %execution_id,
+            waited = ?lock_wait_start.elapsed(),
+            "acquired per-execution masked-input delivery lock"
+        );
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputCollection {
@@ -2090,19 +2227,43 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         };
         drop(d);
 
+        let broadcast_start = std::time::Instant::now();
+        tracing::info!(
+            execution_id = %execution_id,
+            subscribers = sinks.len(),
+            "sending masked-input event to subscribers"
+        );
         let results = futures_util::future::join_all(sinks.iter().map(|sink| {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
             tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
         }))
         .await;
+        tracing::info!(
+            execution_id = %execution_id,
+            elapsed = ?broadcast_start.elapsed(),
+            timed_out = results.iter().filter(|r| !matches!(r, Ok(Ok(())))).count(),
+            "finished sending masked-input event to subscribers"
+        );
+        let assigned_broadcast_start = std::time::Instant::now();
         let assigned_results = if assigned_sinks.is_empty() {
             Vec::new()
         } else {
+            tracing::info!(
+                execution_id = %execution_id,
+                subscribers = assigned_sinks.len(),
+                "sending assigned masked-input event to subscribers"
+            );
             let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
                 let json = to_json_raw_value(&assigned_events).expect("failed convert to JSON");
                 tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
             }))
             .await;
+            tracing::info!(
+                execution_id = %execution_id,
+                elapsed = ?assigned_broadcast_start.elapsed(),
+                timed_out = results.iter().filter(|r| !matches!(r, Ok(Ok(())))).count(),
+                "finished sending assigned masked-input event to subscribers"
+            );
             results
         };
 
@@ -2115,14 +2276,20 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             if matches!(result, Ok(Ok(()))) {
                 d.masked_input_sinks.push(sink);
             } else {
-                eprintln!("coordinator masked-input subscriber disconnected or timed out");
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    "coordinator masked-input subscriber disconnected or timed out"
+                );
             }
         }
         for (sink, result) in assigned_sinks.into_iter().zip(assigned_results) {
             if matches!(result, Ok(Ok(()))) {
                 d.assigned_masked_input_sinks.push(sink);
             } else {
-                eprintln!("coordinator assigned masked-input subscriber disconnected or timed out");
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    "coordinator assigned masked-input subscriber disconnected or timed out"
+                );
             }
         }
 
@@ -2133,6 +2300,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         drop(d);
         deliver_transitions(transitions).await;
 
+        tracing::info!(
+            execution_id = %execution_id,
+            elapsed = ?handler_start.elapsed(),
+            "finished submit_masked_inputs request"
+        );
         Ok(())
     }
 
@@ -2141,6 +2313,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            "received sub_reserved_indices subscription request"
+        );
         let execution_exists = {
             let shared = self.d.lock().await;
             shared.executions.contains_key(&execution_id)
@@ -2161,6 +2338,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            "received sub_masked_inputs subscription request"
+        );
         let execution_exists = {
             let shared = self.d.lock().await;
             shared.executions.contains_key(&execution_id)
@@ -2177,6 +2359,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     }
 
     async fn reserve_mask_index(&self, execution_id: ExecutionId, i: u64) -> RpcResult<()> {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            index = i,
+            "received reserve_mask_index request"
+        );
         self.reserve_mask_indices(execution_id, vec![i]).await
     }
 
@@ -2185,6 +2373,17 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         execution_id: ExecutionId,
         indices: Vec<u64>,
     ) -> RpcResult<()> {
+        let handler_start = std::time::Instant::now();
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            count = indices.len(),
+            "received reserve_mask_indices request"
+        );
+        // Note: unlike `submit_masked_inputs`, `d` here is the per-execution state guard itself
+        // (not a separate delivery lock), and it is held across the subscriber broadcast below.
+        // That means every RPC needing this execution's state -- including another client's
+        // `reserve_mask_indices` -- queues up behind however long that broadcast takes.
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputMaskReservation {
@@ -2295,37 +2494,70 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         // this coordinator. Disconnected subscribers are pruned; late/restarted nodes replay
         // from event history.
         let sinks = std::mem::take(&mut d.reserved_index_sinks);
+        let broadcast_start = std::time::Instant::now();
+        tracing::info!(
+            execution_id = %execution_id,
+            subscribers = sinks.len(),
+            "sending reserved-index event to subscribers"
+        );
         let results = futures_util::future::join_all(sinks.iter().map(|sink| {
             let json = to_json_raw_value(&event).expect("failed convert to JSON");
             tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
         }))
         .await;
+        tracing::info!(
+            execution_id = %execution_id,
+            elapsed = ?broadcast_start.elapsed(),
+            timed_out = results.iter().filter(|r| !matches!(r, Ok(Ok(())))).count(),
+            "finished sending reserved-index event to subscribers"
+        );
         for (sink, result) in sinks.into_iter().zip(results) {
             if matches!(result, Ok(Ok(()))) {
                 d.reserved_index_sinks.push(sink);
             } else {
-                eprintln!("coordinator reserved-index subscriber disconnected or timed out");
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    "coordinator reserved-index subscriber disconnected or timed out"
+                );
             }
         }
         if !assigned_reservations.is_empty() {
             let assigned_sinks = std::mem::take(&mut d.assigned_reserved_index_sinks);
+            let assigned_broadcast_start = std::time::Instant::now();
+            tracing::info!(
+                execution_id = %execution_id,
+                subscribers = assigned_sinks.len(),
+                "sending assigned reserved-index event to subscribers"
+            );
             let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
                 let json =
                     to_json_raw_value(&assigned_reservations).expect("failed convert to JSON");
                 tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
             }))
             .await;
+            tracing::info!(
+                execution_id = %execution_id,
+                elapsed = ?assigned_broadcast_start.elapsed(),
+                timed_out = results.iter().filter(|r| !matches!(r, Ok(Ok(())))).count(),
+                "finished sending assigned reserved-index event to subscribers"
+            );
             for (sink, result) in assigned_sinks.into_iter().zip(results) {
                 if matches!(result, Ok(Ok(()))) {
                     d.assigned_reserved_index_sinks.push(sink);
                 } else {
-                    eprintln!(
+                    tracing::warn!(
+                        execution_id = %execution_id,
                         "coordinator assigned reserved-index subscriber disconnected or timed out"
                     );
                 }
             }
         }
 
+        tracing::info!(
+            execution_id = %execution_id,
+            elapsed = ?handler_start.elapsed(),
+            "finished reserve_mask_indices request"
+        );
         Ok(())
     }
 
@@ -2340,6 +2572,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     /// (or if) it becomes both current and supported. Callers therefore do not need to know how
     /// far the coordinator has progressed.
     async fn transition(&self, execution_id: ExecutionId, next_round: Round) -> RpcResult<()> {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            ?next_round,
+            "received transition request"
+        );
         let (is_party, quorum, roster_head) = {
             let shared = self.d.lock().await;
             (
@@ -2393,6 +2631,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         client_id: ClientIdentity,
         enc_shares: (Vec<u8>, Vec<u8>),
     ) -> RpcResult<()> {
+        tracing::info!(
+            execution_id = %execution_id,
+            node = ?self.id,
+            output_client = ?client_id,
+            "received send_output_shares request"
+        );
         let is_party = {
             let shared = self.d.lock().await;
             shared.mpc_nodes.contains(&self.id)
@@ -2443,6 +2687,11 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         pending: PendingSubscriptionSink,
         execution_id: ExecutionId,
     ) -> SubscriptionResult {
+        tracing::info!(
+            execution_id = %execution_id,
+            client = ?self.id,
+            "received obtain_output_shares subscription request"
+        );
         // Validate under the execution lock, but never hold that lock while
         // completing the WebSocket subscription handshake. A client may open
         // this subscription concurrently with its masked-input RPC; awaiting
@@ -2675,9 +2924,11 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     }
 
     pub async fn trigger_round(&self, round: Round) -> Result<(), CoordinatorError> {
+        tracing::info!(execution_id = %self.execution_id, ?round, "sending transition request");
         CoordinatorRPCBaseClient::transition(self.rpc(), self.execution_id, round)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
+        tracing::info!(execution_id = %self.execution_id, ?round, "received transition response");
 
         Ok(())
     }
@@ -2686,15 +2937,24 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
         &self,
         registration: ExecutionRegistration,
     ) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::register_execution(self.rpc(), registration)
+        tracing::info!(
+            execution_id = %registration.execution_id,
+            "sending register_execution request"
+        );
+        let result = CoordinatorRPCBaseClient::register_execution(self.rpc(), registration)
             .await
-            .map_err(|error| CoordinatorError::JSONError(error.to_string()))
+            .map_err(|error| CoordinatorError::JSONError(error.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received register_execution response");
+        result
     }
 
     pub async fn retire_execution(&self) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::retire_execution(self.rpc(), self.execution_id)
+        tracing::info!(execution_id = %self.execution_id, "sending retire_execution request");
+        let result = CoordinatorRPCBaseClient::retire_execution(self.rpc(), self.execution_id)
             .await
-            .map_err(|error| CoordinatorError::JSONError(error.to_string()))
+            .map_err(|error| CoordinatorError::JSONError(error.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received retire_execution response");
+        result
     }
 
     /// Tells a one-off coordinator it may exit. Callers must only call this after they have
@@ -2703,9 +2963,12 @@ impl<F: FftField, S: ShareBound<F>> OffChainCoordinatorClient<F, S> {
     /// designated party's own round-transition call racing the coordinator's shutdown is exactly
     /// the bug this RPC method replaces.
     pub async fn request_shutdown(&self) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::request_shutdown(self.rpc())
+        tracing::info!(execution_id = %self.execution_id, "sending request_shutdown request");
+        let result = CoordinatorRPCBaseClient::request_shutdown(self.rpc())
             .await
-            .map_err(|error| CoordinatorError::JSONError(error.to_string()))
+            .map_err(|error| CoordinatorError::JSONError(error.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received request_shutdown response");
+        result
     }
 
     fn rpc(&self) -> &Client {
@@ -2726,34 +2989,52 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
     type ClientIdentity = ClientIdentity;
 
     async fn start_preprocessing(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::start_preprocessing(self.rpc(), self.execution_id)
+        tracing::info!(execution_id = %self.execution_id, "sending start_preprocessing request");
+        let result = StoffelCoordinatorRPCClient::start_preprocessing(self.rpc(), self.execution_id)
             .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received start_preprocessing response");
+        result
     }
     async fn reserve_input_masks(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::reserve_input_masks(self.rpc(), self.execution_id)
+        tracing::info!(execution_id = %self.execution_id, "sending reserve_input_masks request");
+        let result = StoffelCoordinatorRPCClient::reserve_input_masks(self.rpc(), self.execution_id)
             .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received reserve_input_masks response");
+        result
     }
     async fn collect_inputs(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::collect_inputs(self.rpc(), self.execution_id)
+        tracing::info!(execution_id = %self.execution_id, "sending collect_inputs request");
+        let result = StoffelCoordinatorRPCClient::collect_inputs(self.rpc(), self.execution_id)
             .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received collect_inputs response");
+        result
     }
     async fn start_mpc(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::start_mpc(self.rpc(), self.execution_id)
+        tracing::info!(execution_id = %self.execution_id, "sending start_mpc request");
+        let result = StoffelCoordinatorRPCClient::start_mpc(self.rpc(), self.execution_id)
             .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received start_mpc response");
+        result
     }
     async fn send_output(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::send_output(self.rpc(), self.execution_id)
+        tracing::info!(execution_id = %self.execution_id, "sending send_output request");
+        let result = StoffelCoordinatorRPCClient::send_output(self.rpc(), self.execution_id)
             .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received send_output response");
+        result
     }
     async fn finalize(&self) -> Result<(), CoordinatorError> {
-        StoffelCoordinatorRPCClient::finalize(self.rpc(), self.execution_id)
+        tracing::info!(execution_id = %self.execution_id, "sending finalize request");
+        let result = StoffelCoordinatorRPCClient::finalize(self.rpc(), self.execution_id)
             .await
-            .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+            .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(execution_id = %self.execution_id, "received finalize response");
+        result
     }
 
     async fn wait_for_indices(
@@ -2761,6 +3042,10 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         n_inputs: u64,
     ) -> Result<HashMap<ClientIdentity, Vec<u64>>, CoordinatorError> {
         // Wait for reserved index events.
+        tracing::info!(
+            execution_id = %self.execution_id,
+            "sending sub_reserved_indices subscription request"
+        );
         let mut sub = CoordinatorRPCBaseClient::sub_reserved_indices(self.rpc(), self.execution_id)
             .await
             .unwrap();
@@ -2778,6 +3063,12 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                 reserved_indices,
             })) = sub.next().await
             {
+                tracing::info!(
+                    execution_id = %self.execution_id,
+                    client = ?client,
+                    count = reserved_indices.len(),
+                    "received reserved-index event"
+                );
                 received += reserved_indices.len() as u64;
                 map.entry(client).or_default().extend(reserved_indices);
             } else {
@@ -2796,6 +3087,10 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         mask_shares: Vec<S>,
     ) -> Result<HashMap<ClientIdentity, Vec<S>>, CoordinatorError> {
         // Wait for masked input events.
+        tracing::info!(
+            execution_id = %self.execution_id,
+            "sending sub_masked_inputs subscription request"
+        );
         let mut sub = CoordinatorRPCBaseClient::sub_masked_inputs(self.rpc(), self.execution_id)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
@@ -2813,6 +3108,12 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                 masked_inputs,
             })) = sub.next().await
             {
+                tracing::info!(
+                    execution_id = %self.execution_id,
+                    client = ?client,
+                    count = masked_inputs.len(),
+                    "received masked-input event"
+                );
                 received += masked_inputs.len() as u64;
                 for (reserved_index, masked_input) in masked_inputs {
                     let i = reserved_index as usize;
@@ -2848,11 +3149,17 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
     }
 
     async fn wait_for_round(&self, round: Round) -> Result<(), CoordinatorError> {
+        tracing::info!(
+            execution_id = %self.execution_id,
+            ?round,
+            "sending sub_round subscription request"
+        );
         let mut sub = CoordinatorRPCBaseClient::sub_round(self.rpc(), self.execution_id, round)
             .await
             .map_err(|e| CoordinatorError::JSONError(e.to_string()))?;
 
         if let Some(Ok(_)) = sub.next().await {
+            tracing::info!(execution_id = %self.execution_id, ?round, "received round event");
             Ok(())
         } else {
             Err(CoordinatorError::JSONError(
@@ -2884,14 +3191,26 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
             masked_inputs.push(masked_input_bytes);
         }
 
-        CoordinatorRPCBaseClient::submit_masked_inputs(
+        let start = std::time::Instant::now();
+        tracing::info!(
+            execution_id = %self.execution_id,
+            count = reserved_indices.len(),
+            "sending submit_masked_inputs request"
+        );
+        let result = CoordinatorRPCBaseClient::submit_masked_inputs(
             self.rpc(),
             self.execution_id,
             masked_inputs,
             reserved_indices,
         )
         .await
-        .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+        .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(
+            execution_id = %self.execution_id,
+            elapsed = ?start.elapsed(),
+            "received submit_masked_inputs response"
+        );
+        result
     }
 
     async fn reserve_mask_index(&mut self, i: u64) -> Result<(), CoordinatorError> {
@@ -2899,17 +3218,33 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
     }
 
     async fn reserve_mask_indices(&mut self, indices: &[u64]) -> Result<(), CoordinatorError> {
-        CoordinatorRPCBaseClient::reserve_mask_indices(
+        let start = std::time::Instant::now();
+        tracing::info!(
+            execution_id = %self.execution_id,
+            count = indices.len(),
+            "sending reserve_mask_indices request"
+        );
+        let result = CoordinatorRPCBaseClient::reserve_mask_indices(
             self.rpc(),
             self.execution_id,
             indices.to_vec(),
         )
         .await
-        .map_err(|e| CoordinatorError::JSONError(e.to_string()))
+        .map_err(|e| CoordinatorError::JSONError(e.to_string()));
+        tracing::info!(
+            execution_id = %self.execution_id,
+            elapsed = ?start.elapsed(),
+            "received reserve_mask_indices response"
+        );
+        result
     }
 
     async fn obtain_outputs(&self) -> Result<Vec<S::ValueType>, CoordinatorError> {
         // Wait for output shares.
+        tracing::info!(
+            execution_id = %self.execution_id,
+            "sending obtain_output_shares subscription request"
+        );
         let mut sub =
             match CoordinatorRPCBaseClient::obtain_output_shares(self.rpc(), self.execution_id)
                 .await
@@ -2935,6 +3270,11 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
         // Try to decrypt and reconstruct outputs until it succeeds.
         while let Some(Ok(enc_output_shares)) = sub.next().await {
+            tracing::info!(
+                execution_id = %self.execution_id,
+                shares = enc_output_shares.len(),
+                "received output shares event"
+            );
             let min_shares = S::min_shares(self.t as usize);
             if enc_output_shares.len() < min_shares {
                 return Err(CoordinatorError::SubscriptionError(format!(
@@ -3032,6 +3372,11 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
 
         // Send the encrypted shares.
+        tracing::info!(
+            execution_id = %self.execution_id,
+            output_client = ?client_id,
+            "sending send_output_shares request"
+        );
         if let Err(e) = CoordinatorRPCBaseClient::send_output_shares(
             self.rpc(),
             self.execution_id,
@@ -3042,6 +3387,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         {
             return Err(CoordinatorError::JSONError(e.to_string()));
         }
+        tracing::info!(execution_id = %self.execution_id, "received send_output_shares response");
 
         Ok(())
     }
