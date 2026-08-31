@@ -5163,6 +5163,7 @@ dependencies = [
  "ark-serialize 0.5.0",
  "ark-std 0.5.0",
  "async-trait",
+ "base64",
  "futures-util",
  "hpke",
  "jsonrpsee",
@@ -5170,6 +5171,7 @@ dependencies = [
  "rand 0.9.4",
  "rcgen",
  "serde",
+ "serde_json",
  "stoffel-mpc-coordinator-off-chain",
  "stoffel-mpc-coordinator-shared",
  "stoffelcrypto",
@@ -5257,9 +5259,9 @@ dependencies = [
 
 [[package]]
 name = "stoffel-vm-types"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76197577cc06cc04d0cf07070d1063766a6f51a031162bcc79df3752b37fb6b2"
+checksum = "77e1c922e7bbd507e40176b347b11cd16fdb8f6df18c2d7ebab7978a9a3f4965"
 dependencies = [
  "num-bigint 0.4.6",
  "num-integer",
@@ -5272,9 +5274,9 @@ dependencies = [
 
 [[package]]
 name = "stoffelcrypto"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5dea6e2e0db0ec0ca2c66f03ea43f8054c0440c77dcc791c5e4b97d072fa7e5"
+checksum = "a66dfe8e28c5d20fb9f4864b68f67aeb6e37c5f00d72790ca988b33e61d3d203"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -5310,9 +5312,9 @@ dependencies = [
 
 [[package]]
 name = "stoffelmpc-network"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74a903efb1d7c87eb71a9bc11367dd04efbdc375b66366bcb21e506848f2e041"
+checksum = "da9d4e7f12f537074c782e44ac0ffd582e3272df2a7364ed7741970d7d7dff5d"
 dependencies = [
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
@@ -5332,9 +5334,9 @@ dependencies = [
 
 [[package]]
 name = "stoffelnet"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dedfe14784d0d5d9fa4a3c5c9c36b49581c43789ac44449be3ade72fa025223"
+checksum = "4008611ad5ca586b18792e99b24217219f3884a03ec3a69c1dbff6aec94d1f82"
 dependencies = [
  "ark-ff 0.5.0",
  "async-trait",
