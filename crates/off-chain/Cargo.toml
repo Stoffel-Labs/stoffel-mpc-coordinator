@@ -21,6 +21,7 @@ ark-ff = "0.5.0"
 ark-serialize = "0.5.0"
 ark-bls12-381 = "0.5.0"
 async-trait = "0.1.89"
+base64 = "0.22.1"
 futures-util = "0.3.31"
 hpke = "0.13.0"
 jsonrpsee = { version = "0.26.0", features = ["full"] }
@@ -34,6 +35,7 @@ tracing = "0.1"
 [dev-dependencies]
 stoffel-mpc-coordinator-off-chain = { path = "." }
 ark-std = "0.5.0"
+serde_json = "1.0"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
 

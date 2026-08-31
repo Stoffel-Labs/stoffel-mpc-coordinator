@@ -3,6 +3,7 @@ pub mod tests;
 use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use hpke::{
     aead::AesGcm256,
     kdf::HkdfSha256,
@@ -15,12 +16,13 @@ use jsonrpsee::types::{error::ErrorCode, ErrorObjectOwned};
 use jsonrpsee::{
     core::{to_json_raw_value, RpcResult, SubscriptionResult},
     proc_macros::rpc,
-    PendingSubscriptionSink, SubscriptionSink,
+    PendingSubscriptionSink, SubscriptionMessage, SubscriptionSink,
 };
 use p256::{pkcs8::DecodePrivateKey, SecretKey};
 use rand::{rngs::StdRng, SeedableRng};
-use serde::{Deserialize, Serialize};
+use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_mpc_coordinator_shared::{
@@ -50,10 +52,87 @@ type AeadImpl = AesGcm256;
 /// mask index, then the node simply checks that the public keys used for both these actions are the same.
 pub type ClientIdentity = Vec<u8>;
 
+/// Binary JSON-RPC payload encoded as base64 instead of an integer array.
+///
+/// This is intentionally a breaking wire-format change: accepting the old integer-array form
+/// would let expensive payloads remain on this hot path unnoticed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WireBytes(pub Vec<u8>);
+
+impl WireBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<Vec<u8>> for WireBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<WireBytes> for Vec<u8> {
+    fn from(bytes: WireBytes) -> Self {
+        bytes.0
+    }
+}
+
+impl Serialize for WireBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&BASE64_STANDARD.encode(&self.0))
+    }
+}
+
+struct WireBytesVisitor;
+
+impl<'de> Visitor<'de> for WireBytesVisitor {
+    type Value = WireBytes;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a base64 string")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        BASE64_STANDARD
+            .decode(value)
+            .map(WireBytes)
+            .map_err(E::custom)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(&value)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(WireBytesVisitor)
+    }
+}
+
+pub type EncryptedOutputShares = (WireBytes, WireBytes);
+
 /// A deliberately small, explicit bound for the number of live executions owned by one RPC
 /// listener. Finished executions must be retired before this many more are registered.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 1024;
 const SUBSCRIPTION_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long a one-off coordinator waits for parties to acknowledge the terminal round after the
 /// designated party requests shutdown. Unanimous acknowledgement closes immediately; the bound
 /// preserves liveness when a faulty party never acknowledges.
@@ -83,13 +162,13 @@ pub struct AssignedMaskedInputEvent {
     pub client: ClientIdentity,
     pub reserved_index: u64,
     pub input_ordinal: u64,
-    pub masked_input: Vec<u8>,
+    pub masked_input: WireBytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignedMaskShare {
     pub reserved_index: u64,
-    pub share_bytes: Vec<u8>,
+    pub share_bytes: WireBytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +196,7 @@ pub struct ExecutionRegistration {
 
 /// The node-side RPC interface.
 pub mod node_rpc {
-    use super::{AssignedMaskReservation, AssignedMaskShare, ClientIdentity};
+    use super::{AssignedMaskReservation, AssignedMaskShare, ClientIdentity, WireBytes};
     use ark_ff::FftField;
     use ark_serialize::CanonicalSerialize;
     use async_trait::async_trait;
@@ -674,7 +753,7 @@ pub mod node_rpc {
                 .ok_or(NodeRPCError::IndexNotAdded)?;
             Ok(AssignedMaskShare {
                 reserved_index,
-                share_bytes: share_bytes.to_vec(),
+                share_bytes: WireBytes(share_bytes.to_vec()),
             })
         }
 
@@ -792,7 +871,7 @@ pub enum Event {
     /// instead of one per index.
     MaskedInputEvent {
         client: ClientIdentity,
-        masked_inputs: Vec<(u64, Vec<u8>)>,
+        masked_inputs: Vec<(u64, WireBytes)>,
     },
     IndexBufferEvent {
         total_indices: u64,
@@ -904,7 +983,7 @@ pub trait CoordinatorRPCBase {
     async fn submit_masked_input(
         &self,
         execution_id: ExecutionId,
-        masked_input: Vec<u8>,
+        masked_input: WireBytes,
         reserved_index: u64,
     ) -> RpcResult<()>;
 
@@ -917,7 +996,7 @@ pub trait CoordinatorRPCBase {
     async fn submit_masked_inputs(
         &self,
         execution_id: ExecutionId,
-        masked_inputs: Vec<Vec<u8>>,
+        masked_inputs: Vec<WireBytes>,
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()>;
 
@@ -932,12 +1011,12 @@ pub trait CoordinatorRPCBase {
         &self,
         execution_id: ExecutionId,
         client_id: ClientIdentity,
-        enc_shares: (Vec<u8>, Vec<u8>),
+        enc_shares: EncryptedOutputShares,
     ) -> RpcResult<()>;
 
     /// MPC clients use this to receive their output shares from the coordinator, so they can
     /// reconstruct their private output.
-    #[subscription(name = "sub_obtain_output_shares", unsubscribe = "unsub_obtain_output_shares", item = Vec<(Vec<u8>, Vec<u8>)>)]
+    #[subscription(name = "sub_obtain_output_shares", unsubscribe = "unsub_obtain_output_shares", item = Vec<EncryptedOutputShares>)]
     async fn obtain_output_shares(&self, execution_id: ExecutionId) -> SubscriptionResult;
 }
 
@@ -1062,26 +1141,29 @@ struct CoordinatorExecutionState {
     sinks: HashMap<Round, Vec<SubscriptionSink>>,
     trans_events: HashMap<Round, Event>,
     reserved_index_events: Vec<Event>,
-    reserved_index_sinks: Vec<SubscriptionSink>,
+    reserved_index_sinks: Vec<Arc<SubscriptionSink>>,
     assigned_reserved_index_events: Vec<AssignedMaskReservation>,
-    assigned_reserved_index_sinks: Vec<SubscriptionSink>,
-    masked_input_events: Vec<Event>,
-    masked_input_sinks: Vec<SubscriptionSink>,
+    assigned_reserved_index_sinks: Vec<Arc<SubscriptionSink>>,
+    masked_input_events: Vec<Arc<Event>>,
+    masked_input_sinks: Vec<Arc<SubscriptionSink>>,
     assigned_masked_input_events: Vec<AssignedMaskedInputEvent>,
-    assigned_masked_input_sinks: Vec<SubscriptionSink>,
-    /// Serializes client input broadcasts without holding the coordinator-wide
-    /// execution-state mutex across subscription I/O.
-    masked_input_delivery: Arc<Mutex<()>>,
+    assigned_masked_input_sinks: Vec<Arc<SubscriptionSink>>,
     n_reserved: u64,
     reserved_indices: Vec<Option<ClientIdentity>>,
-    masked_inputs: Vec<Option<Vec<u8>>>,
+    /// Submission presence is all the coordinator needs after the payload has been recorded in
+    /// event history. Keeping another copy of every masked input here wastes hundreds of
+    /// thousands of allocations on large federated workloads.
+    masked_inputs: Vec<bool>,
     /// The current round.
     round: Round,
     /// Stores encrypted output shares sent by MPC nodes for MPC clients. The first element of the key is the client ID,
     /// the second is the node ID.
-    output_shares: HashMap<(ClientIdentity, ClientIdentity), (Vec<u8>, Vec<u8>)>,
-    /// A client remains subscribed as additional parties submit output shares.
+    output_shares: HashMap<ClientIdentity, HashMap<ClientIdentity, EncryptedOutputShares>>,
+    /// Clients waiting for the first reconstructable output snapshot.
     output_sinks: HashMap<ClientIdentity, Arc<SubscriptionSink>>,
+    /// Clients whose reconstructable output snapshot is being, or has been, delivered. This
+    /// prevents later party submissions from repeatedly sending growing snapshots.
+    output_deliveries: HashSet<ClientIdentity>,
     /// The set of clients that are permitted to call `obtain_output_shares`.
     output_clients: Vec<ClientIdentity>,
     /// Optional index assignments used to prevent clients from reserving indices assigned to others.
@@ -1089,7 +1171,46 @@ struct CoordinatorExecutionState {
 }
 
 type TransitionDelivery = (Round, Event, Vec<SubscriptionSink>);
-type OutputDelivery = (Arc<SubscriptionSink>, Vec<(Vec<u8>, Vec<u8>)>);
+type OutputDelivery = (Arc<SubscriptionSink>, Vec<EncryptedOutputShares>);
+
+fn same_subscription(left: &SubscriptionSink, right: &SubscriptionSink) -> bool {
+    left.connection_id() == right.connection_id()
+        && left.subscription_id() == right.subscription_id()
+}
+
+fn prune_failed_subscriptions(
+    subscriptions: &mut Vec<Arc<SubscriptionSink>>,
+    failed: &[Arc<SubscriptionSink>],
+) {
+    subscriptions.retain(|candidate| {
+        !candidate.is_closed()
+            && !failed
+                .iter()
+                .any(|failed| same_subscription(candidate, failed))
+    });
+}
+
+/// Serialize a subscription item once, then reuse that encoded payload for every sink. The
+/// JSON-RPC envelope is still sink-specific, but the expensive walk over large byte payloads is
+/// no longer repeated once per MPC party.
+async fn broadcast_subscription_item<T: Serialize>(
+    sinks: &[Arc<SubscriptionSink>],
+    item: &T,
+) -> Vec<Arc<SubscriptionSink>> {
+    if sinks.is_empty() {
+        return Vec::new();
+    }
+    let message = SubscriptionMessage::from(
+        to_json_raw_value(item).expect("failed to serialize subscription item"),
+    );
+    let results =
+        futures_util::future::join_all(sinks.iter().map(|sink| sink.send(message.clone()))).await;
+    sinks
+        .iter()
+        .zip(results)
+        .filter_map(|(sink, result)| result.is_err().then(|| Arc::clone(sink)))
+        .collect()
+}
 
 async fn deliver_transitions(deliveries: Vec<TransitionDelivery>) {
     for (round, event, sinks) in deliveries {
@@ -1412,13 +1533,13 @@ impl CoordinatorExecutionState {
             masked_input_sinks: vec![],
             assigned_masked_input_events: vec![],
             assigned_masked_input_sinks: vec![],
-            masked_input_delivery: Arc::new(Mutex::new(())),
             n_reserved: 0,
             reserved_indices: vec![None; n_inputs],
-            masked_inputs: vec![None; n_inputs],
+            masked_inputs: vec![false; n_inputs],
             round: Round::Idle,
             output_shares: HashMap::new(),
             output_sinks: HashMap::new(),
+            output_deliveries: HashSet::new(),
             output_clients: registration.output_clients.clone(),
             input_assignments: registration.input_assignment.input_slots.clone(),
         })
@@ -1440,14 +1561,14 @@ impl CoordinatorExecutionState {
             }
         }
 
-        self.reserved_index_sinks.push(sink);
+        self.reserved_index_sinks.push(Arc::new(sink));
         Ok(())
     }
 
     async fn subscribe_masked_inputs(&mut self, sink: SubscriptionSink) -> SubscriptionResult {
         if !self.masked_input_events.is_empty() {
             for event in &self.masked_input_events {
-                let json = to_json_raw_value(event).expect("failed convert to JSON");
+                let json = to_json_raw_value(event.as_ref()).expect("failed convert to JSON");
                 if !matches!(
                     tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json)).await,
                     Ok(Ok(()))
@@ -1460,7 +1581,7 @@ impl CoordinatorExecutionState {
             }
         }
 
-        self.masked_input_sinks.push(sink);
+        self.masked_input_sinks.push(Arc::new(sink));
         Ok(())
     }
 
@@ -1484,7 +1605,7 @@ impl CoordinatorExecutionState {
             }
         }
 
-        self.assigned_reserved_index_sinks.push(sink);
+        self.assigned_reserved_index_sinks.push(Arc::new(sink));
         Ok(())
     }
 
@@ -1508,7 +1629,7 @@ impl CoordinatorExecutionState {
             }
         }
 
-        self.assigned_masked_input_sinks.push(sink);
+        self.assigned_masked_input_sinks.push(Arc::new(sink));
         Ok(())
     }
 
@@ -1533,7 +1654,7 @@ impl CoordinatorExecutionState {
             let missing = self
                 .masked_inputs
                 .iter()
-                .filter(|input| input.is_none())
+                .filter(|submitted| !**submitted)
                 .count();
             if missing > 0 {
                 return Some(format!(
@@ -1634,6 +1755,9 @@ impl CoordinatorExecutionState {
         client_id: &ClientIdentity,
         min_shares: usize,
     ) -> Option<OutputDelivery> {
+        if self.output_deliveries.contains(client_id) {
+            return None;
+        }
         let waiter = self.output_sinks.get(client_id)?.clone();
         if waiter.is_closed() {
             self.output_sinks.remove(client_id);
@@ -1642,14 +1766,15 @@ impl CoordinatorExecutionState {
 
         let output_shares = self
             .output_shares
-            .iter()
-            .filter(|((candidate, _), _)| candidate == client_id)
-            .map(|(_, shares)| shares.clone())
-            .collect::<Vec<_>>();
+            .get(client_id)
+            .map(|shares| shares.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
         if output_shares.len() < min_shares {
             return None;
         }
 
+        self.output_sinks.remove(client_id);
+        self.output_deliveries.insert(client_id.clone());
         Some((waiter, output_shares))
     }
 }
@@ -1672,16 +1797,14 @@ async fn deliver_ready_output_waiters(
     };
 
     let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
-    if waiter.send(json).await.is_err() {
-        let mut shared = shared.lock().await;
-        if let Some(execution) = shared.executions.get_mut(&execution_id) {
-            if execution
-                .output_sinks
-                .get(client_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &waiter))
-            {
-                execution.output_sinks.remove(client_id);
-            }
+    let delivered = waiter.send(json).await.is_ok();
+    let mut shared = shared.lock().await;
+    if let Some(execution) = shared.executions.get_mut(&execution_id) {
+        if delivered {
+            execution.output_shares.remove(client_id);
+        } else {
+            // Preserve the collected shares so a reconnect can retry delivery.
+            execution.output_deliveries.remove(client_id);
         }
     }
 }
@@ -1870,7 +1993,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     async fn submit_masked_input(
         &self,
         execution_id: ExecutionId,
-        masked_input: Vec<u8>,
+        masked_input: WireBytes,
         reserved_index: u64,
     ) -> RpcResult<()> {
         self.submit_masked_inputs(execution_id, vec![masked_input], vec![reserved_index])
@@ -1880,20 +2003,13 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     async fn submit_masked_inputs(
         &self,
         execution_id: ExecutionId,
-        masked_inputs: Vec<Vec<u8>>,
+        masked_inputs: Vec<WireBytes>,
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()> {
         let (quorum, roster_head) = {
             let shared = self.d.lock().await;
             (shared.transition_quorum(), shared.mpc_nodes[0].clone())
         };
-        let delivery = {
-            let d = self.execution_state(execution_id).await?;
-            d.masked_input_delivery.clone()
-        };
-        // Preserve submission order while allowing unrelated coordinator RPCs
-        // and executions to progress during subscription delivery.
-        let _delivery_guard = delivery.lock().await;
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputCollection {
@@ -1954,7 +2070,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                                 None::<()>
                         ));
                     }
-                    if d.masked_inputs[reserved_index].is_some() {
+                    if d.masked_inputs[reserved_index] {
                         return Err(ErrorObjectOwned::owned(
                             ErrorCode::ServerError(MaskedInputAlreadySubmitted as i32).code(),
                             format!(
@@ -1982,7 +2098,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         let mut assigned_events = Vec::new();
         for (raw_reserved_index, masked_input) in reserved_indices.into_iter().zip(masked_inputs) {
             let reserved_index = raw_reserved_index as usize;
-            d.masked_inputs[reserved_index] = Some(masked_input.clone());
+            d.masked_inputs[reserved_index] = true;
 
             if let Some(slot) = d.input_assignments.get(reserved_index) {
                 assigned_events.push(AssignedMaskedInputEvent {
@@ -1998,60 +2114,37 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
 
         // One event carries every pair in this batch, so subscribers (and history replay) see
         // one message per `submit_masked_input(s)` call instead of one per index.
-        let event = Event::MaskedInputEvent {
+        let event = Arc::new(Event::MaskedInputEvent {
             client: self.id.clone(),
             masked_inputs: pairs,
-        };
+        });
         d.masked_input_events.push(event.clone());
         d.assigned_masked_input_events
             .extend(assigned_events.iter().cloned());
 
-        // Snapshot the sinks under the state lock, then release it before any
-        // WebSocket I/O. The per-execution delivery guard above prevents a
-        // concurrent submitter from observing the temporarily empty sink lists.
-        let sinks = std::mem::take(&mut d.masked_input_sinks);
+        // Keep subscriptions in their live lists while delivery is in flight. This permits
+        // concurrent client batches to encode and drain independently instead of serializing all
+        // 100 clients behind one per-execution mutex.
+        let sinks = d.masked_input_sinks.clone();
         let assigned_sinks = if assigned_events.is_empty() {
             Vec::new()
         } else {
-            std::mem::take(&mut d.assigned_masked_input_sinks)
+            d.assigned_masked_input_sinks.clone()
         };
         drop(d);
 
-        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
-            let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
-        }))
-        .await;
-        let assigned_results = if assigned_sinks.is_empty() {
-            Vec::new()
-        } else {
-            let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
-                let json = to_json_raw_value(&assigned_events).expect("failed convert to JSON");
-                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
-            }))
-            .await;
-            results
-        };
+        let (failed, assigned_failed) = tokio::join!(
+            broadcast_subscription_item(&sinks, event.as_ref()),
+            broadcast_subscription_item(&assigned_sinks, &assigned_events),
+        );
 
         let Ok(mut d) = self.execution_state(execution_id).await else {
-            // Delivery completed, but the execution was retired before its
-            // subscription lists could be pruned.
+            // Delivery completed, but the execution was retired before failed subscriptions
+            // could be pruned.
             return Ok(());
         };
-        for (sink, result) in sinks.into_iter().zip(results) {
-            if matches!(result, Ok(Ok(()))) {
-                d.masked_input_sinks.push(sink);
-            } else {
-                eprintln!("coordinator masked-input subscriber disconnected or timed out");
-            }
-        }
-        for (sink, result) in assigned_sinks.into_iter().zip(assigned_results) {
-            if matches!(result, Ok(Ok(()))) {
-                d.assigned_masked_input_sinks.push(sink);
-            } else {
-                eprintln!("coordinator assigned masked-input subscriber disconnected or timed out");
-            }
-        }
+        prune_failed_subscriptions(&mut d.masked_input_sinks, &failed);
+        prune_failed_subscriptions(&mut d.assigned_masked_input_sinks, &assigned_failed);
 
         // This input may have been the last one the `MPCExecution` precondition was waiting on.
         // Re-checking here is what makes the precondition a wait rather than a rejection: parties
@@ -2215,41 +2308,25 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         d.assigned_reserved_index_events
             .extend(assigned_reservations.iter().cloned());
 
-        // Broadcast the batch to all subscribed RPC clients concurrently -- sequential sends
-        // here would hold the coordinator-wide execution lock for as long as the slowest
-        // subscriber takes to drain its socket, stalling every other execution and client on
-        // this coordinator. Disconnected subscribers are pruned; late/restarted nodes replay
-        // from event history.
-        let sinks = std::mem::take(&mut d.reserved_index_sinks);
-        let results = futures_util::future::join_all(sinks.iter().map(|sink| {
-            let json = to_json_raw_value(&event).expect("failed convert to JSON");
-            tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
-        }))
-        .await;
-        for (sink, result) in sinks.into_iter().zip(results) {
-            if matches!(result, Ok(Ok(()))) {
-                d.reserved_index_sinks.push(sink);
-            } else {
-                eprintln!("coordinator reserved-index subscriber disconnected or timed out");
-            }
-        }
-        if !assigned_reservations.is_empty() {
-            let assigned_sinks = std::mem::take(&mut d.assigned_reserved_index_sinks);
-            let results = futures_util::future::join_all(assigned_sinks.iter().map(|sink| {
-                let json =
-                    to_json_raw_value(&assigned_reservations).expect("failed convert to JSON");
-                tokio::time::timeout(SUBSCRIPTION_SEND_TIMEOUT, sink.send(json))
-            }))
-            .await;
-            for (sink, result) in assigned_sinks.into_iter().zip(results) {
-                if matches!(result, Ok(Ok(()))) {
-                    d.assigned_reserved_index_sinks.push(sink);
-                } else {
-                    eprintln!(
-                        "coordinator assigned reserved-index subscriber disconnected or timed out"
-                    );
-                }
-            }
+        // Snapshot subscriptions, then release the execution lock before encoding or touching
+        // WebSockets. New subscribers are added to the live lists and cannot be lost while this
+        // broadcast is in flight; they replay this event from history during subscription.
+        let sinks = d.reserved_index_sinks.clone();
+        let assigned_sinks = (!assigned_reservations.is_empty())
+            .then(|| d.assigned_reserved_index_sinks.clone())
+            .unwrap_or_default();
+        drop(d);
+
+        let (failed, assigned_failed) = tokio::join!(
+            broadcast_subscription_item(&sinks, &event),
+            broadcast_subscription_item(&assigned_sinks, &assigned_reservations),
+        );
+        if !failed.is_empty() || !assigned_failed.is_empty() {
+            let Ok(mut d) = self.execution_state(execution_id).await else {
+                return Ok(());
+            };
+            prune_failed_subscriptions(&mut d.reserved_index_sinks, &failed);
+            prune_failed_subscriptions(&mut d.assigned_reserved_index_sinks, &assigned_failed);
         }
 
         Ok(())
@@ -2290,11 +2367,6 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
-        let delivery = {
-            let d = self.execution_state(execution_id).await?;
-            d.masked_input_delivery.clone()
-        };
-        let _delivery_guard = delivery.lock().await;
         let mut d = self.execution_state(execution_id).await?;
         if round_index(next_round) <= round_index(d.round) {
             // Already applied. A party that proposes a round the quorum passed without it is
@@ -2317,7 +2389,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         &self,
         execution_id: ExecutionId,
         client_id: ClientIdentity,
-        enc_shares: (Vec<u8>, Vec<u8>),
+        enc_shares: EncryptedOutputShares,
     ) -> RpcResult<()> {
         let is_party = {
             let shared = self.d.lock().await;
@@ -2340,10 +2412,15 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
+        // The client already has enough shares. Remaining parties need not upload or trigger
+        // another copy of the same output snapshot.
+        if d.output_deliveries.contains(&client_id) {
+            return Ok(());
+        }
+
         // a node cannot send output shares for a client twice
-        if d.output_shares
-            .contains_key(&(client_id.clone(), self.id.clone()))
-        {
+        let client_shares = d.output_shares.entry(client_id.clone()).or_default();
+        if client_shares.contains_key(&self.id) {
             return Err(ErrorObjectOwned::owned(
                 ErrorCode::ServerError(OutputSharesAlreadySent as i32).code(),
                 format!(
@@ -2355,8 +2432,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         }
 
         // output shares for `client_id` from `self.id`
-        d.output_shares
-            .insert((client_id.clone(), self.id.clone()), enc_shares);
+        client_shares.insert(self.id.clone(), enc_shares);
 
         let min_shares = d.registration.min_output_shares as usize;
         drop(d);
@@ -2382,9 +2458,10 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                 None::<()>,
             )),
             Ok(d)
-                if d.output_sinks
-                    .get(&self.id)
-                    .is_some_and(|sink| !sink.is_closed()) =>
+                if d.output_deliveries.contains(&self.id)
+                    || d.output_sinks
+                        .get(&self.id)
+                        .is_some_and(|sink| !sink.is_closed()) =>
             {
                 Some(ErrorObjectOwned::owned(
                     ErrorCode::ServerError(OutputSharesAlreadyRequested as i32).code(),
@@ -2408,6 +2485,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         // Recheck after reacquiring the lock in case another subscription for
         // the same identity won the handshake race.
         if !d.output_clients.contains(&self.id)
+            || d.output_deliveries.contains(&self.id)
             || d.output_sinks
                 .get(&self.id)
                 .is_some_and(|current| !current.is_closed())
@@ -2807,7 +2885,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                 .serialize_compressed(&mut masked_input_bytes)
                 .map_err(|_| CoordinatorError::SerializationError)?;
             reserved_indices.push(*i);
-            masked_inputs.push(masked_input_bytes);
+            masked_inputs.push(WireBytes(masked_input_bytes));
         }
 
         CoordinatorRPCBaseClient::submit_masked_inputs(
@@ -2872,14 +2950,15 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
 
             let mut output_shares = Vec::new();
             for (encapped_key_bytes, c) in enc_output_shares.iter() {
-                let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes)
-                    .map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
+                let encapped_key =
+                    <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes.as_slice())
+                        .map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
                 let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
                     &OpModeR::Base,
                     &client_sk,
                     &encapped_key,
                     &enc_info,
-                    c,
+                    c.as_slice(),
                     b"",
                 )
                 .map_err(|_| CoordinatorError::DecryptionError)?;
@@ -2955,7 +3034,10 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
             &mut rng,
         )
         .map_err(|_| CoordinatorError::EncryptionError)?;
-        let c = (encapsulated_key.to_bytes().to_vec(), ciphertext);
+        let c = (
+            WireBytes(encapsulated_key.to_bytes().to_vec()),
+            WireBytes(ciphertext),
+        );
 
         // Send the encrypted shares.
         if let Err(e) = CoordinatorRPCBaseClient::send_output_shares(

@@ -8,7 +8,7 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
 };
 use stoffel_mpc_coordinator_off_chain::{
     AssignedMaskReservation, CoordinatorRPCBaseClient, ExecutionRegistration, InputAssignment,
-    OneOffShutdownConfig, DEFAULT_MAX_CONCURRENT_EXECUTIONS,
+    OneOffShutdownConfig, WireBytes, DEFAULT_MAX_CONCURRENT_EXECUTIONS,
 };
 use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{
@@ -41,6 +41,17 @@ fn free_port() -> u16 {
 
 fn execution(byte: u8) -> ExecutionId {
     ExecutionId::from_bytes([byte; 32])
+}
+
+#[test]
+fn wire_bytes_use_compact_base64_only() {
+    let bytes = WireBytes(vec![0, 1, 127, 128, 255]);
+    assert_eq!(serde_json::to_string(&bytes).unwrap(), "\"AAF/gP8=\"");
+    assert_eq!(
+        serde_json::from_str::<WireBytes>("\"AAF/gP8=\"").unwrap(),
+        bytes
+    );
+    assert!(serde_json::from_str::<WireBytes>("[0,1,127,128,255]").is_err());
 }
 
 fn cert_parts(cert: &Arc<rcgen::CertifiedKey<rcgen::KeyPair>>) -> (Vec<u8>, Vec<u8>) {
@@ -1289,7 +1300,7 @@ async fn end_to_end_fake_coord() {
 }
 
 #[tokio::test]
-async fn output_waiters_receive_threshold_and_later_share_snapshots() {
+async fn output_waiters_receive_exactly_one_threshold_snapshot() {
     stoffel_mpc_coordinator_shared::setup_test();
 
     let execution_id = ExecutionId::from_bytes([0x65; 32]);
@@ -1344,10 +1355,10 @@ async fn output_waiters_receive_threshold_and_later_share_snapshots() {
         .await
         .unwrap();
     let outputs = [
-        (vec![1], vec![11]),
-        (vec![2], vec![22]),
-        (vec![3], vec![33]),
-        (vec![4], vec![44]),
+        (WireBytes(vec![1]), WireBytes(vec![11])),
+        (WireBytes(vec![2]), WireBytes(vec![22])),
+        (WireBytes(vec![3]), WireBytes(vec![33])),
+        (WireBytes(vec![4]), WireBytes(vec![44])),
     ];
     assert!(CoordinatorRPCBaseClient::send_output_shares(
         &node_rpcs[0],
@@ -1406,18 +1417,22 @@ async fn output_waiters_receive_threshold_and_later_share_snapshots() {
     CoordinatorRPCBaseClient::send_output_shares(
         &node_rpcs[3],
         execution_id,
-        output_id,
+        output_id.clone(),
         outputs[3].clone(),
     )
     .await
     .unwrap();
-    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), waiter_a.next())
-        .await
-        .expect("additional-share snapshot must be delivered")
-        .expect("subscription must remain open after threshold delivery")
-        .expect("additional-share snapshot must deserialize");
-    assert_eq!(snapshot.len(), 4);
-    assert!(outputs.iter().all(|output| snapshot.contains(output)));
+    let later = tokio::time::timeout(std::time::Duration::from_millis(100), waiter_a.next()).await;
+    assert!(
+        !matches!(later, Ok(Some(Ok(_)))),
+        "later party shares must not redeliver a growing output snapshot"
+    );
+    assert!(
+        CoordinatorRPCBaseClient::obtain_output_shares(&output_rpc, execution_id)
+            .await
+            .is_err(),
+        "a delivered output must not open a second subscription"
+    );
 }
 
 // A client that abandons a still-pending `receive_assigned_mask_shares` subscription (e.g. it
