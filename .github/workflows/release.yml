@@ -111,9 +111,10 @@ jobs:
           cargo clippy --workspace --all-targets
           cargo test --workspace
 
-      # `cargo publish --workspace --dry-run` is the right check once the
-      # dependency graph is publishable. Until then `cargo package` gives us
-      # the .crate artifacts to sign without resolving against crates.io.
+      # `cargo publish --dry-run` validates the complete publishable workspace,
+      # but stores its archives under target/package/tmp-*. Run cargo package
+      # afterward to materialize the canonical target/package/*.crate files
+      # consumed by the signing steps.
       - name: Package workspace members
         run: |
           args=""
@@ -123,9 +124,9 @@ jobs:
 
           if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.publish_crates }}" = "true" ]; then
             cargo publish $args --dry-run
-          else
-            cargo package $args --no-verify --allow-dirty
           fi
+
+          cargo package $args --no-verify --allow-dirty
 
       # Snapshot the packaged crates outside target/package before anything
       # else can touch them. cargo publish repackages into target/package, so
