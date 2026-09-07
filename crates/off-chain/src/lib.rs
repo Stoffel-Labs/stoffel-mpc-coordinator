@@ -536,9 +536,14 @@ pub mod node_rpc {
                 }
             }
 
-            for (sink, json) in pending_sends {
-                let _ = sink.send(json).await;
-            }
+            futures_util::future::join_all(
+                pending_sends
+                    .into_iter()
+                    .map(|(sink, json)| async move {
+                        let _ = sink.send(json).await;
+                    }),
+            )
+            .await;
 
             Ok(())
         }
@@ -648,9 +653,14 @@ pub mod node_rpc {
                 }
             }
 
-            for (sink, json) in pending_sends {
-                let _ = sink.send(json).await;
-            }
+            futures_util::future::join_all(
+                pending_sends
+                    .into_iter()
+                    .map(|(sink, json)| async move {
+                        let _ = sink.send(json).await;
+                    }),
+            )
+            .await;
 
             Ok(())
         }
