@@ -1,3 +1,4 @@
+pub mod browser_rpc;
 pub mod tests;
 
 use ark_ff::FftField;
@@ -186,6 +187,10 @@ pub mod node_rpc {
         rpc_server: Arc<Mutex<NodeRPCServerInternal>>,
         addr: String,
         server_handle: RPCServerHandle,
+        /// Present only when started via `start_with_browser_tls`: the ordinary
+        /// server-authenticated-TLS listener browser clients connect to, alongside the native
+        /// mTLS listener `server_handle` owns.
+        browser_handle: Option<RPCServerHandle>,
     }
 
     /// An object used by an MPC client to connect to the RPC interfaces of many nodes.
@@ -338,6 +343,51 @@ pub mod node_rpc {
                 rpc_server: rpc_server_data,
                 addr: String::from(addr),
                 server_handle,
+                browser_handle: None,
+            })
+        }
+
+        /// Starts both the native mTLS listener (`addr:port`, for native/CLI MPC clients) and an
+        /// ordinary server-authenticated-TLS listener for browser clients (`browser_addr:
+        /// browser_port`), sharing the same node state. `browser_cert_chain_pem`/
+        /// `browser_key_pem` are an ordinary PEM certificate chain and private key -- typically
+        /// CA-issued -- distinct from `cert_der`/`key_der`, which stay self-signed DER for the
+        /// native mTLS listener as before. See `crate::browser_rpc`'s module doc for why browser
+        /// clients need a separate listener at all.
+        #[allow(clippy::too_many_arguments)]
+        pub async fn start_with_browser_tls(
+            addr: &str,
+            port: u16,
+            cert_der: Vec<u8>,
+            key_der: Vec<u8>,
+            browser_addr: &str,
+            browser_port: u16,
+            browser_cert_chain_pem: Vec<u8>,
+            browser_key_pem: Vec<u8>,
+        ) -> Result<Self, CoordinatorError> {
+            let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::new()));
+            let server_handle =
+                stoffel_mpc_coordinator_shared::rpc::start_coord::<NodeRPCServerImpl>(
+                    addr,
+                    port,
+                    cert_der,
+                    key_der,
+                    rpc_server_data.clone(),
+                )
+                .await?;
+            let browser_handle = stoffel_mpc_coordinator_shared::rpc::start_coord_browser_tls(
+                browser_addr,
+                browser_port,
+                browser_cert_chain_pem,
+                browser_key_pem,
+                crate::browser_rpc::node_browser_methods(rpc_server_data.clone()),
+            )
+            .await?;
+            Ok(Self {
+                rpc_server: rpc_server_data,
+                addr: String::from(addr),
+                server_handle,
+                browser_handle: Some(browser_handle),
             })
         }
 
@@ -358,6 +408,9 @@ pub mod node_rpc {
         }
 
         pub async fn shutdown(self) {
+            if let Some(browser_handle) = self.browser_handle {
+                browser_handle.shutdown().await;
+            }
             self.server_handle.shutdown().await;
         }
 
@@ -615,7 +668,10 @@ pub mod node_rpc {
     }
 
     /// State that must never be shared between two program invocations.
-    struct NodeRPCExecutionState {
+    ///
+    /// `pub(crate)`, not private: `execution_state`'s return type must be at least as visible
+    /// as `execution_state` itself, which is `pub(crate)` for `browser_rpc` (see its doc).
+    pub(crate) struct NodeRPCExecutionState {
         /// Maps reserved indices to the clients that have reserved them.
         index_to_client: HashMap<u64, ClientIdentity>,
         assigned_reservations: HashMap<u64, AssignedMaskReservation>,
@@ -668,7 +724,11 @@ pub mod node_rpc {
             self.executions.remove(&execution_id).is_some()
         }
 
-        fn execution_state(
+        /// `pub(crate)`, not private: `browser_rpc` (a sibling module, not a descendant of
+        /// `node_rpc`) needs this to serve `browser_assigned_mask_shares` without deriving a
+        /// per-connection identity from a TLS client certificate the way the native mTLS path
+        /// does -- see `browser_rpc`'s module doc.
+        pub(crate) fn execution_state(
             &self,
             execution_id: ExecutionId,
         ) -> Option<Arc<Mutex<NodeRPCExecutionState>>> {
@@ -702,7 +762,8 @@ pub mod node_rpc {
             })
         }
 
-        fn assigned_mask_shares_for_client(
+        /// `pub(crate)`, not private -- see `execution_state`'s doc above.
+        pub(crate) fn assigned_mask_shares_for_client(
             &self,
             id: &ClientIdentity,
             start: u64,
@@ -2517,6 +2578,10 @@ impl stoffel_mpc_coordinator_shared::rpc::RPCServerConnection
 pub struct OffChainCoordinatorServer<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> {
     addr: String,
     server_handle: RPCServerHandle,
+    /// Present only when started via `start_coord_with_browser_tls`: the ordinary
+    /// server-authenticated-TLS listener browser clients connect to, alongside the native mTLS
+    /// listener `server_handle` owns.
+    browser_handle: Option<RPCServerHandle>,
     _connection: std::marker::PhantomData<C>,
 }
 
@@ -2569,6 +2634,57 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         Ok(Self {
             addr: String::from(addr),
             server_handle,
+            browser_handle: None,
+            _connection: std::marker::PhantomData,
+        })
+    }
+
+    /// Starts both the native mTLS listener (`addr:port`, for native/CLI clients) and an
+    /// ordinary server-authenticated-TLS listener for browser clients (`browser_addr:
+    /// browser_port`), sharing the same coordinator state. `browser_cert_chain_pem`/
+    /// `browser_key_pem` are an ordinary PEM certificate chain and private key -- typically
+    /// CA-issued, since a browser's `new WebSocket("wss://...")` has no prompt to accept a
+    /// self-signed one -- distinct from `cert_der`/`key_der`, which stay self-signed DER for the
+    /// native mTLS listener as before. See `browser_rpc`'s module doc for why browser clients
+    /// need a separate listener at all, rather than reusing the native one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_coord_with_browser_tls(
+        shared: CoordinatorRPCServerSharedBase,
+        addr: &str,
+        port: u16,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+        browser_addr: &str,
+        browser_port: u16,
+        browser_cert_chain_pem: Vec<u8>,
+        browser_key_pem: Vec<u8>,
+    ) -> Result<Self, CoordinatorError>
+    where
+        C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection<
+            Internal = CoordinatorRPCServerSharedBase,
+        >,
+    {
+        let rpc_server_data = Arc::new(Mutex::new(shared));
+        let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<C>(
+            addr,
+            port,
+            cert_der,
+            key_der,
+            rpc_server_data.clone(),
+        )
+        .await?;
+        let browser_handle = stoffel_mpc_coordinator_shared::rpc::start_coord_browser_tls(
+            browser_addr,
+            browser_port,
+            browser_cert_chain_pem,
+            browser_key_pem,
+            crate::browser_rpc::coordinator_browser_methods(rpc_server_data.clone()),
+        )
+        .await?;
+        Ok(Self {
+            addr: String::from(addr),
+            server_handle,
+            browser_handle: Some(browser_handle),
             _connection: std::marker::PhantomData,
         })
     }
@@ -2637,8 +2753,11 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         Ok(())
     }
 
-    /// Stops the listener. Dropping the server state closes its connections.
+    /// Stops the listener(s). Dropping the server state closes its connections.
     pub async fn shutdown(self) {
+        if let Some(browser_handle) = self.browser_handle {
+            browser_handle.shutdown().await;
+        }
         self.server_handle.shutdown().await;
     }
 }

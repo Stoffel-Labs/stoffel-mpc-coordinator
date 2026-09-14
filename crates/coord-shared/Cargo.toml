@@ -31,6 +31,7 @@ futures-util = { workspace = true }
 rcgen = { workspace = true }
 tower = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 url = { workspace = true }
 ring = { workspace = true }
