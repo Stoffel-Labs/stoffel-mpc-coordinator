@@ -1355,10 +1355,14 @@ impl CoordinatorRPCServerSharedBase {
 
     /// Acknowledges that `party` has finished with `execution_id`.
     ///
-    /// Retirement happens in two stages. Once `n - t` parties have acknowledged, the execution is
-    /// eligible for capacity reclamation, but its complete round history stays live so a healthy
-    /// straggler can still finish. Unanimity removes it immediately. If faulty parties leave the
-    /// coordinator at capacity, registration compacts a quorum-retired execution into a bounded
+    /// Once `n - t` parties have acknowledged, the execution is eligible for capacity
+    /// reclamation, but its complete round history — including any output shares a client has
+    /// not yet retrieved — stays live even after every party acknowledges. It is only actually
+    /// dropped lazily, when a new registration needs the slot back (see `register_execution`).
+    /// This intentionally does not race a client's own output retrieval against party-side
+    /// cleanup: unlike parties, clients never acknowledge anything, so there is no signal here
+    /// that would tell us it is safe to remove eagerly. If faulty parties leave the coordinator
+    /// at capacity, registration compacts a quorum-retired execution into a bounded
     /// acknowledgement-only tombstone before admitting new work.
     pub fn retire_execution(
         &mut self,
@@ -1383,9 +1387,6 @@ impl CoordinatorRPCServerSharedBase {
             return Ok(());
         };
         execution.retirement_acks.insert(party.clone());
-        if execution.retirement_acks.len() >= n {
-            self.executions.remove(&execution_id);
-        }
         Ok(())
     }
 
@@ -1400,13 +1401,18 @@ impl CoordinatorRPCServerSharedBase {
     fn retirement_progress(&self, execution_id: ExecutionId) -> (usize, usize, bool) {
         let n = self.mpc_nodes.len();
         if let Some(execution) = self.executions.get(&execution_id) {
-            return (execution.retirement_acks.len(), n, false);
+            let acknowledged = execution.retirement_acks.len();
+            // Unanimity is a completion *signal* for callers like the one-off coordinator's
+            // shutdown poller, not a trigger to drop state here: `retire_execution` no longer
+            // removes an execution just because every party acknowledged it, so completeness has
+            // to be read off the ack count directly rather than off the execution's absence.
+            return (acknowledged, n, acknowledged >= n);
         }
         if let Some(acks) = self.retired.acks.get(&execution_id) {
             return (acks.len(), n, false);
         }
-        // The one-off execution is registered before the listener starts and can only leave both
-        // maps after unanimous retirement, so absence here is its completed drain state.
+        // Only reachable once capacity pressure has both evicted this execution and then the
+        // resulting tombstone has itself drained to unanimity (see `RetiredExecutions::acknowledge`).
         (n, n, true)
     }
 }
