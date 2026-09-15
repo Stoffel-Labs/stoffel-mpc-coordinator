@@ -204,7 +204,10 @@ async fn one_listener_isolates_and_retires_concurrent_executions() {
     first.send_output().await.unwrap();
     first.finalize().await.unwrap();
     first.retire_execution().await.unwrap();
-    assert!(first.wait_for_round(Round::ProgramFinished).await.is_err());
+    // Unanimous retirement no longer deletes an execution's round history: a client that has not
+    // yet retrieved its output must still be able to read it, so state now only leaves the map
+    // lazily, under real capacity pressure (see `register_execution`).
+    first.wait_for_round(Round::ProgramFinished).await.unwrap();
     second.wait_for_round(Round::Preprocessing).await.unwrap();
 }
 
