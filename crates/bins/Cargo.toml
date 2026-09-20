@@ -5,7 +5,6 @@ edition.workspace = true
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
-documentation.workspace = true
 categories.workspace = true
 keywords.workspace = true
 license.workspace = true
@@ -25,6 +24,14 @@ path = "src/bin/deploy-contract.rs"
 name = "generate-ids"
 path = "src/bin/generate-ids.rs"
 
+[[bin]]
+name = "roster-digest"
+path = "src/bin/roster-digest.rs"
+
+[[bin]]
+name = "issue-invitation"
+path = "src/bin/issue-invitation.rs"
+
 [dependencies]
 stoffel-mpc-coordinator-shared = { workspace = true }
 stoffel-mpc-coordinator-off-chain = { workspace = true }
@@ -38,7 +45,9 @@ ark-serialize = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 rcgen = { workspace = true }
+ring = { workspace = true }
 rustls = { workspace = true }
+serde_json = { workspace = true }
 stoffelmpc-mpc = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
-x509-parser = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "time"] }

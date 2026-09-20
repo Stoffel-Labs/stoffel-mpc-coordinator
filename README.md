@@ -1,11 +1,28 @@
-# Stoffel MPC Coordinator Library
+# Stoffel MPC Coordinator Libraries
 
 `stoffel-mpc-coordinator` provides coordinator primitives for Stoffel MPC workflows. It manages the full protocol lifecycle: preprocessing, input-mask reservation, input collection, MPC execution, and output distribution.
 
-The crate supports two coordinator transports:
+The workspace contains these libraries:
 
-- **On-chain**: Ethereum smart-contract coordination via Alloy and the Stoffel Solidity bindings.
-- **Off-chain**: secure JSON-RPC over mutual TLS for local or non-chain deployments.
+- [`stoffel-mpc-coordinator-shared`](https://crates.io/crates/stoffel-mpc-coordinator-shared): shared coordinator traits, execution identifiers, protocol rounds, RPC utilities, and test helpers.
+- [`stoffel-mpc-coordinator-off-chain`](https://crates.io/crates/stoffel-mpc-coordinator-off-chain): secure JSON-RPC coordination over mutual TLS for local or non-chain deployments.
+- `stoffel-mpc-coordinator-on-chain`: Ethereum smart-contract coordination via Alloy and the Stoffel Solidity bindings; currently workspace-only.
+- `stoffel-mpc-coordinator-bins`: deployment and local-development binaries; currently workspace-only.
+
+## Installation
+
+Add the off-chain coordinator library with:
+
+```toml
+[dependencies]
+stoffel-mpc-coordinator-off-chain = "0.3.0"
+```
+
+The shared crate is pulled in automatically. Depend on `stoffel-mpc-coordinator-shared = "0.3.0"` directly when implementing against transport-independent coordinator traits and types.
+
+## Package status
+
+Version `0.3.0` publishes the shared and off-chain libraries. It is a breaking release: `0.2.0` and `0.3.0` peers do not interoperate, and the changes are listed in [`CHANGELOG.md`](CHANGELOG.md). The on-chain and binary crates remain excluded from crates.io because they depend on pinned Stoffel Solidity SDK binding crates from Git.
 
 ## Deploying the coordinator
 
@@ -20,16 +37,30 @@ Every program invocation needs one nonzero 256-bit execution ID shared by its co
 nodes, and clients. The commands below use
 `0000000000000000000000000000000000000000000000000000000000000001` as a readable example;
 use a freshly generated value (for example, `openssl rand -hex 32`) for each real invocation.
-Then, run the off-chain coordinator with `cargo run --bin run-coord -- --one-off 0000000000000000000000000000000000000000000000000000000000000000,0000000000000000000000000000000000000000000000000000000000000001 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --n-inputs 2 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt,ids/pub/clients/client1.crt`.
-`--one-off <hash>,<execution-id>` registers that single execution before listening and exits the coordinator once it reaches the ProgramFinished round; omit it to run a standing coordinator that keeps listening and accepts further registrations.
+Then run the off-chain coordinator. It registers exactly one execution at startup — its program,
+its client slot table and its admission policy — and nothing can register an execution remotely:
 
-For VM-backed client IO, pass a compiled `.stflb` with an IO manifest and bind logical VM slots to off-chain client certificates:
+`cargo run --bin run-coord -- --execution-id 0000000000000000000000000000000000000000000000000000000000000001 --program program.stflb --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --t 1 --node-certs ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --client-bindings 0=ids/pub/clients/client0.crt`
 
-`cargo run --bin run-coord -- --one-off 0000000000000000000000000000000000000000000000000000000000000000,0000000000000000000000000000000000000000000000000000000000000001 --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --n 5 --t 1 --initial-mpc-nodes ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --output-clients ids/pub/clients/client0.crt --program program.stflb --client-bindings 0=ids/pub/clients/client0.crt`
+With `--program`, the client slots come from the program's IO manifest (its `client_slot`s must be
+`0..k`), and the registration hash is `program_hash_of` the program bytes; `--hash <64-hex>`
+registers a hash instead, with the slots given as `--client-io <inputs>:<outputs>,…`.
+`--one-off` drains and exits once the retirement quorum of nodes has acknowledged the execution in
+a terminal round; omit it for a standing coordinator.
 
-The off-chain coordinator also selects the MPC share backend from the `.stflb` manifest. Compile
-programs with `stoffel --mpc-backend honeybadger -b program.stfl` or
-`stoffel --mpc-backend avss -b program.stfl`. Legacy/no-program startup defaults to HoneyBadger.
+Client admission is chosen per execution with `--admission`:
+
+- `pre-registered` (the default) binds one client certificate to each slot, from
+  `--client-certs <certs>` in slot order or `--client-bindings <slot>=<cert>,…`.
+- `open` lets any certificate holder bind a free slot, first come, first served. Use it only where
+  reaching the coordinator is already access-controlled.
+- `invitation` admits only the invitee of a `SignedInvitation` from `--invitation-issuer-cert`,
+  in the slot the invitation names. Invitations are signed with
+  `cargo run --bin issue-invitation -- --coordinator <host:port> --coord-cert <cert> --execution-id <64-hex> --expect-program-hash <64-hex> --issuer-key <pkcs8.der> --invitee-cert <cert> --client-index <slot> --valid-for-secs <secs> --out invitation.json`.
+
+`open` and `invitation` require `--association-deadline-secs` and `--input-deadline-secs`: an
+execution whose slots are not all bound, or whose masked inputs are not all submitted, by then is
+aborted.
 
 ## Library overview
 
@@ -87,18 +118,20 @@ Client identities are Ethereum `Address` values. The on-chain node-side RPC serv
 
 The off-chain coordinator operates over JSON-RPC (WebSockets) with mutual TLS, without any blockchain dependency. It consists of two components:
 
-- **`OffChainCoordinatorServer<C>`**: the coordinator RPC server. It is generic over the connection type `C: RPCServerConnection`, so developers can extend both per-connection state and shared state. The provided `FakeCoordinatorConnection` and `CoordinatorRPCServerConnectionBase` are ready-to-use implementations.
+- **`OffChainCoordinatorServer<C>`**: the coordinator RPC server. It is generic over the connection type `C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>`, so developers can extend per-connection state. `OffChainCoordinatorConnection` is the ready-to-use implementation embedders serve.
 - **`OffChainCoordinatorClient<F, S>`**: the RPC client used by both MPC nodes and MPC clients to communicate with the coordinator.
 
 Key behaviors:
 
-- **Round management**: parties triggers transitions by calling `transition(Round)` over RPC; all subscribers receive the corresponding event.
-- **Index reservation**: clients call `reserve_mask_index(i)` during `InputMaskReservation`. The event is broadcast to all `sub_reserved_indices` subscribers, including MPC nodes.
-- **Mask-share distribution**: each MPC node runs a `node_rpc::NodeRPCServer`. After learning a client's reserved index from the coordinator, the node delivers its mask share to the client over a dedicated WebSocket subscription authenticated by mTLS. The client collects `2t + 1` shares and reconstructs the mask locally.
-- **Output distribution**: MPC nodes HPKE-encrypt their output shares under the client's P-256 public key and call `send_output_shares`. Once `2t + 1` shares have arrived at the coordinator, they are forwarded to the client's `obtain_output_shares` subscription.
-- **Bound VM IO layout**: `.stflb` bytecode can carry a client IO manifest built from `ClientStore.take_share*` and client-output calls. Off-chain startup binds VM `client_slot` values to certificate public keys, derives input-mask capacity from bound input counts, and authorizes output clients from bound output counts. Scalar IO types stay with the SDK/VM manifest and are not interpreted by the coordinator. On-chain contracts/events do not yet carry this layout metadata; equivalent Solidity support is deferred.
-- **Authentication**: all connections use mutual TLS. The client's identity is the DER-encoded public key from its certificate, used consistently towards both the coordinator and node RPC servers.
-- **Late-subscriber safety**: subscribers pass the coordinator's startup timestamp so that events fired before the subscription is opened are replayed immediately.
+- **Node roster**: the coordinator is built from a `NodeRoster` of node certificates and serves it unchanged for its lifetime through `get_node_roster`. Nodes and clients connect with `CoordinatorLink`, which pins the coordinator's key and fetches and verifies the roster once.
+- **Round management**: parties trigger transitions by calling `transition(Round)` over RPC; all subscribers receive the corresponding event. An execution that misses its association or input deadline ends in the terminal `Round::Aborted`.
+- **Registration and admission**: an execution is registered in the coordinator's process with a client slot table and an admission policy (`PreRegistered`, `Open` or `Invitation`). Clients bind a slot with `associate_client`, keyed on their mTLS identity; node transport never lists client certificates.
+- **Index reservation and input**: an admitted client reserves exactly its slot's input range during `InputMaskReservation`, and submits all of its masked inputs in one call signed with its certificate key. Reservations are broadcast to `sub_reserved_indices` subscribers, including MPC nodes.
+- **Mask-share distribution**: each MPC node runs a `node_rpc::NodeRPCServer`, registers the admitted reservations it fetched with `get_client_admissions`, and delivers each mask share only to the certificate that holds its index. The client pins every node by roster membership, attributes each share to the node's roster position, and reconstructs the mask locally.
+- **Output distribution**: MPC nodes HPKE-seal their output shares under the admitted client's P-256 public key, sign them, and call `send_output_shares`; the client's `obtain_output_shares` subscription receives one `SealedOutputShares` per node.
+- **Bound VM IO layout**: `.stflb` bytecode can carry a client IO manifest built from `ClientStore.take_share*` and client-output calls. `run-coord --program` turns its `client_slot`s into the registration's slot table: each slot's input count fixes its input range, and its output count its output rights. Scalar IO types stay with the SDK/VM manifest and are not interpreted by the coordinator. On-chain contracts/events do not yet carry this layout metadata; equivalent Solidity support is deferred.
+- **Authentication**: all connections use TLS 1.3 with mutual authentication, and every client-side connection pins its server's key. The coordinator identifies a caller by its certificate's public key.
+- **Late-subscriber safety**: events and submissions recorded before a subscription opens are replayed to it, in order, before it parks for live items.
 
 ### Extending the coordinator
 
@@ -111,4 +144,4 @@ The off-chain coordinator is split into two RPC trait layers:
 
 - **HPKE encryption**: output shares are encrypted.
 - **Threshold**: secret reconstruction requires `2t + 1` shares; both the coordinator and clients enforce this before forwarding or accepting outputs.
-- **Testing utilities**: `self_signed_certs` provides `server_cert()` / `client_cert()` helpers. `setup_test()` installs the default `rustls` crypto provider required before any TLS connections are made in tests.
+- **Testing utilities**: `self_signed_certs` provides `server_cert()` / `client_cert()` helpers. `setup_test()` ensures a default `rustls` crypto provider is available before tests create TLS connections.

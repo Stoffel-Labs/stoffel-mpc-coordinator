@@ -3,19 +3,18 @@ members = ["crates/coord-shared", "crates/off-chain", "crates/on-chain", "crates
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Stoffel Labs Inc <contact@stoffelmpc.com>"]
 homepage = "https://stoffelmpc.com"
 repository = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"
-documentation = "https://docs.rs/stoffel-mpc-coordinator"
 categories = ["cryptography", "network-programming"]
 keywords = ["mpc", "coordinator", "cryptography", "json-rpc", "ethereum"]
 license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-stoffel-mpc-coordinator-shared = { version = "0.1.0", path = "crates/coord-shared" }
+stoffel-mpc-coordinator-shared = { version = "0.3.0", path = "crates/coord-shared" }
 stoffel-mpc-coordinator-off-chain = { path = "crates/off-chain" }
 stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.1" }
 stoffelnet = "0.1.1"
@@ -30,6 +29,7 @@ ark-ff = "0.5.0"
 ark-serialize = "0.5.0"
 ark-std = "0.5.0"
 async-trait = "0.1.89"
+blake3 = "1.8"
 clap = { version = "4.5.56", features = ["derive"] }
 futures-util = "0.3.31"
 hex = "0.4.3"
@@ -43,6 +43,7 @@ rcgen = "0.14.7"
 ring = "0.17.14"
 rustls = "0.23.36"
 serde = "1.0.228"
+serde_json = "1.0"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
 tokio-rustls = "0.26.4"
