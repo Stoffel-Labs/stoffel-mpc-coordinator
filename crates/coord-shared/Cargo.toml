@@ -18,7 +18,7 @@ benchmark = []
 [dependencies]
 stoffelmpc-mpc = { workspace = true }
 stoffelnet = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 ark-bls12-381 = { workspace = true }
 jsonrpsee = { workspace = true }
 serde = { workspace = true }
@@ -42,7 +42,9 @@ rand = { workspace = true }
 p256 = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 ark-std = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
+serde_json = { workspace = true }

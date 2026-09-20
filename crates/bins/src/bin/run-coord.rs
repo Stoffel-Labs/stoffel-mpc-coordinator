@@ -1,240 +1,442 @@
-use clap::{Parser, ValueEnum};
-use std::collections::HashMap;
-use std::fs;
-use stoffel_mpc_coordinator_off_chain::tests::fake_coord::HoneyBadgerCoordinatorConnection;
-use stoffel_mpc_coordinator_off_chain::{
-    ClientIdentity, CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment,
-    InputClientRange, OffChainCoordinatorServer, OneOffShutdownConfig,
-    DEFAULT_ONE_OFF_SHUTDOWN_GRACE,
-};
-use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
-use stoffel_mpc_coordinator_shared::{CoordinatorError, ExecutionId};
-use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, MpcBackend};
-use x509_parser::prelude::*;
+//! Runs an off-chain coordinator that registers exactly one execution at startup.
+//!
+//! Registration is in-process and operator-only: this binary is where the operator fixes the
+//! execution's program, its client slot table and its admission policy. Standing mode keeps
+//! serving after the execution finishes; `--one-off` drains once the retirement quorum of a
+//! terminal round has acknowledged it, and exits.
 
-#[derive(ValueEnum, Clone, Debug, Default)]
-#[clap(rename_all = "lower")]
-enum Backend {
+use clap::{ArgGroup, Parser, ValueEnum};
+use std::fs;
+use std::path::Path;
+use std::process::ExitCode;
+use stoffel_mpc_coordinator_off_chain::{
+    CoordinatorRPCServerSharedBase, ExecutionRegistration, OffChainCoordinatorConnection,
+    OffChainCoordinatorServer, OneOffShutdownConfig, DEFAULT_ONE_OFF_SHUTDOWN_GRACE,
+};
+use stoffel_mpc_coordinator_shared::rpc::{caller_identity, RpcServerLimits};
+use stoffel_mpc_coordinator_shared::{
+    program_hash_of, AdmissionPolicy, ClientIdentity, ClientSlotSpec, ClientSlotTable,
+    CoordinatorError, ExecutionDeadlines, ExecutionId, InvitationIssuer, NodeCertificateDer,
+    NodeRoster, PinError, RegistrationError, RosterError, SpkiDer, UnixSeconds,
+};
+use stoffel_vm_types::compiled_binary::{ClientIoManifest, CompiledBinary};
+
+/// `--admission`: which `AdmissionPolicy` the registration carries. Never defaults to `open`.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[clap(rename_all = "kebab-case")]
+enum AdmissionKind {
+    /// One client certificate per slot, fixed at startup (`--client-certs` or
+    /// `--client-bindings`).
     #[default]
-    HoneyBadger,
-    Avss,
+    PreRegistered,
+    /// Any certificate holder binds a free slot, first come, first served. Requires deadlines.
+    Open,
+    /// Only the invitee of a `SignedInvitation` from `--invitation-issuer-cert`, in the slot it
+    /// names. Requires deadlines.
+    Invitation,
 }
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
+#[command(group(ArgGroup::new("program_binding").required(true).args(["program", "hash"])))]
 struct Args {
-    /// Registers exactly one execution, formatted as <hash>,<execution-id>, before listening,
-    /// and exits once a party explicitly requests it via the `request_shutdown` RPC method
-    /// (stoffel-run's `--one-off` flag does this once it has confirmed the execution reached
-    /// ProgramFinished). Omit for a standing coordinator that keeps running and accepts further
-    /// registrations.
-    #[arg(long, value_parser = parse_one_off)]
-    one_off: Option<OneOff>,
+    /// Drain and exit once the retirement quorum has acknowledged the execution in a terminal
+    /// round. Omit for a standing coordinator.
+    #[arg(long)]
+    one_off: bool,
 
-    /// Maximum time after a one-off shutdown request to wait for every MPC party to acknowledge
-    /// ProgramFinished. The coordinator exits sooner as soon as all parties acknowledge.
+    /// Maximum time a one-off coordinator waits, once draining, for the execution to be removed.
     #[arg(long, default_value_t = DEFAULT_ONE_OFF_SHUTDOWN_GRACE.as_secs())]
     one_off_shutdown_grace_secs: u64,
 
-    #[arg(long, required=true, value_delimiter=',', num_args=1..)]
-    initial_mpc_nodes: Vec<String>,
+    /// The execution registered at startup, 64 hexadecimal characters, nonzero.
+    #[arg(long, value_parser = parse_nonzero_execution_id)]
+    execution_id: ExecutionId,
 
-    #[arg(long)]
-    server_cert: String,
-
-    #[arg(long)]
-    server_key: String,
-
-    #[arg(long)]
-    n: u64,
-
-    #[arg(long)]
-    t: u64,
-
-    #[arg(long)]
-    n_inputs: Option<u64>,
-
-    #[arg(long, value_delimiter=',', num_args=0..)]
-    output_clients: Vec<String>,
-
+    /// Compiled program: registers `program_hash_of(bytes)`, and the manifest's client slots.
     #[arg(long)]
     program: Option<String>,
 
-    #[arg(long, value_delimiter=',', num_args=0..)]
-    client_bindings: Vec<String>,
+    /// The program hash, 64 hexadecimal characters, for registering without the bytes.
+    #[arg(long, value_parser = parse_program_hash)]
+    hash: Option<[u8; 32]>,
 
+    /// Roster node certificates (DER), comma-separated.
+    #[arg(long, required = true, value_delimiter = ',', num_args = 1..)]
+    node_certs: Vec<String>,
+
+    /// The corruption threshold of the node roster.
+    #[arg(long)]
+    t: u64,
+
+    /// The coordinator's certificate (DER). Clients and nodes pin its key.
+    #[arg(long)]
+    server_cert: String,
+
+    /// The coordinator's private key (PKCS#8 DER), matching `--server-cert`.
+    #[arg(long)]
+    server_key: String,
+
+    /// One `<inputs>:<outputs>` client slot per entry, in slot order. Refused with `--program`,
+    /// whose manifest supplies the slots. Empty is the same as absent.
+    #[arg(long)]
+    client_io: Option<String>,
+
+    /// How clients are admitted to the execution's slots.
+    #[arg(long, value_enum, default_value_t = AdmissionKind::PreRegistered)]
+    admission: AdmissionKind,
+
+    /// `pre-registered` only: one client certificate per slot, in slot order, comma-separated.
+    #[arg(long)]
+    client_certs: Option<String>,
+
+    /// `pre-registered` only: `<client_slot>=<cert>` entries, comma-separated.
+    #[arg(long)]
+    client_bindings: Option<String>,
+
+    /// `invitation` only: the invitation issuer's certificate.
+    #[arg(long)]
+    invitation_issuer_cert: Option<String>,
+
+    /// Seconds after startup by which every slot must be bound.
+    #[arg(long)]
+    association_deadline_secs: Option<u64>,
+
+    /// Seconds after startup by which every masked input must be submitted.
+    #[arg(long)]
+    input_deadline_secs: Option<u64>,
+
+    /// Maximum established connections; the other connection limits keep their defaults.
+    #[arg(long, default_value_t = RpcServerLimits::default().max_connections)]
+    max_connections: usize,
+
+    /// Listen address.
     #[arg(long, default_value = "127.0.0.1")]
     addr: String,
 
+    /// Listen port.
     #[arg(long, default_value_t = 31415)]
     port: u16,
+}
 
-    #[arg(long, default_value = "honeybadger")]
-    backend: Backend,
+/// Why `run-coord` refuses to start. Every variant exits 2.
+#[derive(Debug, thiserror::Error)]
+enum RunCoordError {
+    #[error("could not read {path}: {reason}")]
+    Unreadable { path: String, reason: String },
+    #[error("{path} is not a Stoffel program: {reason}")]
+    NotAProgram { path: String, reason: String },
+    #[error("certificate {path} is refused: {source}")]
+    Certificate { path: String, source: PinError },
+    #[error("invalid node roster: {0}")]
+    Roster(#[from] RosterError),
+    #[error("invalid registration: {0}")]
+    Registration(#[from] RegistrationError),
+    #[error("client IO manifest slots are not contiguous from 0")]
+    NonContiguousManifestSlots,
+    #[error(
+        "--client-io is refused with --program: the program's manifest supplies the client slots"
+    )]
+    ClientIoWithProgram,
+    #[error("invalid --client-io entry {entry:?}: expected <inputs>:<outputs>")]
+    InvalidClientIo { entry: String },
+    #[error("invalid --client-bindings entry {entry:?}: expected <client_slot>=<cert>")]
+    InvalidClientBinding { entry: String },
+    #[error("--client-bindings names slot {slot} twice")]
+    DuplicateClientBinding { slot: u64 },
+    #[error("--client-bindings names slot {slot}, but the registration has {slots} slots")]
+    ClientBindingOutOfRange { slot: u64, slots: usize },
+    #[error("--client-bindings leaves slot {slot} unbound")]
+    UnboundClientSlot { slot: usize },
+    #[error("--client-certs and --client-bindings are exclusive")]
+    ClientCertsAndBindings,
+    #[error("{flag} is not read under --admission {admission:?}")]
+    UnusedFlag {
+        flag: &'static str,
+        admission: AdmissionKind,
+    },
+    #[error("--admission invitation requires --invitation-issuer-cert")]
+    MissingIssuer,
+    #[error(
+        "--association-deadline-secs and --input-deadline-secs are given together or not at all"
+    )]
+    PartialDeadlines,
+    #[error(transparent)]
+    Coordinator(#[from] CoordinatorError),
 }
 
 fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
-    let execution_id = value
-        .parse::<ExecutionId>()
-        .map_err(|error| error.to_string())?;
+    let execution_id = value.parse::<ExecutionId>()?;
     if execution_id.is_zero() {
         return Err("execution ID must be nonzero".to_string());
     }
     Ok(execution_id)
 }
 
-#[derive(Clone, Debug)]
-struct OneOff {
-    hash: [u8; 32],
-    execution_id: ExecutionId,
-}
-
-fn parse_one_off(value: &str) -> Result<OneOff, String> {
-    let (hash, execution_id) = value
-        .split_once(',')
-        .ok_or_else(|| "--one-off must be formatted as <hash>,<execution-id>".to_string())?;
-    let hash: [u8; 32] = hex::decode(hash)
-        .map_err(|error| format!("invalid hash: {error}"))?
+fn parse_program_hash(value: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(value).map_err(|error| format!("invalid program hash: {error}"))?;
+    bytes
         .try_into()
-        .map_err(|_| "hash should be 32 bytes".to_string())?;
-    let execution_id = parse_nonzero_execution_id(execution_id)?;
-    Ok(OneOff { hash, execution_id })
+        .map_err(|_| "a program hash is 32 bytes (64 hexadecimal characters)".to_string())
 }
 
-type InputAssignmentBuildResult = (InputAssignment, Vec<ClientIdentity>);
-
-fn build_input_assignment(
-    manifest: ClientIoManifest,
-    bindings: Vec<(u64, ClientIdentity)>,
-) -> Result<InputAssignmentBuildResult, CoordinatorError> {
-    let mut by_slot: HashMap<u64, ClientIoSchema> = HashMap::new();
-    for schema in manifest.clients {
-        let client_slot = schema.client_slot;
-        if by_slot.insert(client_slot, schema).is_some() {
-            return Err(CoordinatorError::JSONError(format!(
-                "Duplicate client_slot {client_slot} in client IO manifest"
-            )));
-        }
-    }
-
-    let mut bound_clients = Vec::new();
-    for (client_slot, client) in bindings {
-        let schema = by_slot.remove(&client_slot).ok_or_else(|| {
-            CoordinatorError::JSONError(format!(
-                "No client IO manifest entry for bound client_slot {client_slot}"
-            ))
-        })?;
-        bound_clients.push((
-            client,
-            client_slot,
-            schema.inputs.len() as u64,
-            schema.outputs.len() as u64,
-        ));
-    }
-
-    if !by_slot.is_empty() {
-        let mut unbound_slots = by_slot.keys().copied().collect::<Vec<_>>();
-        unbound_slots.sort_unstable();
-        return Err(CoordinatorError::JSONError(format!(
-            "Client IO manifest slots are not bound to off-chain identities: {unbound_slots:?}"
-        )));
-    }
-
-    let mut seen_clients = std::collections::HashSet::new();
-    let mut clients = Vec::new();
-    let mut ranges = Vec::new();
-    let mut output_clients = Vec::new();
-    for (client, _client_slot, input_count, output_count) in bound_clients {
-        if !seen_clients.insert(client.clone()) {
-            return Err(CoordinatorError::JSONError(
-                "Client identity is bound to multiple client IO slots".to_string(),
-            ));
-        }
-        if output_count > 0 {
-            output_clients.push(client.clone());
-        }
-        if input_count == 0 {
-            continue;
-        }
-        let client_index = u32::try_from(clients.len()).map_err(|_| {
-            CoordinatorError::JSONError("too many distinct input clients".to_string())
-        })?;
-        clients.push(client);
-        ranges.push(InputClientRange {
-            client_index,
-            count: input_count,
-        });
-    }
-
-    Ok((InputAssignment { clients, ranges }, output_clients))
+/// `None` for an absent or empty flag value, otherwise its comma-separated entries.
+fn entries(value: &Option<String>) -> Option<Vec<String>> {
+    value
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.split(',').map(str::to_string).collect())
 }
 
-async fn run_coord<C>(
-    server_state: CoordinatorRPCServerSharedBase,
-    addr: &str,
-    port: u16,
-    t: u64,
-    server_cert_der: Vec<u8>,
-    server_key_der: Vec<u8>,
-) where
-    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
-{
-    let _coord = OffChainCoordinatorServer::<C>::start_coord(
-        server_state,
-        addr,
-        port,
-        t,
-        server_cert_der,
-        server_key_der,
-    )
-    .await
-    .expect("failed to start coordinator");
-    println!("Listening on {}:{}", addr, port);
-
-    tokio::time::sleep(tokio::time::Duration::MAX).await;
+fn read(path: &str) -> Result<Vec<u8>, RunCoordError> {
+    fs::read(Path::new(path)).map_err(|error| RunCoordError::Unreadable {
+        path: path.to_string(),
+        reason: error.to_string(),
+    })
 }
 
-/// Runs the coordinator for exactly `execution_id`, exiting once a party explicitly requests it
-/// via the `request_shutdown` RPC method (stoffel-run's `--one-off` bootnode does this after it
-/// has itself confirmed the execution reached ProgramFinished).
-async fn run_coord_one_off<C>(
-    mut server_state: CoordinatorRPCServerSharedBase,
-    addr: &str,
-    port: u16,
-    server_cert_der: Vec<u8>,
-    server_key_der: Vec<u8>,
-    execution_id: ExecutionId,
-    shutdown_grace: std::time::Duration,
-) where
-    C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
-{
-    // Registered before the listener starts, so no client can call request_shutdown before
-    // the coordinator is watching for it.
-    let shutdown_requested = server_state.watch_for_shutdown_request(execution_id);
+fn identity_of_certificate(path: &str) -> Result<ClientIdentity, RunCoordError> {
+    caller_identity(&read(path)?).map_err(|source| RunCoordError::Certificate {
+        path: path.to_string(),
+        source,
+    })
+}
 
-    println!(
-        "Listening on {}:{} (one-off execution {})",
-        addr, port, execution_id
-    );
-    OffChainCoordinatorServer::<C>::start_coord_one_off(
-        server_state,
-        addr,
-        port,
-        server_cert_der,
-        server_key_der,
-        shutdown_requested,
-        OneOffShutdownConfig {
-            execution_id,
-            grace: shutdown_grace,
-        },
-    )
-    .await
-    .expect("failed to run coordinator");
-    println!("Shutdown requested, exiting");
+fn spki_of_certificate(path: &str) -> Result<SpkiDer, RunCoordError> {
+    SpkiDer::from_certificate_der(&read(path)?).map_err(|source| RunCoordError::Certificate {
+        path: path.to_string(),
+        source,
+    })
+}
+
+/// One slot per manifest client, in `client_slot` order; the slots must be exactly `0..k`.
+fn client_slots_from_manifest(
+    manifest: &ClientIoManifest,
+) -> Result<ClientSlotTable, RunCoordError> {
+    let mut schemas = manifest.clients.iter().collect::<Vec<_>>();
+    schemas.sort_by_key(|schema| schema.client_slot);
+    if schemas
+        .iter()
+        .enumerate()
+        .any(|(position, schema)| schema.client_slot != position as u64)
+    {
+        return Err(RunCoordError::NonContiguousManifestSlots);
+    }
+    Ok(ClientSlotTable::new(
+        schemas
+            .into_iter()
+            .map(|schema| ClientSlotSpec {
+                input_count: schema.inputs.len() as u64,
+                output_count: schema.outputs.len() as u64,
+            })
+            .collect(),
+    ))
+}
+
+fn client_slots_from_flag(client_io: &[String]) -> Result<ClientSlotTable, RunCoordError> {
+    client_io
+        .iter()
+        .map(|entry| {
+            let invalid = || RunCoordError::InvalidClientIo {
+                entry: entry.clone(),
+            };
+            let (inputs, outputs) = entry.split_once(':').ok_or_else(invalid)?;
+            Ok(ClientSlotSpec {
+                input_count: inputs.parse().map_err(|_| invalid())?,
+                output_count: outputs.parse().map_err(|_| invalid())?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(ClientSlotTable::new)
+}
+
+fn pre_registered_clients(
+    args: &Args,
+    slots: &ClientSlotTable,
+) -> Result<Vec<ClientIdentity>, RunCoordError> {
+    match (entries(&args.client_certs), entries(&args.client_bindings)) {
+        (Some(_), Some(_)) => Err(RunCoordError::ClientCertsAndBindings),
+        (Some(certs), None) => certs
+            .iter()
+            .map(|path| identity_of_certificate(path))
+            .collect(),
+        (None, Some(bindings)) => {
+            let mut clients: Vec<Option<ClientIdentity>> = vec![None; slots.slots().len()];
+            for entry in bindings {
+                let invalid = || RunCoordError::InvalidClientBinding {
+                    entry: entry.clone(),
+                };
+                let (slot, path) = entry.split_once('=').ok_or_else(invalid)?;
+                let slot = slot.parse::<u64>().map_err(|_| invalid())?;
+                let bound = clients.get_mut(slot as usize).ok_or(
+                    RunCoordError::ClientBindingOutOfRange {
+                        slot,
+                        slots: slots.slots().len(),
+                    },
+                )?;
+                if bound.is_some() {
+                    return Err(RunCoordError::DuplicateClientBinding { slot });
+                }
+                *bound = Some(identity_of_certificate(path)?);
+            }
+            clients
+                .into_iter()
+                .enumerate()
+                .map(|(slot, client)| client.ok_or(RunCoordError::UnboundClientSlot { slot }))
+                .collect()
+        }
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
+/// The node roster, the served key and the one registration the flags describe. Refuses a
+/// non-empty flag the chosen admission does not read.
+fn registration_from_args(
+    args: &Args,
+    now: UnixSeconds,
+) -> Result<(NodeRoster, SpkiDer, ExecutionRegistration), RunCoordError> {
+    let node_certificates = args
+        .node_certs
+        .iter()
+        .map(|path| read(path).map(NodeCertificateDer::from_der))
+        .collect::<Result<Vec<_>, _>>()?;
+    let node_roster = NodeRoster::new(args.t, node_certificates)?;
+    let server_spki = spki_of_certificate(&args.server_cert)?;
+
+    let (program_hash, client_slots) = match (&args.program, args.hash) {
+        (Some(path), _) => {
+            if entries(&args.client_io).is_some() {
+                return Err(RunCoordError::ClientIoWithProgram);
+            }
+            let bytes = read(path)?;
+            let binary = CompiledBinary::deserialize(&mut bytes.as_slice()).map_err(|error| {
+                RunCoordError::NotAProgram {
+                    path: path.clone(),
+                    reason: format!("{error:?}"),
+                }
+            })?;
+            (
+                program_hash_of(&bytes),
+                client_slots_from_manifest(&binary.client_io_manifest)?,
+            )
+        }
+        (None, Some(hash)) => (
+            hash,
+            entries(&args.client_io)
+                .map(|client_io| client_slots_from_flag(&client_io))
+                .transpose()?
+                .unwrap_or_default(),
+        ),
+        (None, None) => unreachable!("clap requires exactly one of --program and --hash"),
+    };
+
+    let unused = |flag: &'static str, value: &Option<String>| match entries(value) {
+        Some(_) => Err(RunCoordError::UnusedFlag {
+            flag,
+            admission: args.admission,
+        }),
+        None => Ok(()),
+    };
+    let admission = match args.admission {
+        AdmissionKind::PreRegistered => {
+            unused("--invitation-issuer-cert", &args.invitation_issuer_cert)?;
+            AdmissionPolicy::PreRegistered {
+                clients: pre_registered_clients(args, &client_slots)?,
+            }
+        }
+        AdmissionKind::Open => {
+            unused("--client-certs", &args.client_certs)?;
+            unused("--client-bindings", &args.client_bindings)?;
+            unused("--invitation-issuer-cert", &args.invitation_issuer_cert)?;
+            AdmissionPolicy::Open
+        }
+        AdmissionKind::Invitation => {
+            unused("--client-certs", &args.client_certs)?;
+            unused("--client-bindings", &args.client_bindings)?;
+            let issuer = args
+                .invitation_issuer_cert
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .ok_or(RunCoordError::MissingIssuer)?;
+            AdmissionPolicy::Invitation {
+                issuer: InvitationIssuer::new(spki_of_certificate(issuer)?),
+            }
+        }
+    };
+
+    let deadlines = match (args.association_deadline_secs, args.input_deadline_secs) {
+        (Some(association), Some(input)) => Some(ExecutionDeadlines {
+            association: UnixSeconds(now.0.saturating_add(association)),
+            input: UnixSeconds(now.0.saturating_add(input)),
+        }),
+        (None, None) => None,
+        _ => return Err(RunCoordError::PartialDeadlines),
+    };
+
+    let registration = ExecutionRegistration {
+        execution_id: args.execution_id,
+        program_hash,
+        client_slots,
+        admission,
+        deadlines,
+    };
+    registration.validate(&node_roster, &server_spki, now)?;
+    Ok((node_roster, server_spki, registration))
+}
+
+async fn run(args: Args) -> Result<(), RunCoordError> {
+    let (node_roster, server_spki, registration) =
+        registration_from_args(&args, UnixSeconds::now())?;
+    let server_cert_der = read(&args.server_cert)?;
+    let server_key_der = read(&args.server_key)?;
+    println!("Node roster digest: {}", node_roster.digest());
+
+    let execution_id = registration.execution_id;
+    let mut state = CoordinatorRPCServerSharedBase::new(node_roster, server_spki);
+    let nonce = state.register_execution(registration)?;
+    println!("Registered execution {execution_id} (registration nonce {nonce})");
+
+    let limits = RpcServerLimits {
+        max_connections: args.max_connections,
+        ..RpcServerLimits::default()
+    };
+    if args.one_off {
+        println!(
+            "Listening on {}:{} (one-off execution {execution_id})",
+            args.addr, args.port
+        );
+        OffChainCoordinatorServer::<OffChainCoordinatorConnection>::start_coord_one_off(
+            state,
+            &args.addr,
+            args.port,
+            server_cert_der,
+            server_key_der,
+            OneOffShutdownConfig {
+                execution_id,
+                grace: std::time::Duration::from_secs(args.one_off_shutdown_grace_secs),
+            },
+            limits,
+        )
+        .await?;
+        println!("Execution {execution_id} drained, exiting");
+    } else {
+        let _coordinator = OffChainCoordinatorServer::<OffChainCoordinatorConnection>::start_coord(
+            state,
+            &args.addr,
+            args.port,
+            server_cert_der,
+            server_key_der,
+            limits,
+        )
+        .await?;
+        println!("Listening on {}:{}", args.addr, args.port);
+        std::future::pending::<()>().await;
+    }
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     println!(
         "Executing: {}",
         std::env::args().collect::<Vec<_>>().join(" ")
@@ -244,158 +446,11 @@ async fn main() {
         .install_default()
         .expect("Failed to install default crypto provider");
 
-    let args = Args::parse();
-
-    let n = args.n;
-    let t = args.t;
-    let parse_public_keys = |cert_files: &[String]| -> Vec<Vec<u8>> {
-        cert_files
-            .iter()
-            .map(|cert_file| {
-                let cert_der = fs::read(cert_file)
-                    .unwrap_or_else(|_| panic!("could not read certificate file {cert_file}"));
-                let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
-                    .unwrap_or_else(|_| {
-                        panic!("Failed to parse X.509 certificate DER {cert_file}")
-                    });
-                parsed_cert
-                    .public_key()
-                    .subject_public_key
-                    .data
-                    .as_ref()
-                    .to_vec()
-            })
-            .collect()
-    };
-
-    let public_keys = parse_public_keys(&args.initial_mpc_nodes);
-    assert!(n > 0, "--n must be greater than zero");
-    assert_eq!(
-        public_keys.len(),
-        usize::try_from(n).expect("--n does not fit in usize"),
-        "--n must match the number of --initial-mpc-nodes"
-    );
-    assert!(t < n, "--t must be less than --n");
-    let unique_public_keys = public_keys.iter().collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        unique_public_keys.len(),
-        public_keys.len(),
-        "--initial-mpc-nodes must contain unique identities"
-    );
-    let output_client_keys = parse_public_keys(&args.output_clients);
-    let binding_keys = |bindings: &[String]| -> Vec<(u64, Vec<u8>)> {
-        bindings
-            .iter()
-            .map(|binding| {
-                let (slot, cert_file) = binding
-                    .split_once('=')
-                    .expect("client binding must be formatted as <client_slot>=<cert>");
-                let slot = slot.parse::<u64>().expect("invalid client slot");
-                let key = parse_public_keys(&[cert_file.to_string()])
-                    .into_iter()
-                    .next()
-                    .expect("binding key");
-                (slot, key)
-            })
-            .collect()
-    };
-
-    let server_cert_der = fs::read(&args.server_cert)
-        .unwrap_or_else(|_| panic!("could not read certificate file {}", args.server_cert));
-    let server_key_der = fs::read(args.server_key).unwrap();
-
-    let addr = args.addr.as_str();
-    let port = args.port;
-    let mut server_state =
-        CoordinatorRPCServerSharedBase::new(n, t, public_keys).expect("invalid coordinator roster");
-    let one_off_execution_id = if let Some(OneOff { hash, execution_id }) = args.one_off {
-        let (mpc_backend, input_assignment, output_clients, n_inputs) =
-            if let Some(program_path) = args.program {
-                let binary = stoffel_vm_types::compiled_binary::utils::load_from_file(program_path)
-                    .expect("failed to load Stoffel bytecode");
-                let mpc_backend = binary.client_io_manifest.mpc_backend;
-                let client_bindings = if args.client_bindings.is_empty() {
-                    let mut schemas = binary.client_io_manifest.clients.clone();
-                    schemas.sort_by_key(|schema| schema.client_slot);
-                    assert_eq!(
-                schemas.len(),
-                output_client_keys.len(),
-                "without --client-bindings, --output-clients must match manifest client count"
-            );
-                    schemas
-                        .into_iter()
-                        .zip(output_client_keys)
-                        .map(|(schema, key)| (schema.client_slot, key))
-                        .collect()
-                } else {
-                    binding_keys(&args.client_bindings)
-                };
-                let (input_assignment, output_clients) =
-                    build_input_assignment(binary.client_io_manifest, client_bindings)
-                        .expect("failed to bind client IO manifest");
-                let n_inputs = input_assignment
-                    .ranges
-                    .iter()
-                    .map(|range| range.count)
-                    .sum::<u64>();
-                (mpc_backend, input_assignment, output_clients, n_inputs)
-            } else {
-                let n_inputs = args
-                    .n_inputs
-                    .expect("--n-inputs is required when --program is not provided");
-                let mpc_backend = match args.backend {
-                    Backend::HoneyBadger => MpcBackend::HoneyBadger,
-                    Backend::Avss => MpcBackend::Avss,
-                };
-                (
-                    mpc_backend,
-                    InputAssignment::default(),
-                    output_client_keys,
-                    n_inputs,
-                )
-            };
-        let min_output_shares = match mpc_backend {
-            MpcBackend::HoneyBadger => 2 * t + 1,
-            MpcBackend::Avss => t + 1,
-        };
-        server_state
-            .register_execution(ExecutionRegistration {
-                execution_id,
-                program_hash: hash,
-                n_inputs,
-                output_clients,
-                input_assignment,
-                min_output_shares,
-            })
-            .expect("failed to configure initial execution");
-        Some(execution_id)
-    } else {
-        None
-    };
-
-    match one_off_execution_id {
-        Some(execution_id) => {
-            run_coord_one_off::<HoneyBadgerCoordinatorConnection>(
-                server_state,
-                addr,
-                port,
-                server_cert_der,
-                server_key_der,
-                execution_id,
-                std::time::Duration::from_secs(args.one_off_shutdown_grace_secs),
-            )
-            .await;
-        }
-        None => {
-            run_coord::<HoneyBadgerCoordinatorConnection>(
-                server_state,
-                addr,
-                port,
-                t,
-                server_cert_der,
-                server_key_der,
-            )
-            .await;
+    match run(Args::parse()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::from(2)
         }
     }
 }
@@ -403,13 +458,75 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stoffel_mpc_coordinator_shared::ClientIndex;
     use stoffel_vm_types::{
-        compiled_binary::{MpcBackend, MpcCurve},
+        compiled_binary::{ClientIoSchema, MpcBackend, MpcCurve},
         core_types::ShareType,
     };
 
+    /// A directory of minted certificates: four nodes, a coordinator and two clients.
+    struct Fixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "run-coord-{name}-{}-{}",
+                std::process::id(),
+                hex::encode(program_hash_of(name.as_bytes()))
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            for file in [
+                "node0", "node1", "node2", "node3", "server", "client0", "client1",
+            ] {
+                let certified = rcgen::generate_simple_self_signed(vec![file.to_string()]).unwrap();
+                fs::write(dir.join(format!("{file}.crt")), certified.cert.der()).unwrap();
+                fs::write(
+                    dir.join(format!("{file}.key")),
+                    certified.signing_key.serialize_der(),
+                )
+                .unwrap();
+            }
+            Self { dir }
+        }
+
+        fn path(&self, file: &str) -> String {
+            self.dir.join(file).to_string_lossy().into_owned()
+        }
+
+        fn base_args(&self) -> Vec<String> {
+            vec![
+                "run-coord".to_string(),
+                "--execution-id".to_string(),
+                "07".repeat(32),
+                "--node-certs".to_string(),
+                ["node0", "node1", "node2", "node3"]
+                    .map(|node| self.path(&format!("{node}.crt")))
+                    .join(","),
+                "--t".to_string(),
+                "1".to_string(),
+                "--server-cert".to_string(),
+                self.path("server.crt"),
+                "--server-key".to_string(),
+                self.path("server.key"),
+            ]
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn parse(arguments: Vec<String>) -> Result<Args, clap::Error> {
+        Args::try_parse_from(arguments)
+    }
+
     #[test]
-    fn input_assignment_ignores_scalar_share_types() {
+    fn client_slots_ignore_scalar_share_types() {
         let int_manifest = ClientIoManifest {
             mpc_backend: MpcBackend::HoneyBadger,
             mpc_curve: MpcCurve::Bls12_381,
@@ -431,19 +548,36 @@ mod tests {
             ..Default::default()
         };
 
-        let client = vec![7, 8, 9];
-        let (int_layout, int_outputs) =
-            build_input_assignment(int_manifest, vec![(0, client.clone())]).unwrap();
-        let (bool_layout, bool_outputs) =
-            build_input_assignment(bool_manifest, vec![(0, client.clone())]).unwrap();
-
+        let int_slots = client_slots_from_manifest(&int_manifest).unwrap();
+        let bool_slots = client_slots_from_manifest(&bool_manifest).unwrap();
+        assert_eq!(int_slots, bool_slots);
         assert_eq!(
-            int_layout.clients[int_layout.ranges[0].client_index as usize],
-            client
+            int_slots.slots(),
+            &[ClientSlotSpec {
+                input_count: 1,
+                output_count: 1
+            }]
         );
-        assert_eq!(int_layout.ranges[0].count, 1);
-        assert_eq!(int_layout.ranges.len(), bool_layout.ranges.len());
-        assert_eq!(int_outputs, bool_outputs);
+
+        let gapped = ClientIoManifest {
+            clients: vec![
+                ClientIoSchema {
+                    client_slot: 0,
+                    inputs: vec![ShareType::default_secret_int()],
+                    outputs: vec![],
+                },
+                ClientIoSchema {
+                    client_slot: 2,
+                    inputs: vec![ShareType::default_secret_int()],
+                    outputs: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(matches!(
+            client_slots_from_manifest(&gapped),
+            Err(RunCoordError::NonContiguousManifestSlots)
+        ));
     }
 
     #[test]
@@ -454,5 +588,148 @@ mod tests {
             parse_nonzero_execution_id(&execution_id.to_string()).unwrap(),
             execution_id,
         );
+    }
+
+    #[test]
+    fn run_coord_registers_its_execution_at_startup_in_both_modes() {
+        let fixture = Fixture::new("modes");
+        let now = UnixSeconds::now();
+        let hash = "ab".repeat(32);
+        let pre_registered = |one_off: bool| {
+            let mut arguments = fixture.base_args();
+            arguments.extend([
+                "--hash".to_string(),
+                hash.clone(),
+                "--client-io".to_string(),
+                "1:1,2:0".to_string(),
+                "--client-certs".to_string(),
+                format!(
+                    "{},{}",
+                    fixture.path("client0.crt"),
+                    fixture.path("client1.crt")
+                ),
+            ]);
+            if one_off {
+                arguments.push("--one-off".to_string());
+            }
+            parse(arguments).unwrap()
+        };
+
+        let standing = pre_registered(false);
+        let one_off = pre_registered(true);
+        assert!(!standing.one_off);
+        assert!(one_off.one_off);
+        let (roster, _, standing_registration) = registration_from_args(&standing, now).unwrap();
+        let (_, _, one_off_registration) = registration_from_args(&one_off, now).unwrap();
+        assert_eq!(standing_registration, one_off_registration);
+        assert_eq!(roster.n(), 4);
+        assert_eq!(standing_registration.program_hash, [0xab; 32]);
+        assert_eq!(standing_registration.client_slots.capacity(), 2);
+        assert_eq!(standing_registration.client_slots.n_inputs(), 3);
+        assert_eq!(
+            standing_registration
+                .client_slots
+                .input_range(ClientIndex(1))
+                .unwrap()
+                .start,
+            1
+        );
+        let AdmissionPolicy::PreRegistered { clients } = &standing_registration.admission else {
+            panic!("the default admission is pre-registered");
+        };
+        assert_eq!(
+            clients[1],
+            identity_of_certificate(&fixture.path("client1.crt")).unwrap()
+        );
+
+        // Open with deadlines relative to startup.
+        let mut open = fixture.base_args();
+        open.extend(
+            [
+                "--hash",
+                &hash,
+                "--client-io",
+                "1:1",
+                "--admission",
+                "open",
+                "--association-deadline-secs",
+                "30",
+                "--input-deadline-secs",
+                "60",
+                "--client-certs",
+                "",
+            ]
+            .map(str::to_string),
+        );
+        let (_, _, registration) =
+            registration_from_args(&parse(open.clone()).unwrap(), now).unwrap();
+        assert_eq!(registration.admission, AdmissionPolicy::Open);
+        assert_eq!(
+            registration.deadlines,
+            Some(ExecutionDeadlines {
+                association: UnixSeconds(now.0 + 30),
+                input: UnixSeconds(now.0 + 60)
+            })
+        );
+
+        // A non-empty flag the admission does not read is refused, not ignored.
+        let mut with_certs = open.clone();
+        let position = with_certs.iter().rposition(|arg| arg.is_empty()).unwrap();
+        with_certs[position] = fixture.path("client0.crt");
+        assert!(matches!(
+            registration_from_args(&parse(with_certs).unwrap(), now),
+            Err(RunCoordError::UnusedFlag {
+                flag: "--client-certs",
+                ..
+            })
+        ));
+
+        // Open without deadlines is a registration error; pre-registered without certificates
+        // for its slots is refused rather than admitting anyone.
+        let mut no_deadlines = fixture.base_args();
+        no_deadlines.extend(
+            ["--hash", &hash, "--client-io", "1:1", "--admission", "open"].map(str::to_string),
+        );
+        assert!(matches!(
+            registration_from_args(&parse(no_deadlines).unwrap(), now),
+            Err(RunCoordError::Registration(
+                RegistrationError::DeadlinesRequired
+            ))
+        ));
+        let mut no_certs = fixture.base_args();
+        no_certs.extend(["--hash", &hash, "--client-io", "1:1"].map(str::to_string));
+        assert!(matches!(
+            registration_from_args(&parse(no_certs).unwrap(), now),
+            Err(RunCoordError::Registration(
+                RegistrationError::PreRegisteredCountMismatch {
+                    slots: 1,
+                    clients: 0
+                }
+            ))
+        ));
+
+        // --program and --hash are exclusive, and one of them is required.
+        let mut both = fixture.base_args();
+        both.extend(["--hash", &hash, "--program", "program.stfbin"].map(str::to_string));
+        assert!(parse(both).is_err());
+        assert!(parse(fixture.base_args()).is_err());
+
+        // The removed flags are unknown.
+        for removed in [
+            ["--backend", "avss"],
+            ["--min-output-shares", "3"],
+            ["--n", "4"],
+            ["--n-inputs", "1"],
+        ] {
+            let mut arguments = fixture.base_args();
+            arguments.extend(["--hash", &hash].map(str::to_string));
+            arguments.extend(removed.map(str::to_string));
+            let error = parse(arguments).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{removed:?} must be an unknown flag"
+            );
+        }
     }
 }

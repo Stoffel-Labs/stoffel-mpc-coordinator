@@ -28,7 +28,8 @@ p256 = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -36,6 +37,11 @@ stoffel-mpc-coordinator-off-chain = { path = "." }
 ark-std = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 stoffelmpc-mpc = { workspace = true }
+ark-ec = { workspace = true }
+hex = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+url = { workspace = true }
 
 [[test]]
 name = "off_chain"
