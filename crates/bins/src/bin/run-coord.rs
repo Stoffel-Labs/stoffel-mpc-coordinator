@@ -91,6 +91,13 @@ struct Args {
 
     #[arg(long, requires = "browser_addr")]
     browser_tls_key: Option<String>,
+
+    /// WebAuthn relying party ID for the browser listener's `browser_bind_webauthn_identity`
+    /// RPC - the site's own hostname exactly as it appears in the URL bar for every page that
+    /// calls `navigator.credentials.get()`/`create()` (e.g. `vote.example.com`, not an IP or a
+    /// bare `--browser-addr` bind address, which is typically not what voters' browsers see).
+    #[arg(long, requires = "browser_addr")]
+    webauthn_rp_id: Option<String>,
 }
 
 fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
@@ -197,6 +204,7 @@ struct BrowserTls {
     port: u16,
     cert_chain_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    webauthn_rp_id: String,
 }
 
 async fn run_coord<C>(
@@ -221,6 +229,7 @@ async fn run_coord<C>(
             browser_tls.port,
             browser_tls.cert_chain_pem,
             browser_tls.key_pem,
+            &browser_tls.webauthn_rp_id,
         )
         .await
         .expect("failed to start coordinator"),
@@ -367,11 +376,15 @@ async fn main() {
                 .expect("--browser-tls-key (clap requires it with --browser-addr)"),
         )
         .expect("could not read --browser-tls-key");
+        let webauthn_rp_id = args
+            .webauthn_rp_id
+            .expect("--webauthn-rp-id (clap requires it with --browser-addr)");
         BrowserTls {
             addr: browser_addr,
             port: args.browser_port,
             cert_chain_pem,
             key_pem,
+            webauthn_rp_id,
         }
     });
 

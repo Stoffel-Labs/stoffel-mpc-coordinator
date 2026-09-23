@@ -354,6 +354,10 @@ pub mod node_rpc {
         /// CA-issued -- distinct from `cert_der`/`key_der`, which stay self-signed DER for the
         /// native mTLS listener as before. See `crate::browser_rpc`'s module doc for why browser
         /// clients need a separate listener at all.
+        ///
+        /// `webauthn_rp_id` is the WebAuthn relying party ID for `browser_bind_webauthn_identity`
+        /// - the site's own hostname, e.g. `vote.example.com`. See
+        /// `browser_rpc::node_browser_methods`'s doc.
         #[allow(clippy::too_many_arguments)]
         pub async fn start_with_browser_tls(
             addr: &str,
@@ -364,6 +368,7 @@ pub mod node_rpc {
             browser_port: u16,
             browser_cert_chain_pem: Vec<u8>,
             browser_key_pem: Vec<u8>,
+            webauthn_rp_id: &str,
         ) -> Result<Self, CoordinatorError> {
             let rpc_server_data = Arc::new(Mutex::new(NodeRPCServerInternal::new()));
             let server_handle =
@@ -380,7 +385,7 @@ pub mod node_rpc {
                 browser_port,
                 browser_cert_chain_pem,
                 browser_key_pem,
-                crate::browser_rpc::node_browser_methods(rpc_server_data.clone()),
+                crate::browser_rpc::node_browser_methods(rpc_server_data.clone(), webauthn_rp_id),
             )
             .await?;
             Ok(Self {
@@ -1020,6 +1025,30 @@ pub trait CoordinatorRPCBase {
         enc_shares: (Vec<u8>, Vec<u8>),
     ) -> RpcResult<()>;
 
+    /// A party calls this before HPKE-encrypting a client's output share, to check whether
+    /// `client_id` established a WebAuthn session binding (`browser_rpc::
+    /// browser_bind_webauthn_identity`) with a *different*, ephemeral ECDH key than its own
+    /// long-term registered public key. Returns `Some(ecdh_public_key)` when one exists - the
+    /// party should encrypt to that instead of to `client_id`'s own bytes, since that ephemeral
+    /// key is the only one the browser's non-extractable session key can actually decrypt with
+    /// (see the design plan: the browser never has its own long-term private key as a file to
+    /// decrypt with in the WebAuthn flow at all). Returns `None` for every client without such a
+    /// binding (the ordinary case for native, non-browser clients, and the only case that existed
+    /// before this method), in which case the party keeps doing exactly what it already does
+    /// today - encrypt to `client_id`'s own bytes.
+    ///
+    /// A party is a separate process from the coordinator (it reaches the coordinator only over
+    /// this same native RPC connection, not shared memory), which is why this needs to be an RPC
+    /// method at all rather than just a shared lookup - the binding table itself lives on the
+    /// coordinator (`CoordinatorRPCServerSharedBase::webauthn_bindings`, the same instance
+    /// `browser_bind_webauthn_identity` populates), and a party has no other way to read it.
+    #[method(name = "resolve_output_encryption_key")]
+    async fn resolve_output_encryption_key(
+        &self,
+        execution_id: ExecutionId,
+        client_id: ClientIdentity,
+    ) -> RpcResult<Option<Vec<u8>>>;
+
     /// MPC clients use this to receive their output shares from the coordinator, so they can
     /// reconstruct their private output.
     #[subscription(name = "sub_obtain_output_shares", unsubscribe = "unsub_obtain_output_shares", item = Vec<(Vec<u8>, Vec<u8>)>)]
@@ -1094,6 +1123,12 @@ pub struct CoordinatorRPCServerSharedBase {
     /// Executions that reached the retirement quorum. Their protocol state has been dropped;
     /// only the acknowledging identities are kept so that stragglers can still retire cleanly.
     retired: RetiredExecutions,
+    /// Shared with `browser_rpc::coordinator_browser_methods`, which populates it via
+    /// `browser_bind_webauthn_identity` - not just a browser_rpc-local detail, because
+    /// `send_output_shares`'s server-side `resolve_output_encryption_key` (below) needs to read
+    /// it too, and a party (a separate process, reachable only over RPC - see that method's
+    /// doc) has no other way to learn a WebAuthn-bound client's session-scoped HPKE key.
+    pub(crate) webauthn_bindings: Arc<Mutex<crate::browser_rpc::WebauthnBindings>>,
 }
 
 /// A bounded, insertion-ordered set of executions that have been sealed but not yet
@@ -1229,6 +1264,7 @@ impl CoordinatorRPCServerSharedBase {
             shutdown_notify: None,
             one_off_execution: None,
             retired: RetiredExecutions::default(),
+            webauthn_bindings: Arc::new(Mutex::new(crate::browser_rpc::WebauthnBindings::default())),
         })
     }
 
@@ -2505,6 +2541,20 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         Ok(())
     }
 
+    async fn resolve_output_encryption_key(
+        &self,
+        execution_id: ExecutionId,
+        client_id: ClientIdentity,
+    ) -> RpcResult<Option<Vec<u8>>> {
+        // No `is_party`/roster check here, deliberately: unlike send_output_shares, this is a
+        // read-only lookup with no side effect to protect, and the caller already has to pass
+        // the roster check on the send_output_shares call this precedes anyway.
+        let bindings = self.d.lock().await.webauthn_bindings.clone();
+        let _ = execution_id; // bindings are session-scoped, not execution-scoped - see their doc
+        let resolved = bindings.lock().await.resolve_ecdh_public_key(&client_id);
+        Ok(resolved)
+    }
+
     async fn obtain_output_shares(
         &self,
         pending: PendingSubscriptionSink,
@@ -2653,6 +2703,10 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
     /// self-signed one -- distinct from `cert_der`/`key_der`, which stay self-signed DER for the
     /// native mTLS listener as before. See `browser_rpc`'s module doc for why browser clients
     /// need a separate listener at all, rather than reusing the native one.
+    ///
+    /// `webauthn_rp_id` is the WebAuthn relying party ID for `browser_bind_webauthn_identity` -
+    /// the site's own hostname, e.g. `vote.example.com`. See
+    /// `browser_rpc::coordinator_browser_methods`'s doc.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_coord_with_browser_tls(
         shared: CoordinatorRPCServerSharedBase,
@@ -2664,6 +2718,7 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         browser_port: u16,
         browser_cert_chain_pem: Vec<u8>,
         browser_key_pem: Vec<u8>,
+        webauthn_rp_id: &str,
     ) -> Result<Self, CoordinatorError>
     where
         C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection<
@@ -2684,7 +2739,8 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
             browser_port,
             browser_cert_chain_pem,
             browser_key_pem,
-            crate::browser_rpc::coordinator_browser_methods(rpc_server_data.clone()),
+            crate::browser_rpc::coordinator_browser_methods(rpc_server_data.clone(), webauthn_rp_id)
+                .await,
         )
         .await?;
         Ok(Self {
@@ -3134,8 +3190,29 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         key: Vec<u8>,
         output_shares: Vec<S>,
     ) -> Result<(), CoordinatorError> {
+        // A WebAuthn session-key client (see browser_rpc's module doc) has no long-term
+        // private key file to decrypt with at all - only the non-extractable ephemeral ECDH
+        // key its browser generated for this session, established via
+        // browser_bind_webauthn_identity. If the coordinator has such a binding for
+        // `client_id`, encrypt to that key instead of `client_id`'s own bytes; otherwise (the
+        // ordinary case for every native, non-browser client, and everything that worked
+        // before this existed) fall straight back to `key` exactly as before. A lookup
+        // failure here (e.g. an older coordinator without this RPC method) is treated the
+        // same as "no binding" rather than failing the whole send - this is a best-effort
+        // enhancement layered on top of behavior that must keep working without it.
+        let encryption_key = match CoordinatorRPCBaseClient::resolve_output_encryption_key(
+            self.rpc(),
+            self.execution_id,
+            client_id.clone(),
+        )
+        .await
+        {
+            Ok(Some(session_key)) => session_key,
+            Ok(None) | Err(_) => key,
+        };
+
         // Parse the inputs.
-        let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&key)
+        let client_pk = <KemImpl as Kem>::PublicKey::from_bytes(&encryption_key)
             .map_err(|_| CoordinatorError::ParsingPublicKeyFailed)?;
         let mut output_shares_bytes = Vec::new();
         output_shares
