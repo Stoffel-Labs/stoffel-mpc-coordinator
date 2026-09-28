@@ -118,13 +118,13 @@ pub(crate) struct WebauthnBinding {
 /// ephemeral key pair to act as a registered identity for every subsequent
 /// signed request that presents the returned `session_token`
 /// (`SignedBrowserRequest::session_token`, checked in `authenticate`).
-/// Deliberately not scoped to one execution id: the bound identity itself
-/// is what's checked against each execution's own admitted roster
-/// downstream (`output_clients.contains`/`input_slot_client`, unchanged),
-/// so one binding is reusable across every execution the session
-/// subsequently interacts with. Scoped to this coordinator process's
-/// lifetime for now; an idle-timeout eviction policy is a reasonable
-/// future addition, not implemented yet.
+/// `by_token` is deliberately not scoped to one execution id: the bound
+/// identity itself is what's checked against each execution's own admitted
+/// roster downstream (`output_clients.contains`/`input_slot_client`,
+/// unchanged), so one binding is reusable across every execution the
+/// session subsequently interacts with. Scoped to this coordinator
+/// process's lifetime for now; an idle-timeout eviction policy is a
+/// reasonable future addition, not implemented yet.
 ///
 /// `pub(crate)`, not private to this module: `CoordinatorRPCServerSharedBase`
 /// (in `lib.rs`) holds a `webauthn_bindings: Arc<Mutex<WebauthnBindings>>` -
@@ -138,36 +138,60 @@ pub(crate) struct WebauthnBinding {
 #[derive(Default)]
 pub(crate) struct WebauthnBindings {
     by_token: HashMap<String, WebauthnBinding>,
-    /// Kept in sync with `by_token`, keyed the other way - a client
-    /// re-binding (e.g. after a tab close/reload) overwrites the previous
-    /// entry here, which is the desired behavior: encrypt future output to
-    /// whichever session the client's browser currently actually holds the
-    /// private half of, not a stale earlier one.
-    by_client_identity: HashMap<ClientIdentity, WebauthnBinding>,
+    /// Kept in sync with `by_token`, keyed by `(execution_id,
+    /// client_identity)` rather than identity alone - unlike `by_token`,
+    /// this one *is* execution-scoped, deliberately, and has to be: the
+    /// same registered identity can legitimately bind into several
+    /// different concurrently-running executions, each with its own
+    /// ephemeral ECDH key, and each execution's later output-encryption
+    /// lookup needs *its own* key back, not whichever execution that
+    /// identity happened to bind into most recently. (Keying by identity
+    /// alone here previously meant two elections sharing a voter could
+    /// silently steal each other's output-encryption target - the second
+    /// bind's key would overwrite the first's, and the first election
+    /// would go on to encrypt output for a key the voter's first tab never
+    /// held the private half of, breaking decryption client-side with a
+    /// generic WebCrypto `OperationError`.) A same-execution rebind (e.g.
+    /// after a tab close/reload, reusing the same cached ephemeral keys)
+    /// still just overwrites its own entry with an identical value, so
+    /// that case is unaffected.
+    by_execution_and_client_identity: HashMap<(ExecutionId, ClientIdentity), WebauthnBinding>,
 }
 
 impl WebauthnBindings {
-    fn insert(&mut self, binding: WebauthnBinding) -> String {
+    /// `execution_id` is `None` for the party-side call site specifically:
+    /// a party's own `WebauthnBindings` instance never has
+    /// `resolve_ecdh_public_key` called against it (only the coordinator's
+    /// does, via `resolve_output_encryption_key` - see the struct doc), so
+    /// there's nothing to scope there and no `ExecutionId` to thread
+    /// through `BindWebauthnIdentityToNode`'s wire format for it.
+    fn insert(&mut self, execution_id: Option<ExecutionId>, binding: WebauthnBinding) -> String {
         loop {
             let mut token_bytes = [0u8; 32];
             rand::rng().fill_bytes(&mut token_bytes);
             let token = URL_SAFE_NO_PAD.encode(token_bytes);
             if let Entry::Vacant(entry) = self.by_token.entry(token.clone()) {
-                self.by_client_identity
-                    .insert(binding.client_identity.clone(), binding.clone());
+                if let Some(execution_id) = execution_id {
+                    self.by_execution_and_client_identity
+                        .insert((execution_id, binding.client_identity.clone()), binding.clone());
+                }
                 entry.insert(binding);
                 return token;
             }
         }
     }
 
-    /// The session-bound ECDH public key output shares should be
-    /// HPKE-encrypted to for `client_id`, if a WebAuthn binding exists for
-    /// it - see `resolve_output_encryption_key`'s doc for the fallback
-    /// when this returns `None`.
-    pub(crate) fn resolve_ecdh_public_key(&self, client_id: &ClientIdentity) -> Option<Vec<u8>> {
-        self.by_client_identity
-            .get(client_id)
+    /// The session-bound ECDH public key output shares for `execution_id`
+    /// should be HPKE-encrypted to for `client_id`, if a WebAuthn binding
+    /// exists for that exact pair - see `resolve_output_encryption_key`'s
+    /// doc for the fallback when this returns `None`.
+    pub(crate) fn resolve_ecdh_public_key(
+        &self,
+        execution_id: ExecutionId,
+        client_id: &ClientIdentity,
+    ) -> Option<Vec<u8>> {
+        self.by_execution_and_client_identity
+            .get(&(execution_id, client_id.clone()))
             .map(|binding| binding.ecdh_public_key.clone())
     }
 
@@ -556,11 +580,14 @@ pub async fn coordinator_browser_methods(
                 };
                 drop(coordinator);
 
-                let session_token = state.bindings.lock().await.insert(WebauthnBinding {
-                    client_identity: client_identity.clone(),
-                    ecdsa_public_key: call.ecdsa_public_key,
-                    ecdh_public_key: call.ecdh_public_key,
-                });
+                let session_token = state.bindings.lock().await.insert(
+                    Some(call.execution_id),
+                    WebauthnBinding {
+                        client_identity: client_identity.clone(),
+                        ecdsa_public_key: call.ecdsa_public_key,
+                        ecdh_public_key: call.ecdh_public_key,
+                    },
+                );
                 Ok(WebauthnBindingResponse {
                     session_token,
                     client_identity,
@@ -632,11 +659,16 @@ pub fn node_browser_methods(node: Arc<Mutex<NodeRPCServerInternal>>, rp_id: &str
                 .map_err(|_| {
                     auth_error("WebAuthn assertion did not verify against the claimed identity")
                 })?;
-                let session_token = state.bindings.lock().await.insert(WebauthnBinding {
-                    client_identity: call.client_identity.clone(),
-                    ecdsa_public_key: call.ecdsa_public_key,
-                    ecdh_public_key: call.ecdh_public_key,
-                });
+                // None: a party's own WebauthnBindings never has resolve_ecdh_public_key
+                // called against it - see the struct's doc.
+                let session_token = state.bindings.lock().await.insert(
+                    None,
+                    WebauthnBinding {
+                        client_identity: call.client_identity.clone(),
+                        ecdsa_public_key: call.ecdsa_public_key,
+                        ecdh_public_key: call.ecdh_public_key,
+                    },
+                );
                 Ok(WebauthnBindingResponse {
                     session_token,
                     client_identity: call.client_identity,
@@ -1194,11 +1226,14 @@ mod tests {
             .to_vec();
         let stable_identity: ClientIdentity = vec![42];
         let mut bindings = WebauthnBindings::default();
-        let token = bindings.insert(WebauthnBinding {
-            client_identity: stable_identity.clone(),
-            ecdsa_public_key: ecdsa_public_key.clone(),
-            ecdh_public_key: vec![7],
-        });
+        let token = bindings.insert(
+            Some(execution_id()),
+            WebauthnBinding {
+                client_identity: stable_identity.clone(),
+                ecdsa_public_key: ecdsa_public_key.clone(),
+                ecdh_public_key: vec![7],
+            },
+        );
         let bindings = Mutex::new(bindings);
         let nonces = Mutex::new(NonceBook::default());
 
@@ -1235,11 +1270,14 @@ mod tests {
         let attacker_public_key = VerifyingKey::from(&attacker_key).to_sec1_bytes().to_vec();
 
         let mut bindings = WebauthnBindings::default();
-        let token = bindings.insert(WebauthnBinding {
-            client_identity: vec![42],
-            ecdsa_public_key: bound_public_key,
-            ecdh_public_key: vec![7],
-        });
+        let token = bindings.insert(
+            Some(execution_id()),
+            WebauthnBinding {
+                client_identity: vec![42],
+                ecdsa_public_key: bound_public_key,
+                ecdh_public_key: vec![7],
+            },
+        );
         let bindings = Mutex::new(bindings);
         let nonces = Mutex::new(NonceBook::default());
 
@@ -1464,5 +1502,64 @@ mod tests {
             result.is_err(),
             "a globally-indexed but off-roster identity must not be able to bind, got {result:?}",
         );
+    }
+
+    #[test]
+    fn resolve_ecdh_public_key_is_scoped_by_execution_not_just_identity() {
+        let mut bindings = WebauthnBindings::default();
+        let identity: ClientIdentity = vec![42];
+        let exec_a = ExecutionId::from_bytes([1; 32]);
+        let exec_b = ExecutionId::from_bytes([2; 32]);
+
+        // The same registered voter binds into two different, concurrently-running
+        // executions - this is exactly the "several elections at once" scenario that used
+        // to silently let the second bind steal the first execution's output-encryption
+        // target, since the old by_client_identity map was keyed by identity alone.
+        bindings.insert(
+            Some(exec_a),
+            WebauthnBinding {
+                client_identity: identity.clone(),
+                ecdsa_public_key: vec![0xA1],
+                ecdh_public_key: vec![0xA; 65],
+            },
+        );
+        bindings.insert(
+            Some(exec_b),
+            WebauthnBinding {
+                client_identity: identity.clone(),
+                ecdsa_public_key: vec![0xB1],
+                ecdh_public_key: vec![0xB; 65],
+            },
+        );
+
+        assert_eq!(
+            bindings.resolve_ecdh_public_key(exec_a, &identity),
+            Some(vec![0xA; 65]),
+            "execution A must still resolve its own key, not execution B's",
+        );
+        assert_eq!(
+            bindings.resolve_ecdh_public_key(exec_b, &identity),
+            Some(vec![0xB; 65]),
+            "execution B must resolve its own key",
+        );
+    }
+
+    #[test]
+    fn insert_without_an_execution_id_does_not_populate_the_secondary_index() {
+        let mut bindings = WebauthnBindings::default();
+        let identity: ClientIdentity = vec![42];
+        let exec_a = ExecutionId::from_bytes([1; 32]);
+
+        // The party-side call site - see insert()'s own doc for why None is correct there.
+        bindings.insert(
+            None,
+            WebauthnBinding {
+                client_identity: identity.clone(),
+                ecdsa_public_key: vec![0xA1],
+                ecdh_public_key: vec![0xA; 65],
+            },
+        );
+
+        assert_eq!(bindings.resolve_ecdh_public_key(exec_a, &identity), None);
     }
 }
