@@ -84,6 +84,12 @@ struct BindWebauthnIdentity {
     /// The freshly-generated, non-extractable ECDH key output shares will
     /// be HPKE-encrypted to for this session.
     ecdh_public_key: Vec<u8>,
+    /// WebAuthn's `credential.rawId` - optional (older cached browser sessions predate
+    /// this field), used as a fast-path lookup key into `CoordinatorBrowserState`'s
+    /// `credential_id_index` before falling back to the roster scan. Empty means "no
+    /// index lookup, go straight to the scan," same as a genuinely absent field would.
+    #[serde(default)]
+    credential_id: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -246,6 +252,12 @@ struct CoordinatorBrowserState {
     rp_id_hash: [u8; 32],
     /// Checked against `clientDataJSON.origin` on every WebAuthn bind.
     origin: String,
+    /// Global, static credential-ID -> registered-public-key catalog, loaded once at
+    /// startup from files already synced to this coordinator (see `load_credential_id_index`).
+    /// Lets `browser_bind_webauthn_identity` look a claimed credential up directly instead
+    /// of scanning every roster-admitted candidate - see that handler for the roster
+    /// re-check this index's global (not per-execution) scope still requires.
+    credential_id_index: HashMap<Vec<u8>, ClientIdentity>,
 }
 
 struct NodeBrowserState {
@@ -273,6 +285,50 @@ struct BindWebauthnIdentityToNode {
     ecdh_public_key: Vec<u8>,
 }
 
+/// Loads the coordinator's global credential-ID -> registered-public-key catalog from two
+/// already-synced directories: `client_credential_id_dir` holds one `{client_name}.id` file
+/// per registered voter (raw WebAuthn `credential.rawId` bytes - see
+/// `materialize-registered-clients`), and `client_cert_dir` holds the matching
+/// `{client_name}.crt` (the same raw SEC1 public key file StoffelVM's `StandingClientCatalog`
+/// already loads party-side). A missing `client_credential_id_dir` yields an empty index, not
+/// an error - the coordinator falls back to its existing roster-scan for every client in that
+/// case, so nothing breaks for a deployment that hasn't materialized any `.id` files yet. A
+/// `.id` file with no matching `.crt` is skipped, not fatal, for the same reason.
+fn load_credential_id_index(
+    client_cert_dir: &std::path::Path,
+    client_credential_id_dir: &std::path::Path,
+) -> std::io::Result<HashMap<Vec<u8>, ClientIdentity>> {
+    let mut index = HashMap::new();
+
+    let entries = match std::fs::read_dir(client_credential_id_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(index),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("id") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let credential_id = std::fs::read(&path)?;
+
+        let cert_path = client_cert_dir.join(format!("{stem}.crt"));
+        let public_key = match std::fs::read(&cert_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+
+        index.insert(credential_id, public_key);
+    }
+
+    Ok(index)
+}
+
 /// Builds the coordinator-side browser methods (`browser_execution_status`, `browser_round`,
 /// `browser_reserve_mask_indices`, `browser_submit_masked_inputs`, `browser_output_shares`,
 /// `browser_bind_webauthn_identity`), bound to the same shared coordinator state the native mTLS
@@ -284,9 +340,15 @@ struct BindWebauthnIdentityToNode {
 /// derived from it as `https://{rp_id}`; pass a full custom origin string as `rp_id` is not
 /// sufficient for deployments needing a non-default port or scheme (not expected in practice,
 /// since WebAuthn requires a secure context - HTTPS - anyway).
+///
+/// `client_credential_id_dirs`, if given, is `(client_cert_dir, client_credential_id_dir)` -
+/// see `load_credential_id_index`. `None` (or any I/O error loading it) just falls back to an
+/// empty index, logged via `tracing::warn!` rather than failing startup - every bind still
+/// works via the existing roster scan either way.
 pub async fn coordinator_browser_methods(
     coordinator: Arc<Mutex<CoordinatorRPCServerSharedBase>>,
     rp_id: &str,
+    client_credential_id_dirs: Option<(&std::path::Path, &std::path::Path)>,
 ) -> Methods {
     // Share `coordinator`'s own webauthn_bindings, not a fresh table - see
     // CoordinatorRPCServerSharedBase::webauthn_bindings's doc for why: a
@@ -294,12 +356,29 @@ pub async fn coordinator_browser_methods(
     // `resolve_output_encryption_key`) needs to see the exact same bindings
     // this listener's `browser_bind_webauthn_identity` creates.
     let bindings = coordinator.lock().await.webauthn_bindings.clone();
+    let credential_id_index = match client_credential_id_dirs {
+        Some((client_cert_dir, client_credential_id_dir)) => {
+            match load_credential_id_index(client_cert_dir, client_credential_id_dir) {
+                Ok(index) => index,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to load the credential-ID index from {}: {error} - \
+                         falling back to the roster scan for every bind",
+                        client_credential_id_dir.display(),
+                    );
+                    HashMap::new()
+                }
+            }
+        }
+        None => HashMap::new(),
+    };
     let state = Arc::new(CoordinatorBrowserState {
         coordinator,
         nonces: Mutex::new(NonceBook::default()),
         bindings,
         rp_id_hash: Sha256::digest(rp_id.as_bytes()).into(),
         origin: format!("https://{rp_id}"),
+        credential_id_index,
     });
     let mut module = RpcModule::new(state);
 
@@ -432,9 +511,21 @@ pub async fn coordinator_browser_methods(
                     .collect::<std::collections::HashSet<_>>();
 
                 let challenge = webauthn_bind_challenge(&call.ecdsa_public_key, &call.ecdh_public_key);
-                let client_identity = candidates
-                    .into_iter()
-                    .find(|candidate| {
+
+                // Fast path: `credential_id_index` is a *global* catalog (every registered
+                // voter, across every execution), so a hit there still has to be re-checked
+                // against *this* execution's roster before it means anything - unlike a
+                // candidate found via the scan below, which is only ever drawn from the
+                // roster in the first place. Falls through to the full scan whenever this
+                // doesn't produce a match: an empty `call.credential_id` (older cached
+                // sessions predate that field), a credential not yet in the index (registered
+                // before this feature existed), an indexed key not on this roster, or an
+                // indexed key that's on the roster but whose assertion somehow doesn't verify.
+                let indexed_match = (!call.credential_id.is_empty())
+                    .then(|| state.credential_id_index.get(&call.credential_id))
+                    .flatten()
+                    .filter(|candidate| candidates.contains(*candidate))
+                    .filter(|candidate| {
                         verify_webauthn_assertion(
                             &call.assertion,
                             candidate,
@@ -444,8 +535,25 @@ pub async fn coordinator_browser_methods(
                         )
                         .is_ok()
                     })
-                    .cloned()
-                    .ok_or_else(|| auth_error("WebAuthn assertion did not match any registered identity admitted for this execution"))?;
+                    .cloned();
+
+                let client_identity = match indexed_match {
+                    Some(client_identity) => client_identity,
+                    None => candidates
+                        .into_iter()
+                        .find(|candidate| {
+                            verify_webauthn_assertion(
+                                &call.assertion,
+                                candidate,
+                                &state.rp_id_hash,
+                                &state.origin,
+                                &challenge,
+                            )
+                            .is_ok()
+                        })
+                        .cloned()
+                        .ok_or_else(|| auth_error("WebAuthn assertion did not match any registered identity admitted for this execution"))?,
+                };
                 drop(coordinator);
 
                 let session_token = state.bindings.lock().await.insert(WebauthnBinding {
@@ -924,6 +1032,57 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// Creates two uniquely-named, empty temp directories - (cert_dir, credential_id_dir) -
+    /// for `load_credential_id_index` tests. No `tempfile` crate dependency: a nanosecond
+    /// timestamp under `std::env::temp_dir()` is unique enough for this file's own test run.
+    fn temp_catalog_dirs(test_name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("stoffel-coord-test-{test_name}-{unique}"));
+        let cert_dir = base.join("cert_dir");
+        let credential_id_dir = base.join("credential_id_dir");
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        std::fs::create_dir_all(&credential_id_dir).unwrap();
+        (cert_dir, credential_id_dir)
+    }
+
+    #[test]
+    fn load_credential_id_index_builds_map_from_matching_cert_and_id_files() {
+        let (cert_dir, credential_id_dir) = temp_catalog_dirs("builds-map");
+        std::fs::write(cert_dir.join("alice.crt"), [0x04u8; 65]).unwrap();
+        std::fs::write(credential_id_dir.join("alice.id"), b"alice-credential-id").unwrap();
+
+        let index = load_credential_id_index(&cert_dir, &credential_id_dir).unwrap();
+
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.get(b"alice-credential-id".as_slice()),
+            Some(&vec![0x04u8; 65])
+        );
+    }
+
+    #[test]
+    fn load_credential_id_index_skips_id_files_with_no_matching_cert() {
+        let (cert_dir, credential_id_dir) = temp_catalog_dirs("skips-unmatched");
+        std::fs::write(credential_id_dir.join("alice.id"), b"alice-credential-id").unwrap();
+
+        let index = load_credential_id_index(&cert_dir, &credential_id_dir).unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn load_credential_id_index_returns_empty_for_a_missing_directory() {
+        let (cert_dir, credential_id_dir) = temp_catalog_dirs("missing-dir");
+        std::fs::remove_dir(&credential_id_dir).unwrap();
+
+        let index = load_credential_id_index(&cert_dir, &credential_id_dir).unwrap();
+
+        assert!(index.is_empty());
+    }
+
     #[test]
     fn verify_webauthn_assertion_accepts_a_well_formed_assertion() {
         let signing_key = test_signing_key();
@@ -1200,5 +1359,110 @@ mod tests {
         assert!(coordinator
             .browser_execution_status(execution_id(), &vec![99])
             .is_err());
+    }
+
+    /// Builds the params jsonrpsee's `Methods::call` needs for
+    /// `browser_bind_webauthn_identity`, matching the browser client's own wire shape
+    /// exactly (see `BindWebauthnIdentity`/`WebauthnAssertion`) - constructed as raw JSON
+    /// since neither struct derives `Serialize` (they're wire-*input* types only).
+    fn bind_params(
+        assertion: &WebauthnAssertion,
+        ecdsa_public_key: &[u8],
+        ecdh_public_key: &[u8],
+        credential_id: &[u8],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "execution_id": execution_id().as_bytes(),
+            "assertion": {
+                "authenticator_data": assertion.authenticator_data,
+                "client_data_json": assertion.client_data_json,
+                "signature": assertion.signature,
+            },
+            "ecdsa_public_key": ecdsa_public_key,
+            "ecdh_public_key": ecdh_public_key,
+            "credential_id": credential_id,
+        })
+    }
+
+    #[tokio::test]
+    async fn bind_uses_the_credential_id_index_for_an_on_roster_identity() {
+        let signing_key = test_signing_key();
+        let on_roster_public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let shared = Arc::new(Mutex::new(coordinator_with_two_browser_clients(
+            on_roster_public_key.clone(),
+            vec![21],
+        )));
+
+        let (cert_dir, credential_id_dir) = temp_catalog_dirs("indexed-hit-accepted");
+        std::fs::write(cert_dir.join("voter.crt"), &on_roster_public_key).unwrap();
+        std::fs::write(credential_id_dir.join("voter.id"), b"voter-credential-id").unwrap();
+
+        let methods =
+            coordinator_browser_methods(shared, TEST_RP_ID, Some((&cert_dir, &credential_id_dir)))
+                .await;
+
+        let ecdsa_public_key = b"ecdsa-pub".to_vec();
+        let ecdh_public_key = b"ecdh-pub".to_vec();
+        let challenge = webauthn_bind_challenge(&ecdsa_public_key, &ecdh_public_key);
+        let assertion = make_assertion(&signing_key, &challenge);
+        let params = bind_params(
+            &assertion,
+            &ecdsa_public_key,
+            &ecdh_public_key,
+            b"voter-credential-id",
+        );
+
+        // WebauthnBindingResponse only derives Serialize (it's an output-only wire type,
+        // the server never parses one back in) - a plain Value avoids adding a
+        // test-only Deserialize derive to a production type just for this.
+        let response: serde_json::Value = methods
+            .call("browser_bind_webauthn_identity", (params,))
+            .await
+            .expect("an indexed, on-roster credential must be able to bind");
+        let resolved_identity: Vec<u8> = serde_json::from_value(response["client_identity"].clone())
+            .expect("client_identity field");
+        assert_eq!(resolved_identity, on_roster_public_key);
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_a_globally_indexed_credential_not_on_this_executions_roster() {
+        // Registered somewhere on this deployment (has a credential-ID index entry) but
+        // never admitted to *this* execution's roster - the exact scenario the roster
+        // re-check after an index hit exists to catch (see the handler's own comment).
+        let intruder_signing_key = SigningKey::from_bytes(&[77u8; 32].into()).unwrap();
+        let intruder_public_key = VerifyingKey::from(&intruder_signing_key)
+            .to_sec1_bytes()
+            .to_vec();
+        let shared = Arc::new(Mutex::new(coordinator_with_two_browser_clients(
+            vec![20],
+            vec![21],
+        )));
+
+        let (cert_dir, credential_id_dir) = temp_catalog_dirs("off-roster-rejected");
+        std::fs::write(cert_dir.join("intruder.crt"), &intruder_public_key).unwrap();
+        std::fs::write(credential_id_dir.join("intruder.id"), b"intruder-credential-id").unwrap();
+
+        let methods =
+            coordinator_browser_methods(shared, TEST_RP_ID, Some((&cert_dir, &credential_id_dir)))
+                .await;
+
+        let ecdsa_public_key = b"ecdsa-pub".to_vec();
+        let ecdh_public_key = b"ecdh-pub".to_vec();
+        let challenge = webauthn_bind_challenge(&ecdsa_public_key, &ecdh_public_key);
+        let assertion = make_assertion(&intruder_signing_key, &challenge);
+        let params = bind_params(
+            &assertion,
+            &ecdsa_public_key,
+            &ecdh_public_key,
+            b"intruder-credential-id",
+        );
+
+        let result: Result<serde_json::Value, _> = methods
+            .call("browser_bind_webauthn_identity", (params,))
+            .await;
+        assert!(
+            result.is_err(),
+            "a globally-indexed but off-roster identity must not be able to bind, got {result:?}",
+        );
     }
 }

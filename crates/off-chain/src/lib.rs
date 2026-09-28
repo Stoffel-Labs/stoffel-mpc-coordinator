@@ -2707,6 +2707,9 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
     /// `webauthn_rp_id` is the WebAuthn relying party ID for `browser_bind_webauthn_identity` -
     /// the site's own hostname, e.g. `vote.example.com`. See
     /// `browser_rpc::coordinator_browser_methods`'s doc.
+    ///
+    /// `client_credential_id_dirs` - see `browser_rpc::coordinator_browser_methods`'s doc;
+    /// passed straight through.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_coord_with_browser_tls(
         shared: CoordinatorRPCServerSharedBase,
@@ -2719,6 +2722,7 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
         browser_cert_chain_pem: Vec<u8>,
         browser_key_pem: Vec<u8>,
         webauthn_rp_id: &str,
+        client_credential_id_dirs: Option<(&std::path::Path, &std::path::Path)>,
     ) -> Result<Self, CoordinatorError>
     where
         C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection<
@@ -2739,8 +2743,12 @@ impl<C: stoffel_mpc_coordinator_shared::rpc::RPCServerConnection> OffChainCoordi
             browser_port,
             browser_cert_chain_pem,
             browser_key_pem,
-            crate::browser_rpc::coordinator_browser_methods(rpc_server_data.clone(), webauthn_rp_id)
-                .await,
+            crate::browser_rpc::coordinator_browser_methods(
+                rpc_server_data.clone(),
+                webauthn_rp_id,
+                client_credential_id_dirs,
+            )
+            .await,
         )
         .await?;
         Ok(Self {
