@@ -2550,8 +2550,10 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         // read-only lookup with no side effect to protect, and the caller already has to pass
         // the roster check on the send_output_shares call this precedes anyway.
         let bindings = self.d.lock().await.webauthn_bindings.clone();
-        let _ = execution_id; // bindings are session-scoped, not execution-scoped - see their doc
-        let resolved = bindings.lock().await.resolve_ecdh_public_key(&client_id);
+        let resolved = bindings
+            .lock()
+            .await
+            .resolve_ecdh_public_key(execution_id, &client_id);
         Ok(resolved)
     }
 
