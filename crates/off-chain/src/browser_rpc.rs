@@ -176,6 +176,14 @@ struct BrowserCall {
     request: SignedBrowserRequest,
 }
 
+/// Params for `browser_round` - deliberately just the execution id, no
+/// `SignedBrowserRequest` wrapper. See that method's registration for why
+/// it's the one `browser_*` RPC that doesn't require authentication.
+#[derive(Clone, Debug, Deserialize)]
+struct PublicRoundQuery {
+    execution_id: ExecutionId,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct MaskRange {
     start: u64,
@@ -312,12 +320,19 @@ pub async fn coordinator_browser_methods(
         )
         .expect("method name is unique");
 
+    // Intentionally unauthenticated, unlike every other browser_* method here - it
+    // returns only the coarse Round an execution is in (Idle/.../ProgramFinished), no
+    // per-client fields, no vote content. Anyone who already has the execution_id (e.g.
+    // from the vote link) has strictly more access elsewhere in this system's trust
+    // model already, so this doesn't grant a new privilege. Exists so a page with no
+    // WebAuthn-bound identity of its own (e.g. the operator's start.js) can still tell
+    // when an execution it started has finished. Confirmed unused by any current JS
+    // client before removing its auth requirement.
     module
         .register_async_method::<RpcResult<Round>, _, _>(
             "browser_round",
             |params, state, _| async move {
-                let call: BrowserCall = params.one()?;
-                authenticate("browser_round", &call, &state.nonces, &state.bindings).await?;
+                let call: PublicRoundQuery = params.one()?;
                 state
                     .coordinator
                     .lock()
