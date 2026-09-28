@@ -98,6 +98,19 @@ struct Args {
     /// bare `--browser-addr` bind address, which is typically not what voters' browsers see).
     #[arg(long, requires = "browser_addr")]
     webauthn_rp_id: Option<String>,
+
+    /// Directory of registered clients' raw public-key files (`{client_name}.crt`) - the same
+    /// catalog StoffelVM's standing parties already load. Paired with
+    /// --client-credential-id-dir to let the browser listener's `browser_bind_webauthn_identity`
+    /// look a WebAuthn credential up directly instead of scanning every roster candidate. Both
+    /// flags are optional - omitting either just falls back to the scan for every bind.
+    #[arg(long, requires = "browser_addr")]
+    client_cert_dir: Option<String>,
+
+    /// Directory of registered clients' WebAuthn credential-ID files (`{client_name}.id`,
+    /// raw `credential.rawId` bytes) - see --client-cert-dir.
+    #[arg(long, requires = "browser_addr")]
+    client_credential_id_dir: Option<String>,
 }
 
 fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
@@ -205,6 +218,10 @@ struct BrowserTls {
     cert_chain_pem: Vec<u8>,
     key_pem: Vec<u8>,
     webauthn_rp_id: String,
+    /// (client_cert_dir, client_credential_id_dir) - see
+    /// stoffel_mpc_coordinator_off_chain::browser_rpc::coordinator_browser_methods's doc.
+    /// `None` unless both --client-cert-dir and --client-credential-id-dir were given.
+    client_credential_id_dirs: Option<(String, String)>,
 }
 
 async fn run_coord<C>(
@@ -219,20 +236,32 @@ async fn run_coord<C>(
     C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
 {
     let _coord = match browser_tls {
-        Some(browser_tls) => OffChainCoordinatorServer::<C>::start_coord_with_browser_tls(
-            server_state,
-            addr,
-            port,
-            server_cert_der,
-            server_key_der,
-            &browser_tls.addr,
-            browser_tls.port,
-            browser_tls.cert_chain_pem,
-            browser_tls.key_pem,
-            &browser_tls.webauthn_rp_id,
-        )
-        .await
-        .expect("failed to start coordinator"),
+        Some(browser_tls) => {
+            let client_credential_id_dirs = browser_tls
+                .client_credential_id_dirs
+                .as_ref()
+                .map(|(cert_dir, credential_id_dir)| {
+                    (
+                        std::path::Path::new(cert_dir.as_str()),
+                        std::path::Path::new(credential_id_dir.as_str()),
+                    )
+                });
+            OffChainCoordinatorServer::<C>::start_coord_with_browser_tls(
+                server_state,
+                addr,
+                port,
+                server_cert_der,
+                server_key_der,
+                &browser_tls.addr,
+                browser_tls.port,
+                browser_tls.cert_chain_pem,
+                browser_tls.key_pem,
+                &browser_tls.webauthn_rp_id,
+                client_credential_id_dirs,
+            )
+            .await
+            .expect("failed to start coordinator")
+        }
         None => OffChainCoordinatorServer::<C>::start_coord(
             server_state,
             addr,
@@ -379,12 +408,20 @@ async fn main() {
         let webauthn_rp_id = args
             .webauthn_rp_id
             .expect("--webauthn-rp-id (clap requires it with --browser-addr)");
+        // Both flags are required together (see load_credential_id_index) - if only one was
+        // given, the other is silently treated as absent too rather than erroring, matching
+        // that function's own "missing just falls back to the scan" tolerance.
+        let client_credential_id_dirs = match (args.client_cert_dir, args.client_credential_id_dir) {
+            (Some(cert_dir), Some(credential_id_dir)) => Some((cert_dir, credential_id_dir)),
+            _ => None,
+        };
         BrowserTls {
             addr: browser_addr,
             port: args.browser_port,
             cert_chain_pem,
             key_pem,
             webauthn_rp_id,
+            client_credential_id_dirs,
         }
     });
 
