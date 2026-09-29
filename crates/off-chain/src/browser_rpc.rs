@@ -261,6 +261,9 @@ struct BrowserExecutionStatus {
     output_ready: bool,
 }
 
+/// `(created, nonce)` pairs seen recently for one `(execution_id, identity)`.
+type SeenNonces = VecDeque<(u64, [u8; 16])>;
+
 /// Tracks recently-seen `(created, nonce)` pairs per `(execution_id,
 /// identity)`, within a sliding `NONCE_WINDOW_SECONDS` window - see the
 /// module doc for why this replaces a simple monotonic counter. Every key
@@ -269,9 +272,6 @@ struct BrowserExecutionStatus {
 /// so the identity space here is bounded by the execution's actual roster,
 /// not by attacker-chosen input - no separate cap on tracked identities is
 /// needed on top of the per-key window.
-/// `(created, nonce)` pairs seen recently for one `(execution_id, identity)`.
-type SeenNonces = VecDeque<(u64, [u8; 16])>;
-
 #[derive(Default)]
 struct NonceBook {
     seen: HashMap<(ExecutionId, ClientIdentity), SeenNonces>,
@@ -300,12 +300,47 @@ impl NonceBook {
     }
 }
 
+/// Tracks the last-known WebAuthn `signCount` per registered credential (keyed
+/// by `client_identity` - 1:1 with the credential's own ID in this system,
+/// since each registration produces exactly one identity from exactly one
+/// credential), independently per process (coordinator and each party keep
+/// their own, matching `NonceBook`/`WebauthnBindings` - no shared trust
+/// dependency between them for this check either). Implements WebAuthn Level
+/// 3 §7.2 step 20 exactly: skip the check when both the new and stored counts
+/// are zero (covers authenticators - e.g. most synced/platform passkeys -
+/// that never increment it, which is legitimate and common, not suspicious);
+/// otherwise the new count must be strictly greater than the stored one, or
+/// this is treated as a possible cloned authenticator and the bind is
+/// rejected. In-memory only, so it resets on a process restart - a real but
+/// bounded gap (the other five processes, if not also restarted at the same
+/// moment, still catch a clone in that window).
+#[derive(Default)]
+struct SignCounts {
+    last_known: HashMap<ClientIdentity, u32>,
+}
+
+impl SignCounts {
+    fn accept(&mut self, identity: &ClientIdentity, sign_count: u32) -> RpcResult<()> {
+        let stored = self.last_known.get(identity).copied().unwrap_or(0);
+        if (sign_count != 0 || stored != 0) && sign_count <= stored {
+            return Err(auth_error(
+                "authenticator signCount did not increase - possible cloned authenticator",
+            ));
+        }
+        self.last_known.insert(identity.clone(), sign_count);
+        Ok(())
+    }
+}
+
 struct CoordinatorBrowserState {
     coordinator: Arc<Mutex<CoordinatorRPCServerSharedBase>>,
     nonces: Mutex<NonceBook>,
     /// The *same* instance as `coordinator`'s own `webauthn_bindings` field
     /// (an `Arc` clone, not a separate table) - see that field's doc.
     bindings: Arc<Mutex<WebauthnBindings>>,
+    /// Checked on every successful WebAuthn bind, before `bindings.insert` -
+    /// see `SignCounts`'s doc.
+    sign_counts: Mutex<SignCounts>,
     /// SHA-256 of the relying party ID (the site's own hostname) - checked
     /// against `authenticatorData`'s `rpIdHash` on every WebAuthn bind.
     rp_id_hash: [u8; 32],
@@ -323,6 +358,7 @@ struct NodeBrowserState {
     node: Arc<Mutex<NodeRPCServerInternal>>,
     nonces: Mutex<NonceBook>,
     bindings: Mutex<WebauthnBindings>,
+    sign_counts: Mutex<SignCounts>,
     rp_id_hash: [u8; 32],
     origin: String,
 }
@@ -435,6 +471,7 @@ pub async fn coordinator_browser_methods(
         coordinator,
         nonces: Mutex::new(NonceBook::default()),
         bindings,
+        sign_counts: Mutex::new(SignCounts::default()),
         rp_id_hash: Sha256::digest(rp_id.as_bytes()).into(),
         origin: format!("https://{rp_id}"),
         credential_id_index,
@@ -580,11 +617,15 @@ pub async fn coordinator_browser_methods(
                 // sessions predate that field), a credential not yet in the index (registered
                 // before this feature existed), an indexed key not on this roster, or an
                 // indexed key that's on the roster but whose assertion somehow doesn't verify.
+                // Captures (candidate, sign_count) together in one pass - the sign_count
+                // returned is specifically from the assertion that actually matched, not
+                // re-derived separately (verify_webauthn_assertion returns it on success -
+                // see SignCounts's doc for why it's checked below).
                 let indexed_match = (!call.credential_id.is_empty())
                     .then(|| state.credential_id_index.get(&call.credential_id))
                     .flatten()
                     .filter(|candidate| candidates.contains(*candidate))
-                    .filter(|candidate| {
+                    .and_then(|candidate| {
                         verify_webauthn_assertion(
                             &call.assertion,
                             candidate,
@@ -592,15 +633,15 @@ pub async fn coordinator_browser_methods(
                             &state.origin,
                             &challenge,
                         )
-                        .is_ok()
-                    })
-                    .cloned();
+                        .ok()
+                        .map(|sign_count| (candidate.clone(), sign_count))
+                    });
 
-                let client_identity = match indexed_match {
-                    Some(client_identity) => client_identity,
+                let (client_identity, sign_count) = match indexed_match {
+                    Some(found) => found,
                     None => candidates
                         .into_iter()
-                        .find(|candidate| {
+                        .find_map(|candidate| {
                             verify_webauthn_assertion(
                                 &call.assertion,
                                 candidate,
@@ -608,12 +649,18 @@ pub async fn coordinator_browser_methods(
                                 &state.origin,
                                 &challenge,
                             )
-                            .is_ok()
+                            .ok()
+                            .map(|sign_count| (candidate.clone(), sign_count))
                         })
-                        .cloned()
                         .ok_or_else(|| auth_error("WebAuthn assertion did not match any registered identity admitted for this execution"))?,
                 };
                 drop(coordinator);
+
+                state
+                    .sign_counts
+                    .lock()
+                    .await
+                    .accept(&client_identity, sign_count)?;
 
                 let session_token = state.bindings.lock().await.insert(
                     Some(call.execution_id),
@@ -643,6 +690,7 @@ pub fn node_browser_methods(node: Arc<Mutex<NodeRPCServerInternal>>, rp_id: &str
         node,
         nonces: Mutex::new(NonceBook::default()),
         bindings: Mutex::new(WebauthnBindings::default()),
+        sign_counts: Mutex::new(SignCounts::default()),
         rp_id_hash: Sha256::digest(rp_id.as_bytes()).into(),
         origin: format!("https://{rp_id}"),
     });
@@ -684,7 +732,7 @@ pub fn node_browser_methods(node: Arc<Mutex<NodeRPCServerInternal>>, rp_id: &str
                 let call: BindWebauthnIdentityToNode = params.one()?;
                 let challenge =
                     webauthn_bind_challenge(&call.ecdsa_public_key, &call.ecdh_public_key);
-                verify_webauthn_assertion(
+                let sign_count = verify_webauthn_assertion(
                     &call.assertion,
                     &call.client_identity,
                     &state.rp_id_hash,
@@ -694,6 +742,11 @@ pub fn node_browser_methods(node: Arc<Mutex<NodeRPCServerInternal>>, rp_id: &str
                 .map_err(|_| {
                     auth_error("WebAuthn assertion did not verify against the claimed identity")
                 })?;
+                state
+                    .sign_counts
+                    .lock()
+                    .await
+                    .accept(&call.client_identity, sign_count)?;
                 // None: a party's own WebauthnBindings never has resolve_ecdh_public_key
                 // called against it - see the struct's doc.
                 let session_token = state.bindings.lock().await.insert(
@@ -947,13 +1000,17 @@ fn webauthn_bind_challenge(ecdsa_public_key: &[u8], ecdh_public_key: &[u8]) -> [
 /// half of the ceremony (registration/attestation happens client-side, with
 /// the result handed to the operator's registration endpoint - see the
 /// design plan's §1), and only for ES256/P-256 credentials.
+///
+/// Returns the assertion's `signCount` on success - the caller checks it
+/// against `SignCounts` (WebAuthn Level 3 §7.2 step 20's clone-detection
+/// signal) before actually trusting the match.
 fn verify_webauthn_assertion(
     assertion: &WebauthnAssertion,
     candidate_public_key: &[u8],
     expected_rp_id_hash: &[u8; 32],
     expected_origin: &str,
     expected_challenge: &[u8; 32],
-) -> Result<(), ()> {
+) -> Result<u32, ()> {
     let client_data: serde_json::Value =
         serde_json::from_slice(&assertion.client_data_json).map_err(|_| ())?;
     if client_data.get("type").and_then(|v| v.as_str()) != Some("webauthn.get") {
@@ -986,6 +1043,11 @@ fn verify_webauthn_assertion(
     if flags & USER_PRESENT == 0 || flags & USER_VERIFIED == 0 {
         return Err(());
     }
+    let sign_count = u32::from_be_bytes(
+        assertion.authenticator_data[33..37]
+            .try_into()
+            .expect("checked len() >= 37 above"),
+    );
 
     // The assertion signs authenticatorData || SHA-256(clientDataJSON), with
     // a DER-encoded signature - both differ from this file's own raw-bytes/
@@ -998,7 +1060,8 @@ fn verify_webauthn_assertion(
     let mut signed = Vec::with_capacity(assertion.authenticator_data.len() + client_data_hash.len());
     signed.extend_from_slice(&assertion.authenticator_data);
     signed.extend_from_slice(&client_data_hash);
-    key.verify(&signed, &signature).map_err(|_| ())
+    key.verify(&signed, &signature).map_err(|_| ())?;
+    Ok(sign_count)
 }
 
 fn parse_body<T: DeserializeOwned>(body: &[u8]) -> RpcResult<T> {
@@ -1047,6 +1110,17 @@ mod tests {
         user_present: bool,
         user_verified: bool,
     ) -> WebauthnAssertion {
+        make_assertion_with_sign_count(signing_key, challenge, origin, user_present, user_verified, 1)
+    }
+
+    fn make_assertion_with_sign_count(
+        signing_key: &SigningKey,
+        challenge: &[u8; 32],
+        origin: &str,
+        user_present: bool,
+        user_verified: bool,
+        sign_count: u32,
+    ) -> WebauthnAssertion {
         let client_data_json = serde_json::json!({
             "type": "webauthn.get",
             "challenge": URL_SAFE_NO_PAD.encode(challenge),
@@ -1065,7 +1139,7 @@ mod tests {
             flags |= 0x04;
         }
         authenticator_data.push(flags);
-        authenticator_data.extend_from_slice(&1u32.to_be_bytes()); // signCount
+        authenticator_data.extend_from_slice(&sign_count.to_be_bytes());
 
         let client_data_hash = Sha256::digest(&client_data_json);
         let mut signed = authenticator_data.clone();
@@ -1207,14 +1281,77 @@ mod tests {
         let public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
         let challenge = webauthn_bind_challenge(b"ecdsa-pub", b"ecdh-pub");
         let assertion = make_assertion(&signing_key, &challenge);
-        assert!(verify_webauthn_assertion(
-            &assertion,
-            &public_key,
-            &test_rp_id_hash(),
-            TEST_ORIGIN,
-            &challenge,
-        )
-        .is_ok());
+        // make_assertion hardcodes signCount = 1 - confirms verify_webauthn_assertion
+        // actually extracts and returns it, not just discards it.
+        assert_eq!(
+            verify_webauthn_assertion(
+                &assertion,
+                &public_key,
+                &test_rp_id_hash(),
+                TEST_ORIGIN,
+                &challenge,
+            ),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn sign_counts_accepts_the_first_bind_regardless_of_its_sign_count() {
+        let mut sign_counts = SignCounts::default();
+        let identity: ClientIdentity = vec![42];
+        // Both the "authenticator never counts" case (0) and an ordinary
+        // first use (nonzero) must go through - there's nothing to compare
+        // against yet.
+        sign_counts.accept(&identity, 0).expect("first use, count 0");
+        let mut fresh = SignCounts::default();
+        fresh
+            .accept(&identity, 5)
+            .expect("first use, nonzero count");
+    }
+
+    #[test]
+    fn sign_counts_accepts_a_strictly_increasing_count() {
+        let mut sign_counts = SignCounts::default();
+        let identity: ClientIdentity = vec![42];
+        sign_counts.accept(&identity, 1).expect("first bind");
+        sign_counts.accept(&identity, 2).expect("count increased");
+        sign_counts.accept(&identity, 10).expect("count increased again");
+    }
+
+    #[test]
+    fn sign_counts_rejects_a_non_increasing_count_once_tracking_has_started() {
+        let mut sign_counts = SignCounts::default();
+        let identity: ClientIdentity = vec![42];
+        sign_counts.accept(&identity, 5).expect("first bind");
+        // Equal to the stored value - a cloned authenticator replaying the
+        // same count, or a legitimate but stalled/malfunctioning one.
+        assert!(sign_counts.accept(&identity, 5).is_err());
+        // Less than the stored value - the clear clone-detection case from
+        // the spec.
+        assert!(sign_counts.accept(&identity, 3).is_err());
+    }
+
+    #[test]
+    fn sign_counts_keeps_reporting_zero_as_not_suspicious_once_tracking_has_started() {
+        // An authenticator that has always reported 0 (never increments)
+        // must not be flagged just because it keeps reporting 0 - per spec,
+        // the check only runs at all when at least one side is nonzero.
+        let mut sign_counts = SignCounts::default();
+        let identity: ClientIdentity = vec![42];
+        sign_counts.accept(&identity, 0).expect("first use");
+        sign_counts.accept(&identity, 0).expect("still zero, still fine");
+    }
+
+    #[test]
+    fn sign_counts_is_independent_per_identity() {
+        let mut sign_counts = SignCounts::default();
+        let a: ClientIdentity = vec![1];
+        let b: ClientIdentity = vec![2];
+        sign_counts.accept(&a, 5).expect("identity a, first bind");
+        sign_counts
+            .accept(&b, 1)
+            .expect("identity b, unaffected by a's count");
+        assert!(sign_counts.accept(&a, 1).is_err());
     }
 
     #[test]
@@ -1758,6 +1895,44 @@ mod tests {
         assert!(
             result.is_err(),
             "a globally-indexed but off-roster identity must not be able to bind, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_a_second_ceremony_whose_sign_count_did_not_increase() {
+        let signing_key = test_signing_key();
+        let public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let shared = Arc::new(Mutex::new(coordinator_with_two_browser_clients(
+            public_key.clone(),
+            vec![21],
+        )));
+        let methods = coordinator_browser_methods(shared, TEST_RP_ID, None).await;
+
+        let ecdsa_public_key = b"ecdsa-pub".to_vec();
+        let ecdh_public_key = b"ecdh-pub".to_vec();
+        let challenge = webauthn_bind_challenge(&ecdsa_public_key, &ecdh_public_key);
+
+        let first_assertion = make_assertion_with_sign_count(
+            &signing_key, &challenge, TEST_ORIGIN, true, true, 5,
+        );
+        let first_params = bind_params(&first_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        methods
+            .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (first_params,))
+            .await
+            .expect("first bind, establishes the sign_count baseline");
+
+        // Same credential, a second ceremony whose signCount didn't increase past the
+        // first - exactly the WebAuthn Level 3 §7.2 step 20 clone signal.
+        let second_assertion = make_assertion_with_sign_count(
+            &signing_key, &challenge, TEST_ORIGIN, true, true, 5,
+        );
+        let second_params = bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        let result: Result<serde_json::Value, _> = methods
+            .call("browser_bind_webauthn_identity", (second_params,))
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-increasing signCount must reject the bind, got {result:?}",
         );
     }
 
