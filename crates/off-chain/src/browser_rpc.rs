@@ -6,14 +6,22 @@
 //! requiring and verifying a client certificate. A browser's `WebSocket` API has no equivalent:
 //! there is no way for page script to present a TLS client certificate. So instead, every
 //! method here takes a `SignedBrowserRequest` and authenticates it individually, at the
-//! application layer: the browser signs `method || execution_id || nonce || sha256(body)` with
-//! a P-256 keypair it fully controls (see the `stoffel-wasm-client` crate), and `authenticate`
-//! verifies that signature and rejects any reused nonce. The resulting `ClientIdentity` is
-//! exactly the same kind of value the native path derives from a certificate -- the DER-encoded
-//! public key -- so it plugs directly into the same `CoordinatorRPCServerConnectionBase`/
-//! `CoordinatorRPCServerSharedBase` state the native transport uses. Confidentiality and server
-//! authentication come from the TLS layer underneath, same as any ordinary `wss://` site;
-//! client authentication comes from this module instead of from the handshake.
+//! application layer: the browser signs `method || execution_id || created || nonce ||
+//! sha256(body) || session_token` with a P-256 keypair it fully controls (see the
+//! `stoffel-wasm-client` crate), and `authenticate` verifies that signature and rejects a
+//! request whose `created` timestamp has aged out of a short freshness window, or whose
+//! `nonce` (16 CSPRNG-random bytes, fresh per request) has already been seen within that same
+//! window - the pattern RFC 9421 (HTTP Message Signatures) itself defines for this: `created`
+//! bounds how long a request stays valid and lets the server forget old nonces, `nonce` is
+//! what actually prevents replay within that window. `session_token` is always present -
+//! resolved via one prior WebAuthn ceremony (see `browser_bind_webauthn_identity`), which is
+//! also what gates the execution's roster before any of this authentication state is ever
+//! allocated. The resulting `ClientIdentity` is exactly the same kind of value the native path
+//! derives from a certificate -- the DER-encoded public key -- so it plugs directly into the
+//! same `CoordinatorRPCServerConnectionBase`/`CoordinatorRPCServerSharedBase` state the native
+//! transport uses. Confidentiality and server authentication come from the TLS layer
+//! underneath, same as any ordinary `wss://` site; client authentication comes from this
+//! module instead of from the handshake.
 
 use crate::{
     node_rpc::NodeRPCServerInternal, AssignedMaskShare, ClientIdentity, CoordinatorRPCBaseServer,
@@ -30,31 +38,44 @@ use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use stoffel_mpc_coordinator_shared::ExecutionId;
 use tokio::sync::Mutex;
 
-const AUTH_DOMAIN: &[u8] = b"stoffel-browser-rpc-auth-v1";
+const AUTH_DOMAIN: &[u8] = b"stoffel-browser-rpc-auth";
 const AUTH_ERROR: i32 = -32050;
 const BAD_BODY: i32 = -32602;
+/// How long a signed request stays valid, and how long `NonceBook` needs to
+/// remember a nonce to catch a replay of it - generous enough for normal RPC
+/// latency and browser/server clock drift.
+const NONCE_WINDOW_SECONDS: u64 = 120;
 
 #[derive(Clone, Debug, Deserialize)]
 struct SignedBrowserRequest {
     public_key: Vec<u8>,
-    nonce: u64,
+    /// Unix timestamp (seconds) the request was signed at - bounds how long
+    /// it stays valid (see `NONCE_WINDOW_SECONDS`). Does not by itself
+    /// prevent replay within that window; `nonce` below does.
+    created: u64,
+    /// 16 CSPRNG-random bytes, fresh per request - the actual replay check
+    /// (`NonceBook::accept` rejects one it's already seen within the
+    /// freshness window). Deliberately not a counter: a shared, ordered
+    /// counter is exactly what let multiple tabs (each with independent
+    /// client-side state) collide, and what a reload could lose track of.
+    nonce: Vec<u8>,
     signature: Vec<u8>,
     body: Vec<u8>,
-    /// Present for the WebAuthn session-key path (see `WebauthnBindings`
-    /// below): `public_key` above is then the freshly-generated ephemeral
-    /// key that actually produced `signature`, not a registered identity in
-    /// its own right - `session_token` is what `authenticate` looks up to
-    /// find which registered identity that ephemeral key was bound to.
-    /// Absent (the original, unmodified behavior) for the native
-    /// `from_pkcs8` path, where the signing key *is* the identity directly.
-    #[serde(default)]
-    session_token: Option<String>,
+    /// `public_key` is a freshly-generated ephemeral key, not a registered
+    /// identity in its own right - this is what `authenticate` looks up in
+    /// `WebauthnBindings` to find which registered identity that ephemeral
+    /// key was authorized (via one WebAuthn ceremony) to act as. Always
+    /// required: a request with no session_token has no roster-checked
+    /// identity behind it at all, so `authenticate` never has a "the
+    /// signing key is the identity" fallback to reach for.
+    session_token: String,
 }
 
 /// One WebAuthn assertion (the response of a `navigator.credentials.get()`
@@ -240,9 +261,20 @@ struct BrowserExecutionStatus {
     output_ready: bool,
 }
 
+/// Tracks recently-seen `(created, nonce)` pairs per `(execution_id,
+/// identity)`, within a sliding `NONCE_WINDOW_SECONDS` window - see the
+/// module doc for why this replaces a simple monotonic counter. Every key
+/// that can reach `accept` has already passed `browser_bind_webauthn_identity`'s
+/// roster check (see `authenticate` and `SignedBrowserRequest::session_token`),
+/// so the identity space here is bounded by the execution's actual roster,
+/// not by attacker-chosen input - no separate cap on tracked identities is
+/// needed on top of the per-key window.
+/// `(created, nonce)` pairs seen recently for one `(execution_id, identity)`.
+type SeenNonces = VecDeque<(u64, [u8; 16])>;
+
 #[derive(Default)]
 struct NonceBook {
-    latest: HashMap<(ExecutionId, ClientIdentity), u64>,
+    seen: HashMap<(ExecutionId, ClientIdentity), SeenNonces>,
 }
 
 impl NonceBook {
@@ -250,17 +282,20 @@ impl NonceBook {
         &mut self,
         execution_id: ExecutionId,
         identity: &ClientIdentity,
-        nonce: u64,
+        created: u64,
+        nonce: [u8; 16],
+        now: u64,
     ) -> RpcResult<()> {
+        if now.abs_diff(created) > NONCE_WINDOW_SECONDS {
+            return Err(auth_error("request timestamp is outside the accepted window"));
+        }
         let key = (execution_id, identity.clone());
-        if self
-            .latest
-            .get(&key)
-            .is_some_and(|latest| nonce <= *latest)
-        {
+        let entries = self.seen.entry(key).or_default();
+        entries.retain(|(created, _)| now.saturating_sub(*created) <= NONCE_WINDOW_SECONDS);
+        if entries.iter().any(|(_, seen_nonce)| *seen_nonce == nonce) {
             return Err(auth_error("request nonce was already used"));
         }
-        self.latest.insert(key, nonce);
+        entries.push_back((created, nonce));
         Ok(())
     }
 }
@@ -791,31 +826,34 @@ impl CoordinatorRPCServerSharedBase {
 
 /// Verifies a `SignedBrowserRequest` and resolves it to a `ClientIdentity`.
 ///
-/// Two paths, selected by whether `session_token` is present:
-///
-/// - **Absent** (the original, unmodified native `from_pkcs8` path): the
-///   signing key *is* the identity directly, exactly as before - byte-for-
-///   byte identical behavior to the pre-WebAuthn implementation.
-/// - **Present** (the WebAuthn session-key path): `public_key` is a
-///   freshly-generated ephemeral key, not an identity in its own right.
-///   `session_token` is looked up in `bindings` to find which registered
-///   identity that ephemeral key was authorized (via one WebAuthn
-///   ceremony - see `browser_bind_webauthn_identity`) to act as; the
-///   signature still verifies against the ephemeral `public_key` exactly
-///   as in the native path, but the *returned* identity is the bound
-///   registered one, not the ephemeral key itself - which is what lets
-///   this plug into the existing roster checks
-///   (`output_clients.contains`/`input_slot_client`) completely unchanged.
-///   The signed message additionally covers `session_token` itself, so a
-///   captured `{session_token, signature}` pair can't be replayed against
-///   a different request (nonce/body/method are already covered below,
-///   same as the native path - the token is folded in on top of that).
+/// `public_key` is always a freshly-generated ephemeral key, not an identity
+/// in its own right - `session_token` is looked up in `bindings` to find
+/// which registered identity that ephemeral key was authorized (via one
+/// WebAuthn ceremony - see `browser_bind_webauthn_identity`, which already
+/// checks the credential against the execution's roster) to act as; the
+/// signature verifies against the ephemeral `public_key`, but the *returned*
+/// identity is the bound registered one, not the ephemeral key itself -
+/// which is what lets this plug into the existing roster checks
+/// (`output_clients.contains`/`input_slot_client`) completely unchanged. A
+/// fabricated or unknown token is rejected by the `bindings.get` lookup
+/// below, before `NonceBook::accept` is ever reached - so nothing here
+/// allocates nonce-tracking state for an identity that hasn't already
+/// passed that roster check. The signed message additionally covers
+/// `session_token` itself, so a captured `{session_token, signature}` pair
+/// can't be replayed against a different request (created/nonce/body/method
+/// are already covered below - the token is folded in on top of that).
 async fn authenticate(
     method: &str,
     call: &BrowserCall,
     nonces: &Mutex<NonceBook>,
     bindings: &Mutex<WebauthnBindings>,
 ) -> RpcResult<ClientIdentity> {
+    let nonce: [u8; 16] = call
+        .request
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| auth_error("invalid nonce length"))?;
     let key = VerifyingKey::from_sec1_bytes(&call.request.public_key)
         .map_err(|_| auth_error("invalid P-256 public key"))?;
     let signature = Signature::from_slice(&call.request.signature)
@@ -823,60 +861,64 @@ async fn authenticate(
     let message = authentication_message(
         method,
         call.execution_id,
-        call.request.nonce,
+        call.request.created,
+        &nonce,
         &call.request.body,
-        call.request.session_token.as_deref(),
+        &call.request.session_token,
     );
     key.verify(&message, &signature)
         .map_err(|_| auth_error("request signature did not verify"))?;
 
-    let identity = match &call.request.session_token {
-        None => call.request.public_key.clone(),
-        Some(token) => {
-            let bindings = bindings.lock().await;
-            let binding = bindings
-                .get(token)
-                .ok_or_else(|| auth_error("unknown or expired session token"))?;
-            if binding.ecdsa_public_key != call.request.public_key {
-                return Err(auth_error(
-                    "session token is not bound to this signing key",
-                ));
-            }
-            binding.client_identity.clone()
+    let identity = {
+        let bindings = bindings.lock().await;
+        let binding = bindings
+            .get(&call.request.session_token)
+            .ok_or_else(|| auth_error("unknown or expired session token"))?;
+        if binding.ecdsa_public_key != call.request.public_key {
+            return Err(auth_error(
+                "session token is not bound to this signing key",
+            ));
         }
+        binding.client_identity.clone()
     };
 
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
     nonces
         .lock()
         .await
-        .accept(call.execution_id, &identity, call.request.nonce)?;
+        .accept(call.execution_id, &identity, call.request.created, nonce, now)?;
     Ok(identity)
 }
 
 fn authentication_message(
     method: &str,
     execution_id: ExecutionId,
-    nonce: u64,
+    created: u64,
+    nonce: &[u8; 16],
     body: &[u8],
-    session_token: Option<&str>,
+    session_token: &str,
 ) -> Vec<u8> {
     let body_hash = Sha256::digest(body);
     let mut message = Vec::with_capacity(
-        AUTH_DOMAIN.len() + method.len() + execution_id.as_bytes().len() + body_hash.len() + 10,
+        AUTH_DOMAIN.len()
+            + method.len()
+            + execution_id.as_bytes().len()
+            + body_hash.len()
+            + session_token.len()
+            + 20,
     );
     message.extend_from_slice(AUTH_DOMAIN);
     message.push(0);
     message.extend_from_slice(method.as_bytes());
     message.push(0);
     message.extend_from_slice(execution_id.as_bytes());
-    message.extend_from_slice(&nonce.to_le_bytes());
+    message.extend_from_slice(&created.to_le_bytes());
+    message.extend_from_slice(nonce);
     message.extend_from_slice(&body_hash);
-    // Folded in *after* everything the native path already signs, so a
-    // request with no session_token (the native path) produces byte-for-
-    // byte the same message as before - this field is purely additive.
-    if let Some(token) = session_token {
-        message.extend_from_slice(token.as_bytes());
-    }
+    message.extend_from_slice(session_token.as_bytes());
     message
 }
 
@@ -1042,17 +1084,61 @@ mod tests {
     }
 
     #[test]
-    fn authentication_message_folds_in_the_session_token_without_changing_the_native_path() {
-        let native = authentication_message("browser_round", execution_id(), 4, b"body", None);
-        let with_token =
-            authentication_message("browser_round", execution_id(), 4, b"body", Some("tok"));
-        assert_ne!(native, with_token);
-        // The native (no-session-token) path is untouched - identical bytes
-        // to what this function has always produced, so existing signed
-        // requests from the from_pkcs8 path keep verifying unchanged.
-        let native_again = authentication_message("browser_round", execution_id(), 4, b"body", None);
-        assert_eq!(native, native_again);
-        assert!(native.ends_with(&Sha256::digest(b"body")[..]));
+    fn authentication_message_covers_created_nonce_and_session_token() {
+        let base = authentication_message(
+            "browser_round",
+            execution_id(),
+            TEST_CREATED,
+            &test_nonce(1),
+            b"body",
+            "tok-a",
+        );
+        // Changing any one of created/nonce/session_token must change the
+        // signed bytes - each is a real, distinct input the coordinator
+        // checks, not decoration.
+        assert_ne!(
+            base,
+            authentication_message(
+                "browser_round",
+                execution_id(),
+                TEST_CREATED + 1,
+                &test_nonce(1),
+                b"body",
+                "tok-a",
+            )
+        );
+        assert_ne!(
+            base,
+            authentication_message(
+                "browser_round",
+                execution_id(),
+                TEST_CREATED,
+                &test_nonce(2),
+                b"body",
+                "tok-a",
+            )
+        );
+        assert_ne!(
+            base,
+            authentication_message(
+                "browser_round",
+                execution_id(),
+                TEST_CREATED,
+                &test_nonce(1),
+                b"body",
+                "tok-b",
+            )
+        );
+        let base_again = authentication_message(
+            "browser_round",
+            execution_id(),
+            TEST_CREATED,
+            &test_nonce(1),
+            b"body",
+            "tok-a",
+        );
+        assert_eq!(base, base_again);
+        assert!(base.ends_with(b"tok-a"));
     }
 
     #[test]
@@ -1218,6 +1304,27 @@ mod tests {
         .is_err());
     }
 
+    /// A fixed `created` timestamp for tests that don't care about the
+    /// freshness window itself - far enough from 0 that `now - created`
+    /// arithmetic in `NonceBook` never underflows in a test's own fixed
+    /// `now`.
+    const TEST_CREATED: u64 = 1_700_000_000;
+
+    fn test_nonce(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    /// For tests that go through `authenticate` itself - unlike `NonceBook`
+    /// tests (which pass their own fixed `now`), `authenticate` checks
+    /// `created` against the real wall clock, so these need a `created`
+    /// value actually close to it.
+    fn current_unix_time() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     #[tokio::test]
     async fn authenticate_resolves_the_bound_identity_for_a_session_token() {
         let signing_key = test_signing_key();
@@ -1237,22 +1344,25 @@ mod tests {
         let bindings = Mutex::new(bindings);
         let nonces = Mutex::new(NonceBook::default());
 
+        let created = current_unix_time();
         let message = authentication_message(
             "browser_round",
             execution_id(),
-            1,
+            created,
+            &test_nonce(1),
             b"",
-            Some(token.as_str()),
+            &token,
         );
         let signature: Signature = signing_key.sign(&message);
         let call = BrowserCall {
             execution_id: execution_id(),
             request: SignedBrowserRequest {
                 public_key: ecdsa_public_key,
-                nonce: 1,
+                created,
+                nonce: test_nonce(1).to_vec(),
                 signature: signature.to_bytes().to_vec(),
                 body: Vec::new(),
-                session_token: Some(token),
+                session_token: token,
             },
         };
 
@@ -1284,22 +1394,99 @@ mod tests {
         // Attacker holds a valid key of their own and signs correctly with
         // it, but presents someone else's session_token - the mismatch
         // between the bound key and the actual signer must be caught.
+        let created = current_unix_time();
         let message = authentication_message(
             "browser_round",
             execution_id(),
-            1,
+            created,
+            &test_nonce(1),
             b"",
-            Some(token.as_str()),
+            &token,
         );
         let signature: Signature = attacker_key.sign(&message);
         let call = BrowserCall {
             execution_id: execution_id(),
             request: SignedBrowserRequest {
                 public_key: attacker_public_key,
-                nonce: 1,
+                created,
+                nonce: test_nonce(1).to_vec(),
                 signature: signature.to_bytes().to_vec(),
                 body: Vec::new(),
-                session_token: Some(token),
+                session_token: token,
+            },
+        };
+
+        assert!(authenticate("browser_round", &call, &nonces, &bindings)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_a_request_with_an_unknown_session_token() {
+        let signing_key = test_signing_key();
+        let public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let bindings = Mutex::new(WebauthnBindings::default());
+        let nonces = Mutex::new(NonceBook::default());
+
+        // A fabricated token, never issued by a real bind ceremony - this is
+        // the only route into `authenticate` that doesn't already imply the
+        // execution's roster check passed, so it must be rejected before
+        // `NonceBook::accept` is ever reached.
+        let fabricated_token = "not-a-real-session-token".to_string();
+        let created = current_unix_time();
+        let message = authentication_message(
+            "browser_round",
+            execution_id(),
+            created,
+            &test_nonce(1),
+            b"",
+            &fabricated_token,
+        );
+        let signature: Signature = signing_key.sign(&message);
+        let call = BrowserCall {
+            execution_id: execution_id(),
+            request: SignedBrowserRequest {
+                public_key,
+                created,
+                nonce: test_nonce(1).to_vec(),
+                signature: signature.to_bytes().to_vec(),
+                body: Vec::new(),
+                session_token: fabricated_token,
+            },
+        };
+
+        assert!(authenticate("browser_round", &call, &nonces, &bindings)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_a_nonce_of_the_wrong_length() {
+        let signing_key = test_signing_key();
+        let ecdsa_public_key = VerifyingKey::from(&signing_key)
+            .to_sec1_bytes()
+            .to_vec();
+        let mut bindings = WebauthnBindings::default();
+        let token = bindings.insert(
+            Some(execution_id()),
+            WebauthnBinding {
+                client_identity: vec![42],
+                ecdsa_public_key: ecdsa_public_key.clone(),
+                ecdh_public_key: vec![7],
+            },
+        );
+        let bindings = Mutex::new(bindings);
+        let nonces = Mutex::new(NonceBook::default());
+
+        let call = BrowserCall {
+            execution_id: execution_id(),
+            request: SignedBrowserRequest {
+                public_key: ecdsa_public_key,
+                created: current_unix_time(),
+                nonce: vec![1, 2, 3], // not 16 bytes
+                signature: vec![0; 64],
+                body: Vec::new(),
+                session_token: token,
             },
         };
 
@@ -1352,12 +1539,82 @@ mod tests {
         let second = ExecutionId::from_bytes([2; 32]);
         let mut nonces = NonceBook::default();
 
-        nonces.accept(first, &identity, 1).expect("first request");
         nonces
-            .accept(second, &identity, 1)
+            .accept(first, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .expect("first request");
+        nonces
+            .accept(second, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
             .expect("same nonce in a different execution");
-        assert!(nonces.accept(first, &identity, 1).is_err());
-        nonces.accept(first, &identity, 2).expect("next request");
+        assert!(nonces
+            .accept(first, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .is_err());
+        nonces
+            .accept(first, &identity, TEST_CREATED, test_nonce(2), TEST_CREATED)
+            .expect("a different nonce, same execution and identity");
+    }
+
+    #[test]
+    fn nonce_book_rejects_a_replayed_nonce_within_the_window() {
+        let identity = vec![20];
+        let execution = execution_id();
+        let mut nonces = NonceBook::default();
+
+        nonces
+            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .expect("first use of this nonce");
+        assert!(nonces
+            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED + 5)
+            .is_err());
+    }
+
+    #[test]
+    fn nonce_book_accepts_two_distinct_nonces_sharing_the_same_created_timestamp() {
+        // `created` is second-resolution only, by design (matches RFC 9421) -
+        // distinct legitimate requests routinely share a value, so `nonce`
+        // (not `created`) must be what actually distinguishes them.
+        let identity = vec![20];
+        let execution = execution_id();
+        let mut nonces = NonceBook::default();
+
+        nonces
+            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .expect("first nonce");
+        nonces
+            .accept(execution, &identity, TEST_CREATED, test_nonce(2), TEST_CREATED)
+            .expect("second, distinct nonce with the same created timestamp");
+    }
+
+    #[test]
+    fn nonce_book_rejects_a_created_timestamp_outside_the_window() {
+        let identity = vec![20];
+        let execution = execution_id();
+        let mut nonces = NonceBook::default();
+
+        let now = TEST_CREATED + 1000;
+        assert!(nonces
+            .accept(execution, &identity, TEST_CREATED, test_nonce(1), now) // too old
+            .is_err());
+        assert!(nonces
+            .accept(execution, &identity, now + 1000, test_nonce(2), TEST_CREATED) // too far in the future
+            .is_err());
+    }
+
+    #[test]
+    fn nonce_book_evicts_expired_entries() {
+        let identity = vec![20];
+        let execution = execution_id();
+        let mut nonces = NonceBook::default();
+
+        nonces
+            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .expect("first use of this nonce");
+        // Well past the window - the earlier entry should have aged out, so
+        // the *same* nonce is accepted again as a fresh request rather than
+        // rejected as a replay.
+        let later = TEST_CREATED + NONCE_WINDOW_SECONDS * 3;
+        nonces
+            .accept(execution, &identity, later, test_nonce(1), later)
+            .expect("nonce reused only after its window has fully elapsed");
     }
 
     #[tokio::test]
