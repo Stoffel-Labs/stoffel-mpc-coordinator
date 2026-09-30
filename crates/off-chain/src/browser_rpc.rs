@@ -654,6 +654,29 @@ pub async fn coordinator_browser_methods(
                         })
                         .ok_or_else(|| auth_error("WebAuthn assertion did not match any registered identity admitted for this execution"))?,
                 };
+
+                // A second full bind ceremony for an identity that has already submitted its
+                // input is exactly the scenario that silently overwrote the earlier session's
+                // output-encryption target (see the design plan) - the client whose keys ended
+                // up bound "last" isn't necessarily the one that actually submitted and is now
+                // waiting on the tally. A legitimate reload doesn't hit this at all: the client
+                // library skips this RPC call entirely when it already has a cached, valid
+                // binding (see stoffel-browser-client.js's bind()), so this only ever rejects a
+                // *second* real ceremony - and only once something would actually be unsafe to
+                // move, not merely "this identity has bound before."
+                let already_submitted = execution
+                    .input_assignments
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, slot)| {
+                        (execution.input_slot_client(slot) == Some(&client_identity)).then_some(index)
+                    })
+                    .any(|index| execution.masked_inputs[index].is_some());
+                if already_submitted {
+                    return Err(auth_error(
+                        "this identity has already submitted its input for this execution and cannot bind again",
+                    ));
+                }
                 drop(coordinator);
 
                 state
@@ -1896,6 +1919,87 @@ mod tests {
             result.is_err(),
             "a globally-indexed but off-roster identity must not be able to bind, got {result:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_a_second_ceremony_after_the_identity_already_submitted() {
+        let signing_key = test_signing_key();
+        let public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let shared = Arc::new(Mutex::new(coordinator_with_two_browser_clients(
+            public_key.clone(),
+            vec![21],
+        )));
+        let methods = coordinator_browser_methods(shared.clone(), TEST_RP_ID, None).await;
+
+        let ecdsa_public_key = b"ecdsa-pub".to_vec();
+        let ecdh_public_key = b"ecdh-pub".to_vec();
+        let challenge = webauthn_bind_challenge(&ecdsa_public_key, &ecdh_public_key);
+        // Increasing sign_count across the two binds (1, then 2) so SignCounts' own check
+        // can't be what rejects the second bind - this test isolates the already-submitted
+        // check specifically.
+        let first_assertion =
+            make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 1);
+        let first_params = bind_params(&first_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        methods
+            .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (first_params,))
+            .await
+            .expect("first bind, before anything has been submitted");
+
+        // public_key is assigned input index 0 in coordinator_with_two_browser_clients -
+        // simulate that this identity's input has since been submitted, without needing to
+        // drive the full reserve/mask/submit RPC flow just to set up this one field.
+        shared
+            .lock()
+            .await
+            .executions
+            .get_mut(&execution_id())
+            .expect("execution")
+            .masked_inputs[0] = Some(vec![1, 2, 3]);
+
+        let second_assertion =
+            make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 2);
+        let second_params = bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        let result: Result<serde_json::Value, _> = methods
+            .call("browser_bind_webauthn_identity", (second_params,))
+            .await;
+        assert!(
+            result.is_err(),
+            "a second bind for an identity that already submitted must be rejected, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_still_allows_a_second_ceremony_before_submission() {
+        // The reload-recovery case: nothing has been submitted yet, so a second full ceremony
+        // for the same identity (e.g. client-side storage didn't survive a reload - see the
+        // design plan) must still succeed.
+        let signing_key = test_signing_key();
+        let public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let shared = Arc::new(Mutex::new(coordinator_with_two_browser_clients(
+            public_key.clone(),
+            vec![21],
+        )));
+        let methods = coordinator_browser_methods(shared, TEST_RP_ID, None).await;
+
+        let ecdsa_public_key = b"ecdsa-pub".to_vec();
+        let ecdh_public_key = b"ecdh-pub".to_vec();
+        let challenge = webauthn_bind_challenge(&ecdsa_public_key, &ecdh_public_key);
+
+        let first_assertion =
+            make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 1);
+        let first_params = bind_params(&first_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        methods
+            .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (first_params,))
+            .await
+            .expect("first bind");
+
+        let second_assertion =
+            make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 2);
+        let second_params = bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        methods
+            .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (second_params,))
+            .await
+            .expect("a second bind before submission must still succeed");
     }
 
     #[tokio::test]
