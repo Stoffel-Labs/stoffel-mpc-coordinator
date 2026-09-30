@@ -219,6 +219,23 @@ impl WebauthnBindings {
     fn get(&self, token: &str) -> Option<&WebauthnBinding> {
         self.by_token.get(token)
     }
+
+    /// Re-affirms `identity`'s output-encryption binding using the exact `WebauthnBinding`
+    /// already on file for the calling session's own token - called once a submission
+    /// actually succeeds, so a later still-legitimate rebind (before *its own* submission,
+    /// e.g. a different tab, or a reload in an environment where storage doesn't survive
+    /// it - see `browser_bind_webauthn_identity`'s already-submitted rejection) can never
+    /// retroactively move an already-submitted client's encryption target. Deliberately
+    /// doesn't touch `by_token` - no new session is being created here, this just
+    /// re-records which one already exists. Combined with that rejection, this is
+    /// guaranteed to be the last write `by_execution_and_client_identity` ever receives
+    /// for this identity in this execution.
+    pub(crate) fn pin_binding_from_token(&mut self, execution_id: ExecutionId, session_token: &str) {
+        if let Some(binding) = self.by_token.get(session_token).cloned() {
+            self.by_execution_and_client_identity
+                .insert((execution_id, binding.client_identity.clone()), binding);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -556,7 +573,16 @@ pub async fn coordinator_browser_methods(
                         batch.masked_inputs,
                         batch.reserved_indices,
                     )
+                    .await?;
+                // Re-affirm this session's own binding as the output-encryption target now
+                // that it's the one that actually submitted - see WebauthnBindings::
+                // pin_binding_from_token's doc for why this has to happen here.
+                state
+                    .bindings
+                    .lock()
                     .await
+                    .pin_binding_from_token(call.execution_id, &call.request.session_token);
+                Ok(())
             },
         )
         .expect("method name is unique");
@@ -2097,5 +2123,147 @@ mod tests {
         );
 
         assert_eq!(bindings.resolve_ecdh_public_key(exec_a, &identity), None);
+    }
+
+    #[test]
+    fn pin_binding_from_token_re_affirms_the_execution_scoped_entry() {
+        let mut bindings = WebauthnBindings::default();
+        let identity: ClientIdentity = vec![42];
+        let exec = execution_id();
+
+        // Tab 1 binds - key A, token A.
+        let token_a = bindings.insert(
+            Some(exec),
+            WebauthnBinding {
+                client_identity: identity.clone(),
+                ecdsa_public_key: vec![0xA1],
+                ecdh_public_key: vec![0xA; 65],
+            },
+        );
+        // A second, still-legitimate bind for the same identity (e.g. a different tab,
+        // before either has submitted) - overwrites the live entry to key B.
+        bindings.insert(
+            Some(exec),
+            WebauthnBinding {
+                client_identity: identity.clone(),
+                ecdsa_public_key: vec![0xB1],
+                ecdh_public_key: vec![0xB; 65],
+            },
+        );
+        assert_eq!(
+            bindings.resolve_ecdh_public_key(exec, &identity),
+            Some(vec![0xB; 65]),
+            "sanity check: the second bind must have moved the live entry to key B first",
+        );
+
+        // Tab 1 submits, using its own still-valid token A - this must restore key A as the
+        // output-encryption target, not leave key B in place.
+        bindings.pin_binding_from_token(exec, &token_a);
+        assert_eq!(
+            bindings.resolve_ecdh_public_key(exec, &identity),
+            Some(vec![0xA; 65]),
+            "the session that actually submitted (token A, key A) must win, not whichever bound last",
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_pins_the_encryption_key_despite_an_earlier_interleaved_rebind() {
+        let request_signing_key = SigningKey::from_bytes(&[55u8; 32].into()).unwrap();
+        let request_ecdsa_public_key = VerifyingKey::from(&request_signing_key)
+            .to_sec1_bytes()
+            .to_vec();
+        let identity_signing_key = test_signing_key();
+        let identity_public_key = VerifyingKey::from(&identity_signing_key)
+            .to_sec1_bytes()
+            .to_vec();
+        let shared = Arc::new(Mutex::new(coordinator_with_two_browser_clients(
+            identity_public_key.clone(),
+            vec![21],
+        )));
+        let methods = coordinator_browser_methods(shared.clone(), TEST_RP_ID, None).await;
+
+        // Tab 1 binds - real ecdh key A, real signing key for subsequent requests.
+        let ecdh_key_a = b"ecdh-key-a".to_vec();
+        let challenge_a = webauthn_bind_challenge(&request_ecdsa_public_key, &ecdh_key_a);
+        let bind_a = make_assertion_with_sign_count(
+            &identity_signing_key, &challenge_a, TEST_ORIGIN, true, true, 1,
+        );
+        let bind_a_params = bind_params(&bind_a, &request_ecdsa_public_key, &ecdh_key_a, b"");
+        let bind_a_response: serde_json::Value = methods
+            .call("browser_bind_webauthn_identity", (bind_a_params,))
+            .await
+            .expect("tab 1 bind");
+        let session_token_a: String =
+            serde_json::from_value(bind_a_response["session_token"].clone()).unwrap();
+
+        // A different tab rebinds the same identity before anything is submitted - still
+        // legitimate, and moves the live WebauthnBindings entry to key B.
+        let ecdh_key_b = b"ecdh-key-b".to_vec();
+        let challenge_b = webauthn_bind_challenge(&request_ecdsa_public_key, &ecdh_key_b);
+        let bind_b = make_assertion_with_sign_count(
+            &identity_signing_key, &challenge_b, TEST_ORIGIN, true, true, 2,
+        );
+        let bind_b_params = bind_params(&bind_b, &request_ecdsa_public_key, &ecdh_key_b, b"");
+        methods
+            .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (bind_b_params,))
+            .await
+            .expect("a different tab's rebind, still before anything has submitted");
+
+        // identity_public_key is assigned input index 0 in coordinator_with_two_browser_clients.
+        // Set up what reserve_mask_indices would otherwise establish, directly - this test is
+        // about the submit-time pin, not the reservation flow.
+        {
+            let mut coordinator = shared.lock().await;
+            let execution = coordinator
+                .executions
+                .get_mut(&execution_id())
+                .expect("execution");
+            execution.round = Round::InputCollection;
+            execution.reserved_indices[0] = Some(identity_public_key.clone());
+        }
+
+        // Tab 1 submits, signed with its own still-valid session_token_a.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "reserved_indices": [0u64],
+            "masked_inputs": [vec![7u8, 7, 7]],
+        }))
+        .unwrap();
+        let created = current_unix_time();
+        let nonce = test_nonce(9);
+        let message = authentication_message(
+            "browser_submit_masked_inputs",
+            execution_id(),
+            created,
+            &nonce,
+            &body,
+            &session_token_a,
+        );
+        let signature: Signature = request_signing_key.sign(&message);
+        let submit_params = serde_json::json!({
+            "execution_id": execution_id().as_bytes(),
+            "request": {
+                "public_key": request_ecdsa_public_key,
+                "created": created,
+                "nonce": nonce.to_vec(),
+                "signature": signature.to_bytes().to_vec(),
+                "body": body,
+                "session_token": session_token_a,
+            },
+        });
+        methods
+            .call::<_, serde_json::Value>("browser_submit_masked_inputs", (submit_params,))
+            .await
+            .expect("tab 1 submits with its own session token");
+
+        // The output-encryption target must now be key A - the session that actually
+        // submitted - not key B, which bound later but never submitted anything.
+        let bindings = shared.lock().await.webauthn_bindings.clone();
+        assert_eq!(
+            bindings
+                .lock()
+                .await
+                .resolve_ecdh_public_key(execution_id(), &identity_public_key),
+            Some(ecdh_key_a),
+        );
     }
 }
