@@ -9,6 +9,7 @@
 
 use crate::roster::NodeRoster;
 use crate::ClientIdentity;
+use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_SIG_ED25519};
@@ -110,23 +111,32 @@ impl SpkiDer {
             });
         };
 
+        // Canonicality is decided by re-encoding: a key is admitted only when the
+        // certificate carries byte-for-byte the one SubjectPublicKeyInfo its algorithm
+        // defines for it. For P-256 that is the DER round-trip through `p256`, which
+        // subsumes the header, the uncompressed SEC1 point, its length, and membership of
+        // the curve in a single comparison. For Ed25519 it is RFC 8410's encoding: absent
+        // parameters, and a 32-byte key in a BIT STRING with no unused bits. Both leave
+        // `raw` equal to `canonical_prefix() ++ key`, the invariant `key_algorithm` and
+        // `client_identity` slice on.
         let raw = public_key.raw;
-        let non_canonical = PinError::NonCanonicalPublicKey {
-            algorithm: key_algorithm,
-        };
-        let key = raw
-            .strip_prefix(key_algorithm.canonical_prefix())
-            .ok_or_else(|| non_canonical.clone())?;
         let canonical = match key_algorithm {
-            KeyAlgorithm::EcdsaP256 => {
-                key.len() == P256_POINT_LEN
-                    && key[0] == 0x04
-                    && p256::PublicKey::from_sec1_bytes(key).is_ok()
+            KeyAlgorithm::EcdsaP256 => p256::PublicKey::from_public_key_der(raw)
+                .ok()
+                .and_then(|key| key.to_public_key_der().ok())
+                .is_some_and(|re_encoded| re_encoded.as_bytes() == raw),
+            KeyAlgorithm::Ed25519 => {
+                let bit_string = &public_key.subject_public_key;
+                algorithm.parameters.is_none()
+                    && bit_string.unused_bits == 0
+                    && bit_string.data.len() == ED25519_KEY_LEN
+                    && raw == [&ED25519_SPKI_PREFIX[..], &bit_string.data].concat()
             }
-            KeyAlgorithm::Ed25519 => key.len() == ED25519_KEY_LEN,
         };
         if !canonical {
-            return Err(non_canonical);
+            return Err(PinError::NonCanonicalPublicKey {
+                algorithm: key_algorithm,
+            });
         }
         Ok(Self(raw.to_vec()))
     }
@@ -451,6 +461,44 @@ mod tests {
         assert_eq!(KeyAlgorithm::of_client_identity(&hybrid), None);
         assert_eq!(KeyAlgorithm::of_client_identity(&[2; 33]), None);
         assert_eq!(KeyAlgorithm::of_client_identity(&[]), None);
+    }
+
+    /// The property the canonicality check exists for: a compressed point names the same
+    /// key as the pin but is not the pin's bytes, and `p256` parses it happily — only
+    /// re-encoding tells the two apart.
+    #[test]
+    fn a_compressed_p256_point_is_not_canonical() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let certified = p256_certificate();
+        let cert_der = certified.cert.der().to_vec();
+        let pin = SpkiDer::from_certificate_der(&cert_der).unwrap();
+
+        let point = certified.signing_key.public_key_raw().to_vec();
+        let key = p256::PublicKey::from_sec1_bytes(&point).unwrap();
+        let compressed = key.to_encoded_point(true);
+        let compressed = compressed.as_bytes();
+        assert_eq!(compressed.len(), 33);
+
+        let algorithm = &P256_SPKI_PREFIX[2..23];
+        let bit_string_len = compressed.len() + 1;
+        let re_encoding = [
+            &[0x30, (algorithm.len() + 2 + bit_string_len) as u8][..],
+            algorithm,
+            &[0x03, bit_string_len as u8, 0x00],
+            compressed,
+        ]
+        .concat();
+
+        let parsed = p256::PublicKey::from_public_key_der(&re_encoding).unwrap();
+        assert_eq!(parsed, key);
+        assert_ne!(re_encoding, pin.as_bytes());
+        assert_eq!(
+            SpkiDer::from_certificate_der(&with_spki(&cert_der, &re_encoding)),
+            Err(PinError::NonCanonicalPublicKey {
+                algorithm: KeyAlgorithm::EcdsaP256
+            })
+        );
     }
 
     #[test]

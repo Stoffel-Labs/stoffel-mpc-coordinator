@@ -36,7 +36,7 @@ offered. Upgrade coordinators, nodes and clients together.
   `admission: AdmissionPolicy` and `deadlines: Option<ExecutionDeadlines>`, and no longer
   crosses the wire: the `register_execution` RPC is deleted and registration happens in the
   coordinator's process. `CoordinatorRPCServerSharedBase::register_execution` returns the
-  `RegistrationNonce`, refusing with `CoordinatorError::Registration(RegistrationError)`. `open` and `invitation` admission require deadlines.
+  `RegistrationNonce`, refusing with `CoordinatorError::Registration(RegistrationError)`. `open` admission requires deadlines.
 - **Clients.** A client must `associate_client` before reserving. A reservation must name
   exactly the admitted input range (codes 31, 32), and a submission must cover that range in one
   `submit_masked_inputs(first_index, inputs, signature)` call signed by the client's key. A
@@ -90,21 +90,20 @@ offered. Upgrade coordinators, nodes and clients together.
   (`SendingFailed`), 13 (`MismatchedBatchLengths`), 15 (`UnauthorizedClientIo`), 17
   (`ExecutionAlreadyRegistered`), 18 (`ShutdownNotAccepted`) and 19 (`EmptyBatch`); adds 20
   (`AssociationClosed`), 21 (`CapacityExhausted`), 22 (`SlotOutOfRange`), 23 (`SlotTaken`), 24
-  (`NotPreRegistered`), 25 (`PreRegisteredSlotMismatch`), 26 (`InvitationRequired`), 27
-  (`InvitationRejected`), 28 (`UnexpectedInvitation`), 29 (`UnsupportedClientKey`), 30
+  (`NotPreRegistered`), 25 (`PreRegisteredSlotMismatch`), 29 (`UnsupportedClientKey`), 30
   (`AlreadyAssociated`), 31 (`NotAdmitted`), 32 (`ReservationOutsideAdmission`), 33
   (`AdmissionsNotFrozen`), 35 (`ExecutionAborted`), 36 (`MaskedInputTooLarge`), 37
   (`SubmissionOutsideAdmission`), 38 (`BadMaskedInputSignature`), 39 (`SealedOutputTooLarge`), 40
-  (`BadOutputSignature`) and 41 (`RateLimited`). 34 is not allocated. Refusals carry their typed
-  error as JSON-RPC error `data`.
+  (`BadOutputSignature`) and 41 (`RateLimited`). 26, 27 and 28 are retired and never reused; 34
+  is not allocated. Refusals carry their typed error as JSON-RPC error `data`.
 - **`run-coord`.** `--initial-mpc-nodes` becomes `--node-certs <cert.der,...>`; `--n`,
   `--n-inputs`, `--output-clients` and `--backend` are removed; `--one-off <hash>,<execution-id>`
   becomes a boolean `--one-off` beside the required `--execution-id` and exactly one of
   `--program` or `--hash`. The execution is registered at startup in both modes, since a standing
   coordinator can no longer accept remote registrations. Client slots come from the program
   manifest (whose `client_slot`s must be `0..k`) or `--client-io <inputs>:<outputs>,...`, and
-  admission from `--admission pre-registered|open|invitation` (default `pre-registered`) with
-  `--client-certs` or `--client-bindings <slot>=<cert>,...`, or `--invitation-issuer-cert`.
+  admission from `--admission pre-registered|open` (default `pre-registered`) with
+  `--client-certs` or `--client-bindings <slot>=<cert>,...`.
   A non-empty flag the chosen admission does not read, and every registration error, exits 2.
 
 ### Added
@@ -112,8 +111,7 @@ offered. Upgrade coordinators, nodes and clients together.
 - Added the coordinator node roster (`NodeRoster`) with a byte-exact blake3 digest, served unchanged for the process lifetime by the `get_node_roster` RPC to any mTLS caller, rate limited per caller identity.
 - Added `CoordinatorLink`, which connects to a pinned coordinator and fetches and verifies the roster once.
 - Added connection limits for every listener (`RpcServerLimits`): pending-handshake bounds in total and per source, a handshake timeout, per-identity and per-class connection pools, and an idle timeout for unreserved connections.
-- Added per-execution client admission: an in-process `ExecutionRegistration` fixes a `ClientSlotTable` (each slot's input range and output rights) and an `AdmissionPolicy` — `PreRegistered`, `Open` or `Invitation` — and clients bind slots late with the `associate_client` RPC, keyed on their mTLS identity. Association is idempotent for an identical request and refuses with typed `AdmissionError`s, returned as JSON-RPC error `data` under stable codes.
-- Added signed invitations (`SignedInvitation`, bound to one registration nonce, program, roster, slot and expiry) and the `issue-invitation` binary.
+- Added per-execution client admission: an in-process `ExecutionRegistration` fixes a `ClientSlotTable` (each slot's input range and output rights) and an `AdmissionPolicy` — `PreRegistered` or `Open` — and clients bind slots late with the `associate_client` RPC, keyed on their mTLS identity. Association is idempotent for an identical request and refuses with typed `AdmissionError`s, returned as JSON-RPC error `data` under stable codes.
 - Added `get_execution_summary` (rate limited with `get_node_roster`) and the node-only `get_client_admissions`, which serves the admission set frozen when input collection begins; `admitted_reservations` derives the mask-share reservations every node registers from it.
 - Added client signatures over masked inputs and node signatures over sealed outputs (`signing` module), verified by the coordinator and by their receivers; output shares now arrive one node per message and are reconstructed by roster position.
 - Added association and input deadlines with a deadline sweeper owned by every listener start, the terminal `Round::Aborted`, `Event::ExecutionAborted`, bounded memory of ended executions, and output retention after unanimous retirement.
@@ -131,12 +129,12 @@ offered. Upgrade coordinators, nodes and clients together.
 - `ExecutionRegistration` loses `n_inputs`, `output_clients`, `input_assignment` and `min_output_shares` and no longer crosses the wire; registration is in-process only and `register_execution` returns the registration nonce after ordered, typed checks (`RegistrationError`).
 - Reservations and submissions must cover exactly the caller's admitted range in one call; submissions carry the first index and a signature. Output delivery, reservation and submission streams and `sub_round` are gated on node membership or admission, and no subscription or broadcast awaits a send while holding the coordinator state mutex.
 - One-off coordinators drain once the retirement quorum has acknowledged a terminal round (`watch_for_retirement_quorum`), instead of on a designated party's shutdown request.
-- `run-coord` registers its execution at startup in both modes and takes `--execution-id`, `--program` or `--hash`, `--node-certs`, `--client-io`, `--admission`, `--client-certs`, `--client-bindings`, `--invitation-issuer-cert`, the deadline flags and `--max-connections`.
+- `run-coord` registers its execution at startup in both modes and takes `--execution-id`, `--program` or `--hash`, `--node-certs`, `--client-io`, `--admission`, `--client-certs`, `--client-bindings`, the deadline flags and `--max-connections`.
 
 ### Removed
 
 - Removed the `register_execution`, `request_shutdown`, `available_input_masks`, `reserve_mask_index`, `submit_masked_input`, `sub_assigned_reserved_indices` and `sub_assigned_masked_inputs` RPC methods, `InputAssignment`, `InputClientRange`, `InputSlotAssignment`, `AssignedMaskedInputEvent`, and the node listener's unassigned `add_reserved_index(es)_for_execution`.
-- Retired error codes 1, 3, 4, 7, 11, 13, 15, 17, 18 and 19.
+- Retired error codes 1, 3, 4, 7, 11, 13, 15, 17, 18, 19, 26, 27 and 28.
 
 ## 0.2.0 - 2026-08-28
 

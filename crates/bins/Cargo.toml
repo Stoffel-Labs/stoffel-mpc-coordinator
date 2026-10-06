@@ -28,10 +28,6 @@ path = "src/bin/generate-ids.rs"
 name = "roster-digest"
 path = "src/bin/roster-digest.rs"
 
-[[bin]]
-name = "issue-invitation"
-path = "src/bin/issue-invitation.rs"
-
 [dependencies]
 stoffel-mpc-coordinator-shared = { workspace = true }
 stoffel-mpc-coordinator-off-chain = { workspace = true }
@@ -45,9 +41,7 @@ ark-serialize = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 rcgen = { workspace = true }
-ring = { workspace = true }
 rustls = { workspace = true }
-serde_json = { workspace = true }
 stoffelmpc-mpc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time"] }

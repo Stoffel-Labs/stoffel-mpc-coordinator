@@ -30,10 +30,9 @@ use stoffel_mpc_coordinator_shared::{
     masked_inputs_signing_bytes, sealed_output_signing_bytes, sign_with_pkcs8, AbortReason,
     AdmissionError, AdmissionPolicy, AdmissionPolicyKind, AssociationRequest, ClientAdmission,
     ClientIndex, ClientSlotSpec, ClientSlotTable, Coordinator, CoordinatorError,
-    ExecutionDeadlines, ExecutionOutcome, InputRange, Invitation, InvitationIssuer,
-    InvitationRejection, KeyAlgorithm, NodeCertificateDer, NodeRoster, NodeRosterWire,
-    OutputRights, RegistrationError, RegistrationNonce, RosterDigest, RosterError, RpcRefusal,
-    ServerPin, ShareBound, SignedInvitation, SpkiDer, SubmissionError, UnixSeconds,
+    ExecutionDeadlines, ExecutionOutcome, InputRange, KeyAlgorithm, NodeCertificateDer, NodeRoster,
+    NodeRosterWire, OutputRights, RegistrationError, RegistrationNonce, RosterDigest, RosterError,
+    RpcRefusal, ServerPin, ShareBound, SpkiDer, SubmissionError, UnixSeconds,
     MAX_MASKED_INPUT_BYTES, MAX_SEALED_OUTPUT_BYTES,
 };
 use stoffel_mpc_coordinator_shared::{ExecutionId, Round};
@@ -299,16 +298,12 @@ async fn raw_client(port: u16, coordinator: &Certified, cert: &Certified) -> Cli
 }
 
 fn open_request() -> AssociationRequest {
-    AssociationRequest {
-        slot: None,
-        invitation: None,
-    }
+    AssociationRequest { slot: None }
 }
 
 fn slot_request(index: u32) -> AssociationRequest {
     AssociationRequest {
         slot: Some(ClientIndex(index)),
-        invitation: None,
     }
 }
 
@@ -330,19 +325,6 @@ fn refusal_of(result: Result<impl std::fmt::Debug, CoordinatorError>) -> RpcRefu
     match result {
         Err(CoordinatorError::Refused { refusal, .. }) => refusal,
         other => panic!("expected an untyped refusal, got {other:?}"),
-    }
-}
-
-/// The typed admission error in a failed raw call's `data`.
-fn raw_admission_error<T: std::fmt::Debug>(
-    result: Result<T, jsonrpsee::core::client::Error>,
-) -> AdmissionError {
-    match result {
-        Err(jsonrpsee::core::client::Error::Call(error)) => {
-            serde_json::from_str(error.data().expect("admission refusals carry data").get())
-                .unwrap()
-        }
-        other => panic!("expected a refused call, got {other:?}"),
     }
 }
 
@@ -1956,7 +1938,7 @@ async fn registration_checks_state_in_order_and_never_evicts_for_a_refused_one()
     let nonce = state.register_execution(live.clone()).unwrap();
     tokio::time::sleep(Duration::from_millis(2_100)).await;
     assert!(matches!(
-        live.validate(state.node_roster(), state.server_spki(), UnixSeconds::now()),
+        live.validate(UnixSeconds::now()),
         Err(RegistrationError::DeadlineElapsed { .. })
     ));
     assert_eq!(state.register_execution(live.clone()).unwrap(), nonce);
@@ -2312,266 +2294,6 @@ async fn association_closes_when_input_collection_begins() {
             current: Round::InputCollection
         }
     );
-}
-
-/// An invitation from `issuer` for `invitee` to `client_index` of the harness's execution.
-async fn invitation_for(
-    harness: &Harness,
-    issuer: &Certified,
-    invitee: &Certified,
-    client_index: u32,
-) -> SignedInvitation {
-    let invitation = Invitation {
-        execution_id: harness.execution_id,
-        registration_nonce: harness.nonce().await,
-        program_hash: [1; 32],
-        roster_digest: roster_of(1, &harness.nodes).digest(),
-        not_after: UnixSeconds(UnixSeconds::now().0 + 300),
-        invitee: identity_of(invitee),
-        client_index: ClientIndex(client_index),
-    };
-    SignedInvitation::sign(invitation, &issuer.signing_key.serialize_der()).unwrap()
-}
-
-fn invitation_registration(
-    execution_id: ExecutionId,
-    issuer: &Certified,
-    slots: Vec<ClientSlotSpec>,
-) -> ExecutionRegistration {
-    registration(
-        execution_id,
-        slots,
-        AdmissionPolicy::Invitation {
-            issuer: InvitationIssuer::new(spki_of(issuer)),
-        },
-        deadlines_in(600, 1200),
-    )
-}
-
-fn with_invitation(invitation: SignedInvitation) -> AssociationRequest {
-    AssociationRequest {
-        slot: None,
-        invitation: Some(invitation),
-    }
-}
-
-#[tokio::test]
-async fn invitation_admission_accepts_a_valid_invitation_and_refuses_every_forgery() {
-    let issuer = client_cert();
-    let execution_id = execution(0x8a);
-    let harness = Harness::start(invitation_registration(
-        execution_id,
-        &issuer,
-        vec![slot(1, 1), slot(1, 0)],
-    ))
-    .await;
-    let invitee = client_cert();
-    let mut client = harness.client(&invitee).await;
-    let valid = invitation_for(&harness, &issuer, &invitee, 0).await;
-
-    assert_eq!(
-        admission_error(client.associate_client(open_request()).await),
-        AdmissionError::InvitationRequired { execution_id }
-    );
-
-    let resign = |mutate: &dyn Fn(&mut Invitation)| {
-        let mut invitation = valid.invitation.clone();
-        mutate(&mut invitation);
-        SignedInvitation::sign(invitation, &issuer.signing_key.serialize_der()).unwrap()
-    };
-    let now = UnixSeconds::now().0;
-    let other_invitee = client_cert();
-    let mut bad_signature = valid.clone();
-    bad_signature.invitation.not_after = UnixSeconds(now + 301);
-    let forgeries = [
-        (
-            resign(&|invitation| invitation.execution_id = execution(0x8b)),
-            InvitationRejection::WrongExecution,
-        ),
-        (
-            resign(&|invitation| {
-                invitation.registration_nonce = RegistrationNonce::from_bytes([9; 32])
-            }),
-            InvitationRejection::WrongRegistration,
-        ),
-        (
-            resign(&|invitation| invitation.program_hash = [2; 32]),
-            InvitationRejection::WrongProgram,
-        ),
-        (
-            resign(&|invitation| invitation.roster_digest = RosterDigest::from_bytes([3; 32])),
-            InvitationRejection::WrongRoster,
-        ),
-        (
-            resign(&|invitation| invitation.not_after = UnixSeconds(now - 10)),
-            InvitationRejection::Expired {
-                not_after: UnixSeconds(now - 10),
-                now: UnixSeconds::now(),
-            },
-        ),
-        (
-            resign(&|invitation| invitation.invitee = identity_of(&other_invitee)),
-            InvitationRejection::WrongInvitee,
-        ),
-        (bad_signature, InvitationRejection::BadSignature),
-        (
-            SignedInvitation::sign(
-                valid.invitation.clone(),
-                &client_cert().signing_key.serialize_der(),
-            )
-            .unwrap(),
-            InvitationRejection::BadSignature,
-        ),
-    ];
-    // Raw calls: the client library reads the (rate-limited) summary before every association.
-    let raw = harness.raw(&invitee).await;
-    for (forgery, expected) in forgeries {
-        let refused = CoordinatorRPCBaseClient::associate_client(
-            &raw,
-            execution_id,
-            with_invitation(forgery),
-        )
-        .await;
-        match raw_admission_error(refused) {
-            AdmissionError::InvitationRejected {
-                reason: InvitationRejection::Expired { not_after, .. },
-            } => assert!(
-                matches!(expected, InvitationRejection::Expired { not_after: expected_not_after, .. } if expected_not_after == not_after)
-            ),
-            AdmissionError::InvitationRejected { reason } => assert_eq!(reason, expected),
-            other => panic!("expected InvitationRejected({expected:?}), got {other:?}"),
-        }
-    }
-
-    let admission = client
-        .associate_client(with_invitation(valid.clone()))
-        .await
-        .unwrap();
-    assert_eq!(admission.client_index, ClientIndex(0));
-    assert_eq!(admission.output_rights, receive(1));
-    // The identical request again is the idempotent case, not a replay.
-    assert_eq!(
-        client
-            .associate_client(with_invitation(valid))
-            .await
-            .unwrap(),
-        admission
-    );
-
-    // An invitation presented to an `Open` execution is refused, not ignored.
-    let open_id = execution(0x8c);
-    harness
-        .server
-        .state()
-        .lock()
-        .await
-        .register_execution(open_registration(open_id, vec![slot(1, 0)]))
-        .unwrap();
-    let mut open_client =
-        start_coord_client(open_id, harness.port, &harness.coordinator, invitee.clone()).await;
-    let invitation = invitation_for(&harness, &issuer, &invitee, 0).await;
-    assert_eq!(
-        admission_error(
-            open_client
-                .associate_client(with_invitation(invitation))
-                .await
-        ),
-        AdmissionError::UnexpectedInvitation {
-            execution_id: open_id
-        }
-    );
-}
-
-#[tokio::test]
-async fn an_invitation_for_an_earlier_registration_of_the_same_id_is_refused() {
-    let issuer = client_cert();
-    let invitee = client_cert();
-    let execution_id = execution(0x8d);
-    let registration = invitation_registration(execution_id, &issuer, vec![slot(1, 0)]);
-    let first = Harness::start(registration.clone()).await;
-    let old_invitation = invitation_for(&first, &issuer, &invitee, 0).await;
-    let old_nonce = first.nonce().await;
-
-    // The coordinator restarts with the same roster, key, id and registration.
-    let Harness {
-        server,
-        coordinator,
-        nodes,
-        ..
-    } = first;
-    server.shutdown().await;
-    let state = coordinator_state(1, &nodes, &coordinator, registration);
-    let port = free_port();
-    let restarted = start_coordinator(state, port, &coordinator).await;
-    let new_nonce = restarted
-        .state()
-        .lock()
-        .await
-        .registration_nonce(execution_id)
-        .unwrap();
-    assert_ne!(old_nonce, new_nonce, "a new registration draws a new nonce");
-
-    let mut client = start_coord_client(execution_id, port, &coordinator, invitee).await;
-    assert_eq!(
-        admission_error(
-            client
-                .associate_client(with_invitation(old_invitation))
-                .await
-        ),
-        AdmissionError::InvitationRejected {
-            reason: InvitationRejection::WrongRegistration
-        }
-    );
-}
-
-#[tokio::test]
-async fn an_invitation_binds_only_the_slot_it_names() {
-    let issuer = client_cert();
-    let execution_id = execution(0x8e);
-    // Slot 0 is input-only, slot 1 receives outputs.
-    let harness = Harness::start(invitation_registration(
-        execution_id,
-        &issuer,
-        vec![slot(1, 0), slot(0, 1)],
-    ))
-    .await;
-    let input_invitee = client_cert();
-    let output_invitee = client_cert();
-    let mut input_client = harness.client(&input_invitee).await;
-    let for_slot_0 = invitation_for(&harness, &issuer, &input_invitee, 0).await;
-
-    assert_eq!(
-        admission_error(
-            input_client
-                .associate_client(AssociationRequest {
-                    slot: Some(ClientIndex(1)),
-                    invitation: Some(for_slot_0.clone()),
-                })
-                .await
-        ),
-        AdmissionError::InvitationRejected {
-            reason: InvitationRejection::SlotMismatch {
-                invited: ClientIndex(0),
-                requested: ClientIndex(1)
-            }
-        }
-    );
-    let admission = input_client
-        .associate_client(with_invitation(for_slot_0))
-        .await
-        .unwrap();
-    assert_eq!(admission.client_index, ClientIndex(0));
-    assert_eq!(admission.output_rights, OutputRights::None);
-
-    // Slot 1 is still there for the invitation that names it.
-    let mut output_client = harness.client(&output_invitee).await;
-    let for_slot_1 = invitation_for(&harness, &issuer, &output_invitee, 1).await;
-    let admission = output_client
-        .associate_client(with_invitation(for_slot_1))
-        .await
-        .unwrap();
-    assert_eq!(admission.client_index, ClientIndex(1));
-    assert_eq!(admission.output_rights, receive(1));
 }
 
 #[tokio::test]

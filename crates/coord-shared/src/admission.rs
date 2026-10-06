@@ -7,14 +7,9 @@
 //! removed or moved. Every node reads the same frozen `ClientAdmissionSet` once the set can no
 //! longer change, so every node applies the same release rule to the same data.
 
-use crate::pin::{KeyAlgorithm, SpkiDer};
-use crate::roster::{NodeRoster, RosterDigest};
+use crate::pin::KeyAlgorithm;
 use crate::{ClientIdentity, ExecutionId, Round};
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{
-    EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
-    ECDSA_P256_SHA256_ASN1_SIGNING,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -38,8 +33,6 @@ pub const MAX_SEALED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 /// The domain separator of `program_hash_of`, shared byte for byte with the VM's
 /// `program_id_from_bytes`.
 const PROGRAM_HASH_DOMAIN: &[u8] = b"stoffel-program-v1";
-/// The domain separator of `Invitation::signing_bytes`.
-const INVITATION_DOMAIN: &[u8] = b"stoffel-coordinator-invitation-v3";
 
 /// `blake3::Hasher::new()`, `update(b"stoffel-program-v1")`, `update(program_bytes)`,
 /// `finalize()` — byte for byte the VM's `program_id_from_bytes`.
@@ -100,8 +93,8 @@ pub struct ExecutionDeadlines {
 
 /// 32 bytes the coordinator draws from `ring::rand::SystemRandom` when it registers an
 /// execution. Not secret: it names one registration of one `ExecutionId`, so a restart or a
-/// later registration of the same id orphans every invitation, signed submission and sealed
-/// output of the earlier one.
+/// later registration of the same id orphans every signed submission and sealed output of the
+/// earlier one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RegistrationNonce([u8; 32]);
@@ -277,21 +270,6 @@ pub enum OutputRights {
     Receive { output_count: NonZeroU64 },
 }
 
-/// An ECDSA P-256 issuer key.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct InvitationIssuer(SpkiDer);
-
-impl InvitationIssuer {
-    pub fn new(spki: SpkiDer) -> Self {
-        Self(spki)
-    }
-
-    pub fn spki(&self) -> &SpkiDer {
-        &self.0
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdmissionPolicy {
     /// `clients[i]` is bound to slot `i` at registration.
@@ -300,9 +278,6 @@ pub enum AdmissionPolicy {
     /// the capacity. Use it only where association is already access-controlled: anyone who can
     /// reach the coordinator can bind every slot.
     Open,
-    /// Only the invitee named by a valid `SignedInvitation` from `issuer` may bind the slot that
-    /// invitation names.
-    Invitation { issuer: InvitationIssuer },
 }
 
 /// What a non-node may learn about the policy: never the pre-registered identities.
@@ -310,7 +285,6 @@ pub enum AdmissionPolicy {
 pub enum AdmissionPolicyKind {
     PreRegistered,
     Open,
-    Invitation { issuer: InvitationIssuer },
 }
 
 impl AdmissionPolicy {
@@ -318,20 +292,12 @@ impl AdmissionPolicy {
         match self {
             Self::PreRegistered { .. } => AdmissionPolicyKind::PreRegistered,
             Self::Open => AdmissionPolicyKind::Open,
-            Self::Invitation { issuer } => AdmissionPolicyKind::Invitation {
-                issuer: issuer.clone(),
-            },
         }
     }
 
-    /// The policy rows of the registration table, in table order: the `PreRegistered` rows,
-    /// then the `Invitation` rows. `slots` must already have passed `check_bounds`.
-    pub fn check(
-        &self,
-        slots: &ClientSlotTable,
-        roster: &NodeRoster,
-        server_spki: &SpkiDer,
-    ) -> Result<(), RegistrationError> {
+    /// The policy rows of the registration table, in table order: the `PreRegistered` rows.
+    /// `slots` must already have passed `check_bounds`.
+    pub fn check(&self, slots: &ClientSlotTable) -> Result<(), RegistrationError> {
         match self {
             Self::PreRegistered { clients } => {
                 if clients.len() != slots.slots().len() {
@@ -363,20 +329,6 @@ impl AdmissionPolicy {
                 Ok(())
             }
             Self::Open => Ok(()),
-            Self::Invitation { issuer } => {
-                if issuer.spki().key_algorithm() != KeyAlgorithm::EcdsaP256 {
-                    return Err(RegistrationError::UnsupportedIssuerKey);
-                }
-                if let Some(position) = roster.position_of(issuer.spki()) {
-                    return Err(RegistrationError::IssuerIsRosterNode {
-                        position: position as u32,
-                    });
-                }
-                if issuer.spki() == server_spki {
-                    return Err(RegistrationError::IssuerIsCoordinatorKey);
-                }
-                Ok(())
-            }
         }
     }
 
@@ -389,7 +341,7 @@ impl AdmissionPolicy {
         let Some(deadlines) = deadlines else {
             return match self {
                 Self::PreRegistered { .. } => Ok(()),
-                Self::Open | Self::Invitation { .. } => Err(RegistrationError::DeadlinesRequired),
+                Self::Open => Err(RegistrationError::DeadlinesRequired),
             };
         };
         if deadlines.association > deadlines.input {
@@ -408,144 +360,9 @@ impl AdmissionPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Invitation {
-    pub execution_id: ExecutionId,
-    /// One registration of `execution_id`: a coordinator restart, or a later registration of
-    /// the same id, draws a new nonce and orphans the invitation.
-    pub registration_nonce: RegistrationNonce,
-    pub program_hash: [u8; 32],
-    /// The coordinator's node roster. The nodes are part of what the issuer vouches for.
-    pub roster_digest: RosterDigest,
-    /// Coordinator time after which association with this invitation is refused.
-    pub not_after: UnixSeconds,
-    /// The invitee's key in coordinator identity form, compared with the caller's mTLS identity.
-    pub invitee: ClientIdentity,
-    /// The slot the issuer assigns. Required: a slot is a program role, with its own input
-    /// range and output rights.
-    pub client_index: ClientIndex,
-}
-
-/// What the coordinator compares an invitation with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InvitationContext<'a> {
-    pub execution_id: ExecutionId,
-    pub registration_nonce: RegistrationNonce,
-    pub program_hash: &'a [u8; 32],
-    pub roster_digest: RosterDigest,
-    pub caller: &'a ClientIdentity,
-    pub now: UnixSeconds,
-}
-
-impl Invitation {
-    /// The byte-exact message the issuer signs:
-    ///
-    /// ```text
-    /// b"stoffel-coordinator-invitation-v3"            33 bytes, ASCII, no terminator
-    /// execution_id                                    32 bytes
-    /// registration_nonce                              32 bytes
-    /// program_hash                                    32 bytes
-    /// roster_digest                                   32 bytes
-    /// not_after as u64                                 8 bytes little-endian
-    /// invitee.len() as u64                             8 bytes little-endian
-    /// invitee                                         invitee.len() bytes
-    /// client_index as u32                              4 bytes little-endian
-    /// ```
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(INVITATION_DOMAIN.len() + 4 * 32 + 16 + 4);
-        bytes.extend_from_slice(INVITATION_DOMAIN);
-        bytes.extend_from_slice(self.execution_id.as_bytes());
-        bytes.extend_from_slice(self.registration_nonce.as_bytes());
-        bytes.extend_from_slice(&self.program_hash);
-        bytes.extend_from_slice(self.roster_digest.as_bytes());
-        bytes.extend_from_slice(&self.not_after.0.to_le_bytes());
-        bytes.extend_from_slice(&(self.invitee.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&self.invitee);
-        bytes.extend_from_slice(&self.client_index.0.to_le_bytes());
-        bytes
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedInvitation {
-    pub invitation: Invitation,
-    /// ASN.1 DER ECDSA P-256 / SHA-256 signature over `invitation.signing_bytes()`.
-    pub signature: Vec<u8>,
-}
-
-impl SignedInvitation {
-    /// Signs `invitation` with the issuer's PKCS#8 P-256 key.
-    pub fn sign(
-        invitation: Invitation,
-        issuer_pkcs8_der: &[u8],
-    ) -> Result<Self, InvitationSigningError> {
-        let random = SystemRandom::new();
-        let key_pair =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, issuer_pkcs8_der, &random)
-                .map_err(|_| InvitationSigningError::UnsupportedIssuerKey)?;
-        let signature = key_pair
-            .sign(&random, &invitation.signing_bytes())
-            .map_err(|_| InvitationSigningError::SigningFailed)?;
-        Ok(Self {
-            invitation,
-            signature: signature.as_ref().to_vec(),
-        })
-    }
-
-    /// The uncompressed P-256 point of a PKCS#8 issuer key, the form `issuer_point_matches`
-    /// compares with an `InvitationIssuer`.
-    pub fn issuer_public_point(issuer_pkcs8_der: &[u8]) -> Result<Vec<u8>, InvitationSigningError> {
-        EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_ASN1_SIGNING,
-            issuer_pkcs8_der,
-            &SystemRandom::new(),
-        )
-        .map(|key_pair| key_pair.public_key().as_ref().to_vec())
-        .map_err(|_| InvitationSigningError::UnsupportedIssuerKey)
-    }
-
-    /// Checks, in order, the execution, the registration, the program, the roster, the expiry,
-    /// the invitee and then the signature against `issuer`.
-    pub fn verify(
-        &self,
-        issuer: &InvitationIssuer,
-        context: &InvitationContext<'_>,
-    ) -> Result<(), InvitationRejection> {
-        let invitation = &self.invitation;
-        if invitation.execution_id != context.execution_id {
-            return Err(InvitationRejection::WrongExecution);
-        }
-        if invitation.registration_nonce != context.registration_nonce {
-            return Err(InvitationRejection::WrongRegistration);
-        }
-        if invitation.program_hash != *context.program_hash {
-            return Err(InvitationRejection::WrongProgram);
-        }
-        if invitation.roster_digest != context.roster_digest {
-            return Err(InvitationRejection::WrongRoster);
-        }
-        if context.now > invitation.not_after {
-            return Err(InvitationRejection::Expired {
-                not_after: invitation.not_after,
-                now: context.now,
-            });
-        }
-        if invitation.invitee != *context.caller {
-            return Err(InvitationRejection::WrongInvitee);
-        }
-        let issuer_point = issuer.spki().client_identity();
-        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, issuer_point)
-            .verify(&invitation.signing_bytes(), &self.signature)
-            .map_err(|_| InvitationRejection::BadSignature)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssociationRequest {
-    /// `None` binds the lowest-numbered free slot under `Open`, and the invitation's slot under
-    /// `Invitation`.
+    /// `None` binds the lowest-numbered free slot under `Open`.
     pub slot: Option<ClientIndex>,
-    /// Required by `Invitation`, refused by every other policy.
-    pub invitation: Option<SignedInvitation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,12 +437,6 @@ pub enum AdmissionError {
         registered: ClientIndex,
         requested: ClientIndex,
     },
-    #[error("execution {execution_id} admits clients only with an invitation")]
-    InvitationRequired { execution_id: ExecutionId },
-    #[error("the invitation is refused: {reason}")]
-    InvitationRejected { reason: InvitationRejection },
-    #[error("execution {execution_id} is not invitation-gated; the invitation is refused")]
-    UnexpectedInvitation { execution_id: ExecutionId },
     #[error(
         "client slot {client_index} receives outputs, which can be sealed only to a P-256 key"
     )]
@@ -648,32 +459,6 @@ pub enum AdmissionError {
     },
     #[error("this client has no output rights in execution {execution_id}")]
     NoOutputRights { execution_id: ExecutionId },
-}
-
-#[derive(thiserror::Error, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InvitationRejection {
-    #[error("it names another execution")]
-    WrongExecution,
-    #[error("it was issued for another registration of this execution")]
-    WrongRegistration,
-    #[error("it names another program")]
-    WrongProgram,
-    #[error("it names another node roster")]
-    WrongRoster,
-    #[error("it expired at {not_after}; coordinator time is {now}")]
-    Expired {
-        not_after: UnixSeconds,
-        now: UnixSeconds,
-    },
-    #[error("it was issued to another key")]
-    WrongInvitee,
-    #[error("its signature does not verify against the registered issuer")]
-    BadSignature,
-    #[error("it names slot {invited}, but slot {requested} was requested")]
-    SlotMismatch {
-        invited: ClientIndex,
-        requested: ClientIndex,
-    },
 }
 
 #[derive(thiserror::Error, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,14 +505,6 @@ pub enum ExecutionOutcome {
     Aborted(AbortReason),
 }
 
-#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InvitationSigningError {
-    #[error("the issuer key is not a PKCS#8 ECDSA P-256 key")]
-    UnsupportedIssuerKey,
-    #[error("signing the invitation failed")]
-    SigningFailed,
-}
-
 /// Returned in-process by `register_execution` and `new_for_execution`; never on the wire.
 #[derive(thiserror::Error, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistrationError {
@@ -759,13 +536,7 @@ pub enum RegistrationError {
     UnsupportedPreRegisteredKey { client_index: ClientIndex },
     #[error("the client pre-registered for slot {client_index} is pre-registered for an earlier slot too")]
     DuplicatePreRegisteredClient { client_index: ClientIndex },
-    #[error("the invitation issuer key is not an ECDSA P-256 key")]
-    UnsupportedIssuerKey,
-    #[error("the invitation issuer key is the key of roster node {position}")]
-    IssuerIsRosterNode { position: u32 },
-    #[error("the invitation issuer key is the coordinator's own server key")]
-    IssuerIsCoordinatorKey,
-    #[error("open and invitation admission require association and input deadlines")]
+    #[error("open admission requires association and input deadlines")]
     DeadlinesRequired,
     #[error("the association deadline {association} is after the input deadline {input}")]
     DeadlinesOutOfOrder {
@@ -789,21 +560,10 @@ pub enum RegistrationError {
 mod tests {
     use super::*;
     use crate::pin::test_certificates::{ed25519_certificate, p256_certificate};
-    use crate::roster::NodeCertificateDer;
+    use crate::pin::SpkiDer;
 
     fn spki_of(certified: &rcgen::CertifiedKey<rcgen::KeyPair>) -> SpkiDer {
         SpkiDer::from_certificate_der(certified.cert.der()).unwrap()
-    }
-
-    fn roster_of(certs: &[rcgen::CertifiedKey<rcgen::KeyPair>]) -> NodeRoster {
-        NodeRoster::new(
-            1,
-            certs
-                .iter()
-                .map(|cert| NodeCertificateDer::from_der(cert.cert.der().to_vec()))
-                .collect(),
-        )
-        .unwrap()
     }
 
     fn slot(input_count: u64, output_count: u64) -> ClientSlotSpec {
@@ -861,178 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn invitation_signing_bytes_have_the_documented_layout() {
-        let invitation = Invitation {
-            execution_id: ExecutionId::from_bytes([0x11; 32]),
-            registration_nonce: RegistrationNonce::from_bytes([0x22; 32]),
-            program_hash: [0x33; 32],
-            roster_digest: RosterDigest::from_bytes([0x44; 32]),
-            not_after: UnixSeconds(0x0102_0304_0506_0708),
-            invitee: vec![0x55; 65],
-            client_index: ClientIndex(0x0a0b_0c0d),
-        };
-        let bytes = invitation.signing_bytes();
-        let mut expected = b"stoffel-coordinator-invitation-v3".to_vec();
-        assert_eq!(expected.len(), 33);
-        expected.extend_from_slice(&[0x11; 32]);
-        expected.extend_from_slice(&[0x22; 32]);
-        expected.extend_from_slice(&[0x33; 32]);
-        expected.extend_from_slice(&[0x44; 32]);
-        expected.extend_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
-        expected.extend_from_slice(&[65, 0, 0, 0, 0, 0, 0, 0]);
-        expected.extend_from_slice(&[0x55; 65]);
-        expected.extend_from_slice(&[0x0d, 0x0c, 0x0b, 0x0a]);
-        assert_eq!(bytes, expected);
-        assert_eq!(bytes.len(), 33 + 4 * 32 + 8 + 8 + 65 + 4);
-    }
-
-    #[test]
-    fn a_signed_invitation_verifies_only_for_its_registration_program_roster_window_invitee_and_issuer(
-    ) {
-        let issuer_cert = p256_certificate();
-        let issuer = InvitationIssuer::new(spki_of(&issuer_cert));
-        let invitee = p256_certificate();
-        let invitee_identity = spki_of(&invitee).client_identity();
-        let program_hash = [0x33; 32];
-        let invitation = Invitation {
-            execution_id: ExecutionId::from_bytes([0x11; 32]),
-            registration_nonce: RegistrationNonce::from_bytes([0x22; 32]),
-            program_hash,
-            roster_digest: RosterDigest::from_bytes([0x44; 32]),
-            not_after: UnixSeconds(1_000),
-            invitee: invitee_identity.clone(),
-            client_index: ClientIndex(1),
-        };
-        let signed =
-            SignedInvitation::sign(invitation.clone(), &issuer_cert.signing_key.serialize_der())
-                .unwrap();
-        assert_eq!(
-            SignedInvitation::issuer_public_point(&issuer_cert.signing_key.serialize_der())
-                .unwrap(),
-            issuer.spki().client_identity()
-        );
-        let context = InvitationContext {
-            execution_id: invitation.execution_id,
-            registration_nonce: invitation.registration_nonce,
-            program_hash: &program_hash,
-            roster_digest: invitation.roster_digest,
-            caller: &invitee_identity,
-            now: UnixSeconds(1_000),
-        };
-        assert_eq!(signed.verify(&issuer, &context), Ok(()));
-
-        let other_hash = [0x34; 32];
-        let stranger = spki_of(&p256_certificate()).client_identity();
-        let cases = [
-            (
-                InvitationContext {
-                    execution_id: ExecutionId::from_bytes([0x12; 32]),
-                    ..context
-                },
-                InvitationRejection::WrongExecution,
-            ),
-            (
-                InvitationContext {
-                    registration_nonce: RegistrationNonce::from_bytes([0x23; 32]),
-                    ..context
-                },
-                InvitationRejection::WrongRegistration,
-            ),
-            (
-                InvitationContext {
-                    program_hash: &other_hash,
-                    ..context
-                },
-                InvitationRejection::WrongProgram,
-            ),
-            (
-                InvitationContext {
-                    roster_digest: RosterDigest::from_bytes([0x45; 32]),
-                    ..context
-                },
-                InvitationRejection::WrongRoster,
-            ),
-            (
-                InvitationContext {
-                    now: UnixSeconds(1_001),
-                    ..context
-                },
-                InvitationRejection::Expired {
-                    not_after: UnixSeconds(1_000),
-                    now: UnixSeconds(1_001),
-                },
-            ),
-            (
-                InvitationContext {
-                    caller: &stranger,
-                    ..context
-                },
-                InvitationRejection::WrongInvitee,
-            ),
-        ];
-        for (context, rejection) in cases {
-            assert_eq!(signed.verify(&issuer, &context), Err(rejection));
-        }
-
-        // Another issuer's key, and a field changed after signing.
-        let other_issuer = InvitationIssuer::new(spki_of(&p256_certificate()));
-        assert_eq!(
-            signed.verify(&other_issuer, &context),
-            Err(InvitationRejection::BadSignature)
-        );
-        let mut altered = signed.clone();
-        altered.invitation.client_index = ClientIndex(0);
-        assert_eq!(
-            altered.verify(&issuer, &context),
-            Err(InvitationRejection::BadSignature)
-        );
-
-        // Only P-256 keys issue invitations.
-        let ed = ed25519_certificate();
-        assert_eq!(
-            SignedInvitation::sign(invitation, &ed.signing_key.serialize_der()),
-            Err(InvitationSigningError::UnsupportedIssuerKey)
-        );
-    }
-
-    #[test]
-    fn registration_refuses_an_issuer_that_is_a_roster_node_or_the_coordinator() {
-        let nodes = (0..3).map(|_| p256_certificate()).collect::<Vec<_>>();
-        let roster = roster_of(&nodes);
-        let coordinator = p256_certificate();
-        let slots = ClientSlotTable::new(vec![slot(1, 1)]);
-
-        let node_issuer = AdmissionPolicy::Invitation {
-            issuer: InvitationIssuer::new(roster.node_spkis()[2].clone()),
-        };
-        assert_eq!(
-            node_issuer.check(&slots, &roster, &spki_of(&coordinator)),
-            Err(RegistrationError::IssuerIsRosterNode { position: 2 })
-        );
-        let coordinator_issuer = AdmissionPolicy::Invitation {
-            issuer: InvitationIssuer::new(spki_of(&coordinator)),
-        };
-        assert_eq!(
-            coordinator_issuer.check(&slots, &roster, &spki_of(&coordinator)),
-            Err(RegistrationError::IssuerIsCoordinatorKey)
-        );
-        let ed_issuer = AdmissionPolicy::Invitation {
-            issuer: InvitationIssuer::new(spki_of(&ed25519_certificate())),
-        };
-        assert_eq!(
-            ed_issuer.check(&slots, &roster, &spki_of(&coordinator)),
-            Err(RegistrationError::UnsupportedIssuerKey)
-        );
-        let separate = AdmissionPolicy::Invitation {
-            issuer: InvitationIssuer::new(spki_of(&p256_certificate())),
-        };
-        assert_eq!(
-            separate.check(&slots, &roster, &spki_of(&coordinator)),
-            Ok(())
-        );
-    }
-
-    #[test]
     fn registration_refuses_missing_or_disordered_deadlines_and_non_canonical_clients() {
         let now = UnixSeconds(1_000);
         let deadlines = |association, input| {
@@ -1041,16 +629,12 @@ mod tests {
                 input: UnixSeconds(input),
             })
         };
-        let issuer = AdmissionPolicy::Invitation {
-            issuer: InvitationIssuer::new(spki_of(&p256_certificate())),
-        };
-        for policy in [AdmissionPolicy::Open, issuer] {
-            assert_eq!(
-                policy.check_deadlines(None, now),
-                Err(RegistrationError::DeadlinesRequired)
-            );
-            assert_eq!(policy.check_deadlines(deadlines(1_001, 1_002), now), Ok(()));
-        }
+        let open = AdmissionPolicy::Open;
+        assert_eq!(
+            open.check_deadlines(None, now),
+            Err(RegistrationError::DeadlinesRequired)
+        );
+        assert_eq!(open.check_deadlines(deadlines(1_001, 1_002), now), Ok(()));
         let pre = AdmissionPolicy::PreRegistered { clients: vec![] };
         assert_eq!(pre.check_deadlines(None, now), Ok(()));
         assert_eq!(
@@ -1069,17 +653,13 @@ mod tests {
         );
         assert_eq!(pre.check_deadlines(deadlines(1_001, 1_001), now), Ok(()));
 
-        let nodes = (0..3).map(|_| p256_certificate()).collect::<Vec<_>>();
-        let roster = roster_of(&nodes);
-        let coordinator = spki_of(&p256_certificate());
         let p256_client = spki_of(&p256_certificate()).client_identity();
         let ed_client = spki_of(&ed25519_certificate()).client_identity();
         let slots = ClientSlotTable::new(vec![slot(1, 1), slot(1, 0)]);
 
         let compressed = vec![0x02; 33];
-        let check = |clients: Vec<ClientIdentity>| {
-            AdmissionPolicy::PreRegistered { clients }.check(&slots, &roster, &coordinator)
-        };
+        let check =
+            |clients: Vec<ClientIdentity>| AdmissionPolicy::PreRegistered { clients }.check(&slots);
         assert_eq!(
             check(vec![compressed, p256_client.clone()]),
             Err(RegistrationError::UnsupportedPreRegisteredKey {

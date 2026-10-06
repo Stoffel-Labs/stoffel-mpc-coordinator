@@ -32,11 +32,10 @@ use stoffel_mpc_coordinator_shared::{
     sealed_output_signing_bytes, sign_with_pkcs8, verify_identity_signature, AbortReason,
     AdmissionError, AdmissionPolicy, AdmissionPolicyKind, AssociationRequest, ClientAdmission,
     ClientAdmissionRecord, ClientAdmissionSet, ClientIndex, ClientSlotTable, Coordinator,
-    CoordinatorError, ExecutionDeadlines, ExecutionId, ExecutionOutcome, InputRange,
-    InvitationContext, KeyAlgorithm, NodeRoster, NodeRosterWire, OutputRights, PositionedShare,
-    Reconstruction, RegistrationError, RegistrationNonce, RosterDigest, Round, RpcRefusal,
-    ServerPin, ShareBound, SpkiDer, SubmissionError, UnixSeconds, MAX_MASKED_INPUT_BYTES,
-    MAX_SEALED_OUTPUT_BYTES,
+    CoordinatorError, ExecutionDeadlines, ExecutionId, ExecutionOutcome, InputRange, KeyAlgorithm,
+    NodeRoster, NodeRosterWire, OutputRights, PositionedShare, Reconstruction, RegistrationError,
+    RegistrationNonce, RosterDigest, Round, RpcRefusal, ServerPin, ShareBound, SpkiDer,
+    SubmissionError, UnixSeconds, MAX_MASKED_INPUT_BYTES, MAX_SEALED_OUTPUT_BYTES,
 };
 use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -124,18 +123,13 @@ pub struct ExecutionRegistration {
     pub program_hash: [u8; 32],
     pub client_slots: ClientSlotTable,
     pub admission: AdmissionPolicy,
-    /// Required under `Open` and `Invitation`, optional under `PreRegistered`.
+    /// Required under `Open`, optional under `PreRegistered`.
     pub deadlines: Option<ExecutionDeadlines>,
 }
 
 impl ExecutionRegistration {
     /// The rows of the validation table that read no coordinator state, in table order.
-    pub fn validate(
-        &self,
-        roster: &NodeRoster,
-        server_spki: &SpkiDer,
-        now: UnixSeconds,
-    ) -> Result<(), RegistrationError> {
+    pub fn validate(&self, now: UnixSeconds) -> Result<(), RegistrationError> {
         if self.execution_id.is_zero() {
             return Err(RegistrationError::ZeroExecutionId);
         }
@@ -143,8 +137,7 @@ impl ExecutionRegistration {
             return Err(RegistrationError::ZeroProgramHash);
         }
         self.client_slots.check_bounds()?;
-        self.admission
-            .check(&self.client_slots, roster, server_spki)?;
+        self.admission.check(&self.client_slots)?;
         self.admission.check_deadlines(self.deadlines, now)
     }
 }
@@ -1313,8 +1306,9 @@ pub trait CoordinatorRPCBase {
 ///
 /// Codes 1 (`NotDesignatedParty`), 3 (`IndexOutOfBounds`), 4 (`BadID`), 7
 /// (`IndexAlreadyReserved`), 11 (`SendingFailed`), 13 (`MismatchedBatchLengths`), 15
-/// (`UnauthorizedClientIo`), 17 (`ExecutionAlreadyRegistered`), 18 (`ShutdownNotAccepted`) and 19
-/// (`EmptyBatch`) are retired and never reused; 34 is not allocated.
+/// (`UnauthorizedClientIo`), 17 (`ExecutionAlreadyRegistered`), 18 (`ShutdownNotAccepted`), 19
+/// (`EmptyBatch`), 26 (`InvitationRequired`), 27 (`InvitationRejected`) and 28
+/// (`UnexpectedInvitation`) are retired and never reused; 34 is not allocated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoordinatorRPCBaseError {
     WrongRound = 2,
@@ -1332,9 +1326,6 @@ pub enum CoordinatorRPCBaseError {
     SlotTaken = 23,
     NotPreRegistered = 24,
     PreRegisteredSlotMismatch = 25,
-    InvitationRequired = 26,
-    InvitationRejected = 27,
-    UnexpectedInvitation = 28,
     UnsupportedClientKey = 29,
     AlreadyAssociated = 30,
     NotAdmitted = 31,
@@ -1350,7 +1341,7 @@ pub enum CoordinatorRPCBaseError {
 }
 
 impl CoordinatorRPCBaseError {
-    const ALL: [Self; 30] = [
+    const ALL: [Self; 27] = [
         Self::WrongRound,
         Self::MaskedInputAlreadySubmitted,
         Self::IndexNotReserved,
@@ -1366,9 +1357,6 @@ impl CoordinatorRPCBaseError {
         Self::SlotTaken,
         Self::NotPreRegistered,
         Self::PreRegisteredSlotMismatch,
-        Self::InvitationRequired,
-        Self::InvitationRejected,
-        Self::UnexpectedInvitation,
         Self::UnsupportedClientKey,
         Self::AlreadyAssociated,
         Self::NotAdmitted,
@@ -1419,9 +1407,6 @@ impl CoordinatorRPCBaseError {
             AdmissionError::SlotTaken { .. } => Self::SlotTaken,
             AdmissionError::NotPreRegistered { .. } => Self::NotPreRegistered,
             AdmissionError::PreRegisteredSlotMismatch { .. } => Self::PreRegisteredSlotMismatch,
-            AdmissionError::InvitationRequired { .. } => Self::InvitationRequired,
-            AdmissionError::InvitationRejected { .. } => Self::InvitationRejected,
-            AdmissionError::UnexpectedInvitation { .. } => Self::UnexpectedInvitation,
             AdmissionError::UnsupportedClientKey { .. } => Self::UnsupportedClientKey,
             AdmissionError::AlreadyAssociated { .. } => Self::AlreadyAssociated,
             AdmissionError::NotAdmitted { .. } => Self::NotAdmitted,
@@ -2278,7 +2263,7 @@ impl CoordinatorRPCServerSharedBase {
         if self.executions.contains_key(&execution_id) {
             return Err(RegistrationError::ConflictingRegistration { execution_id }.into());
         }
-        registration.validate(&self.node_roster, &self.server_spki, UnixSeconds::now())?;
+        registration.validate(UnixSeconds::now())?;
 
         if self.executions.len() >= DEFAULT_MAX_CONCURRENT_EXECUTIONS {
             // Healthy stragglers need the completed round history until they have also reached
@@ -2995,13 +2980,12 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         request: AssociationRequest,
     ) -> RpcResult<ClientAdmission> {
         // 1. Snapshot, under the state mutex.
-        let (quorum, roster_head, roster_digest, registration, nonce, delivery) = {
+        let (quorum, roster_head, registration, nonce, delivery) = {
             let shared = self.d.lock().await;
             let execution = shared.live_execution(execution_id)?;
             (
                 shared.transition_quorum(),
                 shared.mpc_nodes[0].clone(),
-                shared.node_roster.digest(),
                 execution.registration.clone(),
                 execution.registration_nonce,
                 execution.delivery.clone(),
@@ -3009,20 +2993,6 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         };
 
         // 2–3. Pure checks with no lock held; verdicts are not returned yet.
-        let invitation_verdict = match (&registration.admission, &request.invitation) {
-            (AdmissionPolicy::Invitation { issuer }, Some(signed)) => Some(signed.verify(
-                issuer,
-                &InvitationContext {
-                    execution_id,
-                    registration_nonce: nonce,
-                    program_hash: &registration.program_hash,
-                    roster_digest,
-                    caller: &self.id,
-                    now: UnixSeconds::now(),
-                },
-            )),
-            _ => None,
-        };
         let sealable = KeyAlgorithm::of_client_identity(&self.id) == Some(KeyAlgorithm::EcdsaP256);
 
         // 4. Binding: the delivery guard, then the state again.
@@ -3050,11 +3020,6 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             return match &slot.request {
                 Some(recorded) if *recorded == request => Ok(slot.admission.clone()),
                 None => {
-                    if request.invitation.is_some() {
-                        return Err(admission_refusal(AdmissionError::UnexpectedInvitation {
-                            execution_id,
-                        }));
-                    }
                     if let Some(requested) = request.slot {
                         if requested != slot.admission.client_index {
                             return Err(admission_refusal(
@@ -3090,39 +3055,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                     execution_id,
                 }));
             }
-            AdmissionPolicy::Open => {
-                if request.invitation.is_some() {
-                    return Err(admission_refusal(AdmissionError::UnexpectedInvitation {
-                        execution_id,
-                    }));
-                }
-                request.slot
-            }
-            AdmissionPolicy::Invitation { .. } => {
-                let Some(signed) = &request.invitation else {
-                    return Err(admission_refusal(AdmissionError::InvitationRequired {
-                        execution_id,
-                    }));
-                };
-                if let Some(Err(reason)) = invitation_verdict {
-                    return Err(admission_refusal(AdmissionError::InvitationRejected {
-                        reason,
-                    }));
-                }
-                let invited = signed.invitation.client_index;
-                if let Some(requested) = request.slot {
-                    if requested != invited {
-                        return Err(admission_refusal(AdmissionError::InvitationRejected {
-                            reason:
-                                stoffel_mpc_coordinator_shared::InvitationRejection::SlotMismatch {
-                                    invited,
-                                    requested,
-                                },
-                        }));
-                    }
-                }
-                Some(invited)
-            }
+            AdmissionPolicy::Open => request.slot,
         };
 
         // 8. Slot.
@@ -4654,8 +4587,7 @@ mod wire_tests {
     use super::*;
     use std::num::NonZeroU64;
     use stoffel_mpc_coordinator_shared::{
-        ClientSlotSpec, InvitationIssuer, MAX_CLIENT_SLOTS, MAX_INPUTS, MAX_INPUTS_PER_SLOT,
-        MAX_OUTPUTS_PER_SLOT,
+        ClientSlotSpec, MAX_CLIENT_SLOTS, MAX_INPUTS, MAX_INPUTS_PER_SLOT, MAX_OUTPUTS_PER_SLOT,
     };
 
     const TEN_MIB: usize = 10 * 1024 * 1024;
@@ -4716,15 +4648,6 @@ mod wire_tests {
     fn registration_bounds_keep_every_response_under_the_wire_limit() {
         let identity = vec![0xff; 65];
         let signature = vec![0xff; 72];
-        let issuer = InvitationIssuer::new(
-            SpkiDer::from_certificate_der(
-                rcgen::generate_simple_self_signed(vec!["issuer".to_string()])
-                    .unwrap()
-                    .cert
-                    .der(),
-            )
-            .unwrap(),
-        );
         let summary = ExecutionSummary {
             execution_id: ExecutionId::from_bytes([0xff; 32]),
             registration_nonce: RegistrationNonce::from_bytes([0xff; 32]),
@@ -4736,7 +4659,7 @@ mod wire_tests {
                 };
                 MAX_CLIENT_SLOTS as usize
             ]),
-            admission: AdmissionPolicyKind::Invitation { issuer },
+            admission: AdmissionPolicyKind::PreRegistered,
             deadlines: Some(ExecutionDeadlines {
                 association: UnixSeconds(u64::MAX),
                 input: UnixSeconds(u64::MAX),

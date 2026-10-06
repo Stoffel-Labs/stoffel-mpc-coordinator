@@ -16,8 +16,8 @@ use stoffel_mpc_coordinator_off_chain::{
 use stoffel_mpc_coordinator_shared::rpc::{caller_identity, RpcServerLimits};
 use stoffel_mpc_coordinator_shared::{
     program_hash_of, AdmissionPolicy, ClientIdentity, ClientSlotSpec, ClientSlotTable,
-    CoordinatorError, ExecutionDeadlines, ExecutionId, InvitationIssuer, NodeCertificateDer,
-    NodeRoster, PinError, RegistrationError, RosterError, SpkiDer, UnixSeconds,
+    CoordinatorError, ExecutionDeadlines, ExecutionId, NodeCertificateDer, NodeRoster, PinError,
+    RegistrationError, RosterError, SpkiDer, UnixSeconds,
 };
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, CompiledBinary};
 
@@ -31,9 +31,6 @@ enum AdmissionKind {
     PreRegistered,
     /// Any certificate holder binds a free slot, first come, first served. Requires deadlines.
     Open,
-    /// Only the invitee of a `SignedInvitation` from `--invitation-issuer-cert`, in the slot it
-    /// names. Requires deadlines.
-    Invitation,
 }
 
 #[derive(Parser, Debug)]
@@ -94,10 +91,6 @@ struct Args {
     #[arg(long)]
     client_bindings: Option<String>,
 
-    /// `invitation` only: the invitation issuer's certificate.
-    #[arg(long)]
-    invitation_issuer_cert: Option<String>,
-
     /// Seconds after startup by which every slot must be bound.
     #[arg(long)]
     association_deadline_secs: Option<u64>,
@@ -155,8 +148,6 @@ enum RunCoordError {
         flag: &'static str,
         admission: AdmissionKind,
     },
-    #[error("--admission invitation requires --invitation-issuer-cert")]
-    MissingIssuer,
     #[error(
         "--association-deadline-secs and --input-deadline-secs are given together or not at all"
     )]
@@ -338,29 +329,13 @@ fn registration_from_args(
         None => Ok(()),
     };
     let admission = match args.admission {
-        AdmissionKind::PreRegistered => {
-            unused("--invitation-issuer-cert", &args.invitation_issuer_cert)?;
-            AdmissionPolicy::PreRegistered {
-                clients: pre_registered_clients(args, &client_slots)?,
-            }
-        }
+        AdmissionKind::PreRegistered => AdmissionPolicy::PreRegistered {
+            clients: pre_registered_clients(args, &client_slots)?,
+        },
         AdmissionKind::Open => {
             unused("--client-certs", &args.client_certs)?;
             unused("--client-bindings", &args.client_bindings)?;
-            unused("--invitation-issuer-cert", &args.invitation_issuer_cert)?;
             AdmissionPolicy::Open
-        }
-        AdmissionKind::Invitation => {
-            unused("--client-certs", &args.client_certs)?;
-            unused("--client-bindings", &args.client_bindings)?;
-            let issuer = args
-                .invitation_issuer_cert
-                .as_deref()
-                .filter(|path| !path.is_empty())
-                .ok_or(RunCoordError::MissingIssuer)?;
-            AdmissionPolicy::Invitation {
-                issuer: InvitationIssuer::new(spki_of_certificate(issuer)?),
-            }
         }
     };
 
@@ -380,7 +355,7 @@ fn registration_from_args(
         admission,
         deadlines,
     };
-    registration.validate(&node_roster, &server_spki, now)?;
+    registration.validate(now)?;
     Ok((node_roster, server_spki, registration))
 }
 
@@ -720,6 +695,7 @@ mod tests {
             ["--min-output-shares", "3"],
             ["--n", "4"],
             ["--n-inputs", "1"],
+            ["--invitation-issuer-cert", "issuer.crt"],
         ] {
             let mut arguments = fixture.base_args();
             arguments.extend(["--hash", &hash].map(str::to_string));
@@ -731,5 +707,14 @@ mod tests {
                 "{removed:?} must be an unknown flag"
             );
         }
+
+        // `invitation` is no longer an admission kind.
+        let mut invitation = fixture.base_args();
+        invitation.extend(["--hash", &hash, "--admission", "invitation"].map(str::to_string));
+        assert_eq!(
+            parse(invitation).unwrap_err().kind(),
+            clap::error::ErrorKind::InvalidValue,
+            "--admission invitation must be an invalid value"
+        );
     }
 }

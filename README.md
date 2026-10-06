@@ -54,13 +54,9 @@ Client admission is chosen per execution with `--admission`:
   `--client-certs <certs>` in slot order or `--client-bindings <slot>=<cert>,…`.
 - `open` lets any certificate holder bind a free slot, first come, first served. Use it only where
   reaching the coordinator is already access-controlled.
-- `invitation` admits only the invitee of a `SignedInvitation` from `--invitation-issuer-cert`,
-  in the slot the invitation names. Invitations are signed with
-  `cargo run --bin issue-invitation -- --coordinator <host:port> --coord-cert <cert> --execution-id <64-hex> --expect-program-hash <64-hex> --issuer-key <pkcs8.der> --invitee-cert <cert> --client-index <slot> --valid-for-secs <secs> --out invitation.json`.
 
-`open` and `invitation` require `--association-deadline-secs` and `--input-deadline-secs`: an
-execution whose slots are not all bound, or whose masked inputs are not all submitted, by then is
-aborted.
+`open` requires `--association-deadline-secs` and `--input-deadline-secs`: an execution whose
+slots are not all bound, or whose masked inputs are not all submitted, by then is aborted.
 
 ## Library overview
 
@@ -125,7 +121,7 @@ Key behaviors:
 
 - **Node roster**: the coordinator is built from a `NodeRoster` of node certificates and serves it unchanged for its lifetime through `get_node_roster`. Nodes and clients connect with `CoordinatorLink`, which pins the coordinator's key and fetches and verifies the roster once.
 - **Round management**: parties trigger transitions by calling `transition(Round)` over RPC; all subscribers receive the corresponding event. An execution that misses its association or input deadline ends in the terminal `Round::Aborted`.
-- **Registration and admission**: an execution is registered in the coordinator's process with a client slot table and an admission policy (`PreRegistered`, `Open` or `Invitation`). Clients bind a slot with `associate_client`, keyed on their mTLS identity; node transport never lists client certificates.
+- **Registration and admission**: an execution is registered in the coordinator's process with a client slot table and an admission policy (`PreRegistered` or `Open`). Clients bind a slot with `associate_client`, keyed on their mTLS identity; node transport never lists client certificates.
 - **Index reservation and input**: an admitted client reserves exactly its slot's input range during `InputMaskReservation`, and submits all of its masked inputs in one call signed with its certificate key. Reservations are broadcast to `sub_reserved_indices` subscribers, including MPC nodes.
 - **Mask-share distribution**: each MPC node runs a `node_rpc::NodeRPCServer`, registers the admitted reservations it fetched with `get_client_admissions`, and delivers each mask share only to the certificate that holds its index. The client pins every node by roster membership, attributes each share to the node's roster position, and reconstructs the mask locally.
 - **Output distribution**: MPC nodes HPKE-seal their output shares under the admitted client's P-256 public key, sign them, and call `send_output_shares`; the client's `obtain_output_shares` subscription receives one `SealedOutputShares` per node.

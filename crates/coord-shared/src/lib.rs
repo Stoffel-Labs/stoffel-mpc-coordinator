@@ -23,7 +23,7 @@ pub mod pin;
 /// The coordinator's node roster, its digest and its receiver check.
 pub mod roster;
 
-/// Client slots, admission policies, invitations and the admission errors.
+/// Client slots, admission policies and the admission errors.
 pub mod admission;
 
 /// Client signatures over masked inputs and node signatures over sealed outputs.
@@ -41,6 +41,7 @@ use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Once;
+use stoffelmpc_mpc::common::share::avss::verify_feldman;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::share::shamir::Shamirshare;
 use stoffelmpc_mpc::common::share::ShareError;
@@ -51,9 +52,8 @@ use thiserror::Error;
 pub use admission::{
     program_hash_of, AbortReason, AdmissionError, AdmissionPolicy, AdmissionPolicyKind,
     AssociationRequest, ClientAdmission, ClientAdmissionRecord, ClientAdmissionSet, ClientIndex,
-    ClientSlotSpec, ClientSlotTable, ExecutionDeadlines, ExecutionOutcome, InputRange, Invitation,
-    InvitationContext, InvitationIssuer, InvitationRejection, InvitationSigningError, OutputRights,
-    RegistrationError, RegistrationNonce, SignedInvitation, SubmissionError, UnixSeconds,
+    ClientSlotSpec, ClientSlotTable, ExecutionDeadlines, ExecutionOutcome, InputRange,
+    OutputRights, RegistrationError, RegistrationNonce, SubmissionError, UnixSeconds,
     MAX_CLIENT_SLOTS, MAX_INPUTS, MAX_INPUTS_PER_SLOT, MAX_MASKED_INPUT_BYTES,
     MAX_OUTPUTS_PER_SLOT, MAX_SEALED_OUTPUT_BYTES,
 };
@@ -192,18 +192,19 @@ pub trait ShareBound<F: FftField>:
     ) -> Reconstruction<Self::ValueType>;
 }
 
-/// The shares of `shares` that sit at their position's id with degree `t`.
+/// The shares of `shares` that sit at their position's id with degree `t`, each paired with
+/// the roster position it was attributed to.
 fn position_bound_shares<F: FftField, S: ShareBound<F>>(
     shares: &[PositionedShare<S>],
     t: usize,
-) -> impl Iterator<Item = &S> {
+) -> impl Iterator<Item = (usize, &S)> {
     shares
         .iter()
         .filter(move |positioned| {
             positioned.share.share_id() == S::share_id_of_position(positioned.position)
                 && positioned.share.share_degree() == t
         })
-        .map(|positioned| &positioned.share)
+        .map(|positioned| (positioned.position, &positioned.share))
 }
 
 impl<F: FftField> ShareBound<F> for RobustShare<F> {
@@ -250,7 +251,7 @@ impl<F: FftField> ShareBound<F> for RobustShare<F> {
         t: usize,
     ) -> Reconstruction<Self::ValueType> {
         let remaining = position_bound_shares::<F, Self>(shares, t)
-            .cloned()
+            .map(|(_, share)| share.clone())
             .collect::<Vec<_>>();
         if remaining.len() < Self::min_shares(t) {
             return Reconstruction::Pending;
@@ -308,8 +309,8 @@ impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShami
         t: usize,
     ) -> Reconstruction<Self::ValueType> {
         let mut groups: Vec<(Vec<u8>, Vec<Self>)> = Vec::new();
-        for share in position_bound_shares::<F, Self>(shares, t) {
-            if !feldman_share_verifies(share, t) {
+        for (position, share) in position_bound_shares::<F, Self>(shares, t) {
+            if !verify_feldman(share.clone(), Self::share_id_of_position(position)) {
                 continue;
             }
             let mut commitments = Vec::new();
@@ -334,24 +335,6 @@ impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShami
         }
         Reconstruction::Pending
     }
-}
-
-/// `share · G == Σⱼ commitmentsⱼ · idʲ` over the share's own `t + 1` commitments.
-fn feldman_share_verifies<F: FftField, G: CurveGroup<ScalarField = F>>(
-    share: &FeldmanShamirShare<F, G>,
-    t: usize,
-) -> bool {
-    if share.commitments.len() != t + 1 {
-        return false;
-    }
-    let id = F::from(share.feldmanshare.id as u64);
-    let mut power = F::one();
-    let mut expected = G::zero();
-    for commitment in &share.commitments {
-        expected += *commitment * power;
-        power *= id;
-    }
-    G::generator() * share.feldmanshare.share[0] == expected
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -753,6 +736,25 @@ mod share_bound_tests {
             Reconstruction::Secret(secret)
         );
 
+        // A share carrying another position's id is ignored, both before `verify_feldman`
+        // (the position-binding filter drops it) and by `verify_feldman`'s own
+        // `id == expected_id` check; the honest two still reconstruct.
+        let mut relabelled = honest.clone();
+        relabelled[2].share.feldmanshare.id = 2;
+        assert_eq!(
+            AvssShareType::reconstruct(&relabelled, n, t),
+            Reconstruction::Secret(secret)
+        );
+        assert_eq!(
+            AvssShareType::reconstruct(&relabelled[1..], n, t),
+            Reconstruction::Pending,
+            "only position 1 survives the relabelling, and one share is not t + 1"
+        );
+        assert!(!verify_feldman(
+            relabelled[2].share.clone(),
+            <AvssShareType as ShareBound<Fr>>::share_id_of_position(2),
+        ));
+
         // A share off its own commitments is ignored; the honest two still reconstruct.
         let mut off_commitments = honest.clone();
         off_commitments[0].share.feldmanshare.share[0] += Fr::from(1u64);
@@ -783,7 +785,10 @@ mod share_bound_tests {
             AvssShareType::new(forged_value, 1, t, forged_commitments.clone()).unwrap();
         let accepted_honest_share =
             AvssShareType::new(honest_share_1, 2, t, forged_commitments).unwrap();
-        assert!(feldman_share_verifies(&accepted_honest_share, t));
+        assert!(verify_feldman(
+            accepted_honest_share,
+            <AvssShareType as ShareBound<Fr>>::share_id_of_position(1),
+        ));
         assert_eq!(
             AvssShareType::reconstruct(&with_forgery, n, t),
             Reconstruction::Secret(secret)
