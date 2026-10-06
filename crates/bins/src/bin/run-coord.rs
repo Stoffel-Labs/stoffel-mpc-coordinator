@@ -695,7 +695,6 @@ mod tests {
             ["--min-output-shares", "3"],
             ["--n", "4"],
             ["--n-inputs", "1"],
-            ["--invitation-issuer-cert", "issuer.crt"],
         ] {
             let mut arguments = fixture.base_args();
             arguments.extend(["--hash", &hash].map(str::to_string));
@@ -707,14 +706,5 @@ mod tests {
                 "{removed:?} must be an unknown flag"
             );
         }
-
-        // `invitation` is no longer an admission kind.
-        let mut invitation = fixture.base_args();
-        invitation.extend(["--hash", &hash, "--admission", "invitation"].map(str::to_string));
-        assert_eq!(
-            parse(invitation).unwrap_err().kind(),
-            clap::error::ErrorKind::InvalidValue,
-            "--admission invitation must be an invalid value"
-        );
     }
 }

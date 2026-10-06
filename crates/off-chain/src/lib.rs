@@ -1307,8 +1307,7 @@ pub trait CoordinatorRPCBase {
 /// Codes 1 (`NotDesignatedParty`), 3 (`IndexOutOfBounds`), 4 (`BadID`), 7
 /// (`IndexAlreadyReserved`), 11 (`SendingFailed`), 13 (`MismatchedBatchLengths`), 15
 /// (`UnauthorizedClientIo`), 17 (`ExecutionAlreadyRegistered`), 18 (`ShutdownNotAccepted`), 19
-/// (`EmptyBatch`), 26 (`InvitationRequired`), 27 (`InvitationRejected`) and 28
-/// (`UnexpectedInvitation`) are retired and never reused; 34 is not allocated.
+/// (`EmptyBatch`), 26, 27 and 28 are retired and never reused; 34 is not allocated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoordinatorRPCBaseError {
     WrongRound = 2,
