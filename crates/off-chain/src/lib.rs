@@ -1011,7 +1011,8 @@ pub trait CoordinatorRPCBase {
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()>;
 
-    /// The designated party uses this to transition to the new round `next_round`.
+    /// Casts this party's vote to transition to the new round `next_round`; the round advances
+    /// once `transition_quorum` distinct parties have voted for it.
     #[method(name = "transition")]
     async fn transition(&self, execution_id: ExecutionId, next_round: Round) -> RpcResult<()>;
 

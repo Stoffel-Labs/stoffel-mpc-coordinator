@@ -17,7 +17,7 @@
 //! resolved via one prior WebAuthn ceremony (see `browser_bind_webauthn_identity`), which is
 //! also what gates the execution's roster before any of this authentication state is ever
 //! allocated. The resulting `ClientIdentity` is exactly the same kind of value the native path
-//! derives from a certificate -- the DER-encoded public key -- so it plugs directly into the
+//! derives from a certificate -- the raw `subjectPublicKey` bytes -- so it plugs directly into the
 //! same `CoordinatorRPCServerConnectionBase`/`CoordinatorRPCServerSharedBase` state the native
 //! transport uses. Confidentiality and server authentication come from the TLS layer
 //! underneath, same as any ordinary `wss://` site; client authentication comes from this

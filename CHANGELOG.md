@@ -1,11 +1,27 @@
 # Changelog
 
+## 0.2.1
+
+### Added
+
+- Added an optional browser-client listener served over server-authenticated TLS, with per-request P-256 signatures, timestamp/nonce replay protection, and WebAuthn-based binding of ephemeral browser keys to registered client identities (`browser_rpc`, `OffChainCoordinatorServer::start_coord_with_browser_tls`).
+- Added `run-coord` flags `--browser-addr`, `--browser-port`, `--browser-tls-cert-chain`, `--browser-tls-key`, `--webauthn-rp-id`, `--client-cert-dir`, and `--client-credential-id-dir`.
+- Added the `request_shutdown` RPC method and `run-coord --one-off-shutdown-grace-secs`.
+
+### Changed
+
+- One-off coordinators now exit only when the designated party calls `request_shutdown` after the execution reached `ProgramFinished`, then wait a bounded grace period for the remaining parties to acknowledge, instead of shutting down on the round transition itself.
+
+### Fixed
+
+- Fixed clients participating in multiple executions, and prevented a client from logging in again after it has submitted its input.
+
 ## 0.2.0 - 2026-08-28
 
 ### Added
 
 - Added strict 256-bit execution identifiers for isolating coordinator runs.
-- Added persistent and concurrent off-chain executions, including one-off registration and clean shutdown after `ProgramFinished`.
+- Added persistent and concurrent off-chain executions, including one-off registration and clean shutdown once the execution reached `ProgramFinished` (superseded by explicit `request_shutdown` in 0.2.1).
 - Added batched input-mask reservation and masked-input submission APIs.
 - Added voting-based round transitions so execution control no longer depends on one designated party.
 
