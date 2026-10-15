@@ -19,7 +19,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # The on-chain feature pulls in alloy "full" plus a few git dependencies,
+      # The on-chain crate pulls in alloy "full" plus a few git dependencies,
       # so cold builds are slow. Cache the registry, git deps, and target dir.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
