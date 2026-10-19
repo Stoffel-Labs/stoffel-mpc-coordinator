@@ -68,7 +68,9 @@ pub mod node_rpc {
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
     use stoffel_mpc_coordinator_shared::{
-        rpc::RPCServerHandle, CoordinatorError, NodeRPCError, ShareBound,
+        rpc::{RPCServerHandle, RpcServerLimits},
+        self_signed_certs::{connect_roster_legs, NODE_LEG_CONNECT_TIMEOUT},
+        CoordinatorError, NodeRPCError, NodeRoster, PositionedShare, Reconstruction, ShareBound,
     };
     use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
     use tokio::task::JoinSet;
@@ -101,8 +103,13 @@ pub mod node_rpc {
     }
 
     /// Exterior representation of an RPC client that interfaces with the node-side RPC interface.
+    ///
+    /// The on-chain crate is outside the coordinator's roster authority: its contract carries no
+    /// TLS identities, so the caller builds `roster` with `NodeRoster::new` from node
+    /// certificates it obtained out of band. Every leg is still pinned to a member of that
+    /// roster and every share attributed to the member's position.
     pub struct NodeRPCClient<F: FftField, S: ShareBound<F>> {
-        node_rpcs: Vec<Client>,
+        legs: Vec<(Arc<Client>, usize)>,
         n: usize,
         t: usize,
         _marker: std::marker::PhantomData<(F, S)>,
@@ -111,14 +118,12 @@ pub mod node_rpc {
     impl<F: FftField, S: ShareBound<F>> NodeRPCClient<F, S> {
         /// Start an RPC client from a certificate generated using rcgen.
         pub async fn start_rpc_client_from_cert(
-            n: usize,
-            t: usize,
+            roster: &NodeRoster,
             addrs: Vec<(String, u16)>,
             client_cert: Arc<rcgen::CertifiedKey<rcgen::KeyPair>>,
-        ) -> Self {
+        ) -> Result<Self, CoordinatorError> {
             Self::start_rpc_client(
-                n,
-                t,
+                roster,
                 addrs,
                 client_cert.cert.der().to_vec(),
                 client_cert.signing_key.serialize_der(),
@@ -129,75 +134,88 @@ pub mod node_rpc {
         /// Start an RPC client from a raw certificate and corresponding private key in DER format.
         /// The information is the same as for `start_rpc_client_from_cert`, but the format
         /// differs.
+        ///
+        /// An address that is unreachable or does not connect within
+        /// `NODE_LEG_CONNECT_TIMEOUT` is dropped; a key outside the roster, two addresses
+        /// answering as one member, or more addresses than nodes refuse the whole client. See
+        /// `connect_roster_legs`.
         pub async fn start_rpc_client(
-            n: usize,
-            t: usize,
+            roster: &NodeRoster,
             addrs: Vec<(String, u16)>,
             cert_der: Vec<u8>,
             key_der: Vec<u8>,
-        ) -> Self {
-            let node_rpcs: Vec<Client> =
-                futures_util::future::join_all(addrs.iter().map(|(addr, port)| {
-                    stoffel_mpc_coordinator_shared::self_signed_certs::setup_client(
-                        addr,
-                        *port,
-                        cert_der.clone(),
-                        key_der.clone(),
-                    )
-                }))
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("failed to connect to node RPC");
+        ) -> Result<Self, CoordinatorError> {
+            let n = usize::try_from(roster.n()).map_err(|_| CoordinatorError::U64ToUsizeError)?;
+            let t = usize::try_from(roster.t()).map_err(|_| CoordinatorError::U64ToUsizeError)?;
+            let legs = connect_roster_legs(
+                roster,
+                &addrs,
+                &cert_der,
+                &key_der,
+                NODE_LEG_CONNECT_TIMEOUT,
+            )
+            .await?
+            .into_iter()
+            .map(|leg| (Arc::new(leg.client), leg.position))
+            .collect();
 
-            Self {
-                node_rpcs,
+            Ok(Self {
+                legs,
                 n,
                 t,
                 _marker: std::marker::PhantomData,
-            }
+            })
         }
 
-        /// Returns a mask whose index has been previously reserved by the client by receiving the
-        /// individual shares from nodes and reconstructing the mask from them.
+        /// Returns the mask at `index`, which the client has previously reserved, by receiving
+        /// the individual shares from nodes and reconstructing the mask by roster position.
+        ///
+        /// A leg that refuses the subscription, ends, fails or serves an undecodable share
+        /// contributes nothing; legs are awaited concurrently. Returns as
+        /// soon as the mask reconstructs, and fails with `MaskReconstructionFailed` once every
+        /// leg has answered or ended without that.
         pub async fn receive_mask(
             &self,
+            index: u64,
             sig: Vec<u8>,
             addr: Address,
         ) -> Result<S::SecretType, CoordinatorError> {
             let mut share_futures = JoinSet::new();
 
-            for rpc in self.node_rpcs.iter() {
-                let mut sub = rpc.receive_mask_share(sig.clone(), addr).await.unwrap();
-                share_futures.spawn(async move { sub.next().await });
+            // Each leg subscribes and waits inside its own task, so a leg that refuses the
+            // subscription or never answers only fails to contribute.
+            for (rpc, position) in self.legs.iter() {
+                let rpc = Arc::clone(rpc);
+                let position = *position;
+                let sig = sig.clone();
+                share_futures.spawn(async move {
+                    let answer = match rpc.receive_mask_share(sig, addr).await {
+                        Ok(mut sub) => sub.next().await,
+                        Err(_) => None,
+                    };
+                    (position, answer)
+                });
             }
 
             let mut mask_shares = Vec::new();
 
-            while let Some(share_bytes) = share_futures.join_next().await {
-                let share = ark_serialize::CanonicalDeserialize::deserialize_compressed(
-                    share_bytes.unwrap().unwrap().unwrap().as_slice(),
-                )
-                .unwrap();
-                mask_shares.push(share);
+            while let Some(joined) = share_futures.join_next().await {
+                let Ok((position, Some(Ok(share_bytes)))) = joined else {
+                    continue;
+                };
+                let Ok(share) = ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                    share_bytes.as_slice(),
+                ) else {
+                    continue;
+                };
+                mask_shares.push(PositionedShare { position, share });
 
-                if mask_shares.len() >= S::min_shares(self.t) {
-                    match S::recover_secret(&mask_shares, self.n, self.t) {
-                        Ok((_, mask)) => {
-                            return Ok(mask);
-                        }
-                        Err(_) => {
-                            return Err(CoordinatorError::MaskReconstructionFailed(
-                                mask_shares.len(),
-                            ));
-                        }
-                    }
+                if let Reconstruction::Secret(mask) = S::reconstruct(&mask_shares, self.n, self.t) {
+                    return Ok(mask);
                 }
             }
 
-            Err(CoordinatorError::MaskReconstructionFailed(
-                mask_shares.len(),
-            ))
+            Err(CoordinatorError::MaskReconstructionFailed { index })
         }
     }
 
@@ -241,7 +259,12 @@ pub mod node_rpc {
             let server_handle = stoffel_mpc_coordinator_shared::rpc::start_coord::<
                 NodeRPCServerConnection<P, F, S>,
             >(
-                addr, port, cert_der, key_der, rpc_server_data.clone()
+                addr,
+                port,
+                cert_der,
+                key_der,
+                rpc_server_data.clone(),
+                RpcServerLimits::default(),
             )
             .await
             .expect("failed to start node RPC server");
@@ -634,6 +657,9 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>>
             Round::Idle => {
                 panic!();
             }
+            // The on-chain coordinator has no deadlines and never aborts; like `Idle`, no
+            // proposal can target it.
+            Round::Aborted => return Err(CoordinatorError::RoundNotProposable { round }),
             Round::Preprocessing => self.coord.startPreprocessing().send().await,
             Round::InputMaskReservation => self.coord.reserveInputMasks().send().await,
             Round::InputCollection => self.coord.collectInputs().send().await,
@@ -914,6 +940,8 @@ impl<P: Provider + WalletProvider + Clone, F: FftField, S: ShareBound<F>> Coordi
 
         match round {
             Round::Idle => panic!(),
+            // The contract emits no abort event: an on-chain execution is never aborted.
+            Round::Aborted => Err(CoordinatorError::RoundNotProposable { round }),
             Round::Preprocessing => wait_for_event!(
                 self.coord.PreprocessingStarted_filter(),
                 "PreprocessingStarted"

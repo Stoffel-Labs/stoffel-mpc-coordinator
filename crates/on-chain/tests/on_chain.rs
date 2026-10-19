@@ -12,8 +12,8 @@ use stoffel_mpc_coordinator_on_chain::{generate_client_sig, ws_connect};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{
     HoneyBadgerShareType, HoneyBadgerShareValueType, HoneyBadgerValueType,
 };
-use stoffel_mpc_coordinator_shared::ShareBound;
 use stoffel_mpc_coordinator_shared::{Coordinator, Round};
+use stoffel_mpc_coordinator_shared::{NodeCertificateDer, NodeRoster, ShareBound, SpkiDer};
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator;
 use stoffel_solidity_bindings::stoffel_coordinator::StoffelCoordinator::StoffelCoordinatorInstance;
 use stoffel_solidity_bindings_test::fake_coordinator::FakeCoordinator;
@@ -48,6 +48,25 @@ static ACC: [Address; 10] = [
 
 fn sample_ids(n: usize) -> Vec<usize> {
     (1..=n).collect()
+}
+
+type Certified = std::sync::Arc<rcgen::CertifiedKey<rcgen::KeyPair>>;
+
+/// Sorts node certificates into canonical roster order, so `certs[i]` is roster position `i`.
+fn sort_into_roster_order(certs: &mut [Certified]) {
+    certs.sort_by_key(|cert| SpkiDer::from_certificate_der(cert.cert.der()).unwrap());
+}
+
+/// The node roster the on-chain caller builds from certificates obtained out of band.
+fn roster_of(t: u64, certs: &[Certified]) -> NodeRoster {
+    NodeRoster::new(
+        t,
+        certs
+            .iter()
+            .map(|cert| NodeCertificateDer::from_der(cert.cert.der().to_vec()))
+            .collect(),
+    )
+    .unwrap()
 }
 
 fn spawn_anvil() -> AnvilInstance {
@@ -157,7 +176,7 @@ async fn run_client_round<P: Provider + WalletProvider + Clone + 'static>(
         .await
         .expect("generating client signature failed");
     let mask = rpc_client
-        .receive_mask(sig.into(), client_addr)
+        .receive_mask(0, sig.into(), client_addr)
         .await
         .unwrap();
     assert_eq!(mask, correct_mask);
@@ -320,6 +339,11 @@ pub async fn start_node_rpc() {
     .expect("deployment failed");
 
     // simulate 2 * t + 1 = 3 nodes that have received valid signatures from a client
+    let mut node_certs = (0..n)
+        .map(|_| stoffel_mpc_coordinator_shared::self_signed_certs::server_cert())
+        .collect::<Vec<_>>();
+    sort_into_roster_order(&mut node_certs);
+    let roster = roster_of(t as u64, &node_certs);
     let mut node_rpcs = Vec::new();
     for i in 0..node_rpc_addrs.len() {
         let provider = ws_connect(&anvil.ws_endpoint(), SK[i]).await;
@@ -329,27 +353,30 @@ pub async fn start_node_rpc() {
             &node_rpc_addrs[i].0,
             node_rpc_addrs[i].1,
             instance.clone(),
-            stoffel_mpc_coordinator_shared::self_signed_certs::server_cert(),
+            node_certs[i].clone(),
         )
         .await;
         node_rpcs.push(node_rpc);
     }
-    let _ = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
-        n,
-        t,
+    HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
+        &roster,
         node_rpc_addrs.clone(),
         stoffel_mpc_coordinator_shared::self_signed_certs::client_cert(),
     )
-    .await;
+    .await
+    .expect("every node RPC listener is a roster member");
 }
 
 #[tokio::test]
 pub async fn end_to_end() {
     stoffel_mpc_coordinator_shared::setup_test();
 
-    let certs = (0..7)
+    let mut certs = (0..7)
         .map(|_| stoffel_mpc_coordinator_shared::self_signed_certs::client_cert())
         .collect::<Vec<_>>();
+    // `certs[..5]` are the nodes; share ids are roster positions.
+    sort_into_roster_order(&mut certs[..5]);
+    let roster = roster_of(1, &certs[..5]);
     let public_keys = certs
         .iter()
         .map(|c| c.signing_key.public_key_raw().to_vec())
@@ -429,12 +456,12 @@ pub async fn end_to_end() {
     )
     .await;
     let rpc_client = HoneyBadgerNodeRPCClient::start_rpc_client_from_cert(
-        n,
-        t as usize,
+        &roster,
         node_rpc_addrs.clone(),
         certs[5].clone(),
     )
-    .await;
+    .await
+    .expect("every node RPC listener is a roster member");
 
     tokio::join!(
         run_node_round(
