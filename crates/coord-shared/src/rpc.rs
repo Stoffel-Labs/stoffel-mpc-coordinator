@@ -64,7 +64,15 @@ pub struct RpcServerLimits {
     pub max_connections: usize,
     /// Established connections of `CapacityClass::BoundClient` identities (default 1024).
     pub max_bound_client_connections: usize,
-    /// Established connections of one identity, whatever its class (default 8).
+    /// Established connections of one identity, whatever its class (default 64).
+    ///
+    /// Sized in *concurrent executions*, not in callers: one identity is legitimately in many
+    /// executions at once — a client opens two connections per execution, deliberately, so its
+    /// long-lived output subscription does not sit behind an input call on one WebSocket — and a
+    /// node holds one for its execution stream plus one per execution it is running. A cap of a
+    /// handful therefore refused honest concurrency as a bare connection reset, with the reason
+    /// only in a `tracing` warning, while still leaving one identity far short of the
+    /// `max_connections` pool it is meant to protect.
     pub max_connections_per_identity: usize,
     /// An unreserved connection with no call in progress, no live subscription and no call
     /// started for this long is closed (default 30 s).
@@ -84,7 +92,7 @@ impl Default for RpcServerLimits {
             handshake_timeout: Duration::from_secs(10),
             max_connections: 4096,
             max_bound_client_connections: 1024,
-            max_connections_per_identity: 8,
+            max_connections_per_identity: 64,
             idle_timeout: Duration::from_secs(30),
             max_subscriptions_per_connection: 64,
             message_buffer_capacity: 16,
@@ -302,7 +310,7 @@ impl ConnectionActivity {
             if response.is_subscription() {
                 self.live_subscriptions.fetch_add(1, Ordering::SeqCst);
             } else if method.starts_with(UNSUBSCRIBE_METHOD_PREFIX) {
-                let _ = self.live_subscriptions.fetch_update(
+                let _ = self.live_subscriptions.try_update(
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                     |live| live.checked_sub(1),

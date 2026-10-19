@@ -10,6 +10,9 @@ use hpke::{
     single_shot_open, single_shot_seal, Deserializable, OpModeR, OpModeS, Serializable,
 };
 use jsonrpsee::async_client::Client;
+/// Re-exported so a node can name the type [`CoordinatorLink::subscribe_executions`] returns
+/// without taking a `jsonrpsee` dependency of its own.
+pub use jsonrpsee::core::client::Subscription;
 use jsonrpsee::core::JsonRawValue;
 use jsonrpsee::server::RpcModule;
 use jsonrpsee::types::{error::ErrorCode, ErrorObjectOwned};
@@ -19,7 +22,7 @@ use jsonrpsee::{
     PendingSubscriptionSink, SubscriptionSink,
 };
 use p256::{pkcs8::DecodePrivateKey, SecretKey};
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +38,8 @@ use stoffel_mpc_coordinator_shared::{
     CoordinatorError, ExecutionDeadlines, ExecutionId, ExecutionOutcome, InputRange, KeyAlgorithm,
     NodeRoster, NodeRosterWire, OutputRights, PositionedShare, Reconstruction, RegistrationError,
     RegistrationNonce, RosterDigest, Round, RpcRefusal, ServerPin, ShareBound, SpkiDer,
-    SubmissionError, UnixSeconds, MAX_MASKED_INPUT_BYTES, MAX_SEALED_OUTPUT_BYTES,
+    SubmissionError, UnixSeconds, MAX_ENTRY_NAME_BYTES, MAX_MASKED_INPUT_BYTES,
+    MAX_SEALED_OUTPUT_BYTES,
 };
 use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -80,6 +84,10 @@ pub const DEFAULT_MAX_ENDED_EXECUTIONS: usize = 4096;
 pub const DEFAULT_OUTPUT_RETENTION: Duration = Duration::from_secs(60);
 /// Parked subscriptions one caller may hold in one list; parking a fifth drops its oldest.
 pub const MAX_PARKED_SUBSCRIPTIONS_PER_CALLER: usize = 4;
+/// Published `ExecutionNotice`s kept for subscribers that are between their snapshot and their
+/// park. One per registration and per cancellation, so this only has to cover the notices a
+/// coordinator can publish while one subscriber sends one snapshot.
+pub const MAX_PUBLICATION_BACKLOG: usize = 1024;
 
 /// One mask share a node's RPC listener releases to `client`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,32 +122,172 @@ pub fn admitted_reservations(set: &ClientAdmissionSet) -> Vec<AssignedMaskReserv
         .collect()
 }
 
-/// Immutable data that binds one invocation to its program, its client slot table and its
-/// admission policy. Registered in-process by the operator; never sent over the wire.
+/// What an operator asks this coordinator to run: a program, the entry function to call in it,
+/// a client slot table, an admission policy and, under `Open`, deadlines.
+///
+/// A request carries no execution identity. The coordinator mints that itself, in
+/// [`CoordinatorRPCServerSharedBase::register_execution`], and publishes it to the roster, so
+/// an operator never names an execution and a node never invents one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionRegistration {
-    pub execution_id: ExecutionId,
+pub struct ExecutionRequest {
     /// `program_hash_of` the compiled program bytes.
     pub program_hash: [u8; 32],
+    /// The function the nodes call in that program.
+    pub entry: String,
     pub client_slots: ClientSlotTable,
     pub admission: AdmissionPolicy,
     /// Required under `Open`, optional under `PreRegistered`.
     pub deadlines: Option<ExecutionDeadlines>,
 }
 
-impl ExecutionRegistration {
-    /// The rows of the validation table that read no coordinator state, in table order.
+impl ExecutionRequest {
+    /// The rows of the validation table that read neither coordinator state nor the minted
+    /// identity, in table order.
     pub fn validate(&self, now: UnixSeconds) -> Result<(), RegistrationError> {
-        if self.execution_id.is_zero() {
-            return Err(RegistrationError::ZeroExecutionId);
-        }
         if self.program_hash == [0; 32] {
             return Err(RegistrationError::ZeroProgramHash);
+        }
+        if self.entry.is_empty() {
+            return Err(RegistrationError::EmptyEntry);
+        }
+        if self.entry.len() as u64 > MAX_ENTRY_NAME_BYTES {
+            return Err(RegistrationError::EntryTooLong {
+                bytes: self.entry.len() as u64,
+                max: MAX_ENTRY_NAME_BYTES,
+            });
         }
         self.client_slots.check_bounds()?;
         self.admission.check(&self.client_slots)?;
         self.admission.check_deadlines(self.deadlines, now)
     }
+}
+
+/// Immutable data that binds one invocation to the identity the coordinator minted for it:
+/// everything a roster node needs to run that invocation, and exactly what `sub_executions`
+/// publishes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionRegistration {
+    /// Minted by [`ExecutionId::new`]; never read from a caller.
+    pub execution_id: ExecutionId,
+    pub request: ExecutionRequest,
+}
+
+impl ExecutionRegistration {
+    /// Binds `request` to a freshly minted identity.
+    pub fn mint(request: ExecutionRequest) -> Self {
+        Self {
+            execution_id: ExecutionId::new(),
+            request,
+        }
+    }
+
+    /// The rows of the validation table that read no coordinator state, in table order.
+    pub fn validate(&self, now: UnixSeconds) -> Result<(), RegistrationError> {
+        if self.execution_id.is_zero() {
+            return Err(RegistrationError::ZeroExecutionId);
+        }
+        self.request.validate(now)
+    }
+}
+
+/// What registering an execution tells the operator: the identity the coordinator minted for
+/// it, and the nonce that names this registration of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredExecution {
+    pub execution_id: ExecutionId,
+    pub registration_nonce: RegistrationNonce,
+}
+
+/// One execution a roster node must run, as the coordinator publishes it: the minted identity
+/// bound to the operator's request, and the nonce that names this registration of it. A node
+/// needs nothing else to admit the execution and spawn its instance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedExecution {
+    pub registration: ExecutionRegistration,
+    pub registration_nonce: RegistrationNonce,
+}
+
+/// Which run of the coordinator process published a snapshot.
+///
+/// Drawn afresh every time the coordinator's state is constructed, so two runs of the same
+/// binary on the same configuration never share a value. It exists because this coordinator
+/// keeps its executions in memory only: a restarted coordinator's first snapshot names nothing,
+/// and a node that reconciled against it would stop every instance it is running — work the new
+/// coordinator never aborted and cannot know about. Carrying the incarnation on the snapshot
+/// lets a node scope the reconciliation to the executions *this* run of the coordinator admitted
+/// and leave the rest alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CoordinatorIncarnation([u8; 16]);
+
+impl CoordinatorIncarnation {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Draws a fresh incarnation from the operating system's random source.
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Display for CoordinatorIncarnation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// One item of the `sub_executions` stream: the coordinator telling the roster to start an
+/// execution, or to stop one, or that the opening snapshot is complete.
+///
+/// A `Cancel` can name an execution a node never received a `Prepare` for — one that ended
+/// before that node subscribed — so a node applies it to whatever it is running and ignores the
+/// rest.
+///
+/// A `Cancel` is also the one notice a node can lose: a subscriber whose connection queue is
+/// full has its stream ended, and the `Cancel` that filled it is not redelivered. The opening
+/// snapshot is what recovers it, which is why `SnapshotComplete` is part of the vocabulary: the
+/// snapshot names every execution the coordinator still wants *this* node to run, so a node
+/// that reaches `SnapshotComplete` must stop every instance it is running that *this
+/// incarnation* of the coordinator admitted and the snapshot did not name, exactly as if a
+/// `Cancel` had arrived for it. Without that reconciliation a dropped `Cancel` would leave an
+/// instance running an execution the coordinator has already aborted; without the incarnation
+/// scope, a coordinator restart would abort every live execution on the whole roster, because
+/// this coordinator's `executions` map does not outlive its process.
+///
+/// The snapshot is per node, and it names an execution the subscriber has not yet retired even
+/// after the retirement quorum and even in a terminal round: that is a healthy straggler's own
+/// unfinished work, which the coordinator keeps alive for it. Only an execution the subscriber
+/// itself acknowledged, or one the coordinator aborted or forgot, is left out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionNotice {
+    /// Run this execution. Sent once per execution per subscription.
+    Prepare(PublishedExecution),
+    /// This coordinator no longer serves the execution, and `outcome` says what that means
+    /// for a node still running it. `Aborted` is an order to stop, published while the
+    /// execution is still live. `Finished` is not: the execution reached its retirement
+    /// quorum, so the notice is caused by the parties' own acknowledgements, and a straggler
+    /// that had not acknowledged yet keeps its instance and its own ending.
+    Cancel {
+        execution_id: ExecutionId,
+        outcome: ExecutionOutcome,
+    },
+    /// Every execution the coordinator wanted run as of the start of this subscription has been
+    /// sent as a `Prepare`. Sent exactly once per subscription, before any later notice. Stop
+    /// every instance this incarnation admitted that the preceding `Prepare`s did not name.
+    SnapshotComplete {
+        /// The run of the coordinator process this snapshot is a statement of.
+        incarnation: CoordinatorIncarnation,
+    },
 }
 
 /// What any caller may learn about a registered execution.
@@ -1202,6 +1350,10 @@ fn event_json(event: &Event) -> Box<JsonRawValue> {
     to_json_raw_value(event).expect("events serialize to JSON")
 }
 
+fn notice_json(notice: &ExecutionNotice) -> Box<JsonRawValue> {
+    to_json_raw_value(notice).expect("execution notices serialize to JSON")
+}
+
 /// RPC interface implemented by the developer.
 #[rpc(server, client)]
 pub trait StoffelCoordinatorRPC {
@@ -1229,8 +1381,46 @@ pub trait CoordinatorRPCBase {
     #[method(name = "get_node_roster")]
     async fn get_node_roster(&self) -> RpcResult<NodeRosterWire>;
 
+    /// Every execution this coordinator wants the roster to run, and every one it wants
+    /// stopped. Roster nodes only.
+    ///
+    /// Snapshot then stream: the first items are one `ExecutionNotice::Prepare` per execution
+    /// this caller must run, in registration order, closed by
+    /// `ExecutionNotice::SnapshotComplete`, and everything published after that snapshot follows
+    /// on the same stream. An execution registered before the node subscribed is therefore never
+    /// missed, and no execution is published twice on one subscription. A node that cannot keep
+    /// up has its stream closed rather than silently skipping a notice, and resubscribes onto a
+    /// fresh snapshot — which is also how it learns of a `Cancel` the ended stream could not
+    /// deliver, since the snapshot names every execution still wanted of this caller and the
+    /// node stops the rest — but only among the executions the snapshot's `CoordinatorIncarnation`
+    /// admitted, since a restarted coordinator remembers none of them and its snapshot is empty.
+    /// The snapshot still names an execution this caller has not retired
+    /// even once the retirement quorum is reached, so a healthy straggler is never told to
+    /// abandon its own unfinished work.
+    #[subscription(name = "sub_executions", unsubscribe = "unsub_executions", item = ExecutionNotice)]
+    async fn sub_executions(&self) -> SubscriptionResult;
+
+    /// Ask this coordinator to run an execution. Operators only.
+    ///
+    /// The coordinator mints the identity, registers the execution and publishes it to every
+    /// roster node on `sub_executions`, then returns what it minted. An operator never names an
+    /// identity, and the submission is the only way an execution comes into existence over the
+    /// wire: nodes learn executions, they do not create them.
+    #[method(name = "submit_execution")]
+    async fn submit_execution(&self, request: ExecutionRequest) -> RpcResult<RegisteredExecution>;
+
+    /// Ask this coordinator to stop an execution it is running. Operators only.
+    ///
+    /// The execution is marked aborted while its nodes are still running it and a
+    /// `ExecutionNotice::Cancel` is published to the roster, so the instances stop. An execution
+    /// this coordinator does not have is `ExecutionNotFound`; one it has already aborted is
+    /// accepted without publishing a second cancellation.
+    #[method(name = "abort_execution")]
+    async fn abort_execution(&self, execution_id: ExecutionId) -> RpcResult<()>;
+
     /// What any caller may learn about an execution: its program, slot table, policy kind,
-    /// deadlines and round. Rate limited per caller identity, sharing `get_node_roster`'s bucket.
+    /// deadlines and round. Rate limited per caller identity, on its own bucket
+    /// (`SUMMARY_READ_BURST` at `SUMMARY_READS_PER_MINUTE`); `get_node_roster` has another.
     #[method(name = "get_execution_summary")]
     async fn get_execution_summary(&self, execution_id: ExecutionId)
         -> RpcResult<ExecutionSummary>;
@@ -1337,10 +1527,12 @@ pub enum CoordinatorRPCBaseError {
     SealedOutputTooLarge = 39,
     BadOutputSignature = 40,
     RateLimited = 41,
+    NotOperator = 42,
+    RegistrationRefused = 43,
 }
 
 impl CoordinatorRPCBaseError {
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 29] = [
         Self::WrongRound,
         Self::MaskedInputAlreadySubmitted,
         Self::IndexNotReserved,
@@ -1368,6 +1560,8 @@ impl CoordinatorRPCBaseError {
         Self::SealedOutputTooLarge,
         Self::BadOutputSignature,
         Self::RateLimited,
+        Self::NotOperator,
+        Self::RegistrationRefused,
     ];
 
     /// The JSON-RPC `code` of this refusal.
@@ -1393,6 +1587,7 @@ impl CoordinatorRPCBaseError {
             Self::ClientAlreadyReserved => Some(RpcRefusal::ClientAlreadyReserved),
             Self::ExecutionNotFound => Some(RpcRefusal::ExecutionNotFound),
             Self::RateLimited => Some(RpcRefusal::RateLimited),
+            Self::NotOperator => Some(RpcRefusal::NotOperator),
             _ => None,
         }
     }
@@ -1439,6 +1634,16 @@ fn admission_refusal(error: AdmissionError) -> ErrorObjectOwned {
     )
 }
 
+/// A refused submission, carrying the typed [`RegistrationError`] so the operator sees which
+/// row of the registration table refused it rather than a string.
+fn registration_refusal(error: RegistrationError) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        CoordinatorRPCBaseError::RegistrationRefused.code(),
+        error.to_string(),
+        Some(&error),
+    )
+}
+
 fn submission_refusal(error: SubmissionError) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(
         CoordinatorRPCBaseError::of_submission(&error).code(),
@@ -1466,6 +1671,16 @@ fn not_party(action: &str) -> ErrorObjectOwned {
     refusal(
         CoordinatorRPCBaseError::NotParty,
         format!("Only roster nodes can {action}."),
+    )
+}
+
+/// An operator certificate is what authorizes telling this coordinator what to run. The
+/// operator set is fixed at startup and is empty by default, so a coordinator started without
+/// one runs only the executions its own command line registered.
+fn not_operator(action: &str) -> ErrorObjectOwned {
+    refusal(
+        CoordinatorRPCBaseError::NotOperator,
+        format!("Only an operator of this coordinator can {action}."),
     )
 }
 
@@ -1499,6 +1714,11 @@ fn decode_error_object(execution_id: ExecutionId, object: &ErrorObjectOwned) -> 
                 reason,
             })
             .unwrap_or_else(|_| untyped()),
+        CoordinatorRPCBaseError::RegistrationRefused => {
+            serde_json::from_str::<RegistrationError>(data)
+                .map(CoordinatorError::Registration)
+                .unwrap_or_else(|_| untyped())
+        }
         CoordinatorRPCBaseError::MaskedInputTooLarge
         | CoordinatorRPCBaseError::SubmissionOutsideAdmission
         | CoordinatorRPCBaseError::BadMaskedInputSignature
@@ -1526,12 +1746,32 @@ fn decode_client_error(
     }
 }
 
-/// Tokens a caller identity earns per minute for the rate-limited read methods.
+/// Tokens a caller identity earns per minute for `get_execution_summary`.
 pub const SUMMARY_READS_PER_MINUTE: u32 = 60;
-/// Tokens a caller identity may hold at once.
-pub const SUMMARY_READ_BURST: u32 = 10;
+/// Tokens a caller identity may hold at once for `get_execution_summary`.
+///
+/// The burst is sized for the executions one identity may be starting at once, and the refill
+/// is what throttles polling. A client reads the summary when it associates with an execution,
+/// once per connection it opens, so a client in several concurrent executions legitimately
+/// reads it a dozen times within a second or two of starting — and a burst sized for one
+/// execution refused that with `RateLimited` before any of them could begin. Sustained reading
+/// is still bounded by `SUMMARY_READS_PER_MINUTE`.
+pub const SUMMARY_READ_BURST: u32 = 64;
 /// Caller identities whose buckets are remembered; the least recently used is forgotten first.
 pub const SUMMARY_READ_BUCKETS: usize = 65_536;
+/// Tokens a caller identity earns per minute for `get_node_roster`.
+///
+/// The roster has its own bucket, and a larger one, because reading it is not a request a
+/// caller chooses to make: every link opened to this coordinator fetches and verifies the
+/// roster once, as the only way to learn the party set it must pin. A client opens two links
+/// per execution and a node reopens its link whenever the connection under its subscription
+/// ends, so with concurrent executions on one identity the binding constraint on a summary-sized
+/// bucket is the number of links, not any kind of abuse. What is served is also one cached,
+/// constant wire struct — the same bytes for every caller, cloned under the lock — so the cost
+/// of answering is a clone rather than a walk of per-execution state.
+pub const ROSTER_READS_PER_MINUTE: u32 = 240;
+/// Tokens a caller identity may hold at once for `get_node_roster`.
+pub const ROSTER_READ_BURST: u32 = 64;
 
 /// One caller identity's token bucket.
 #[derive(Clone, Copy, Debug)]
@@ -1549,15 +1789,21 @@ struct ReadRateLimiter {
     by_use: BTreeMap<u64, ClientIdentity>,
     uses: u64,
     capacity: usize,
+    /// Tokens one identity earns per minute.
+    per_minute: u32,
+    /// Tokens one identity may hold at once.
+    burst: u32,
 }
 
 impl ReadRateLimiter {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, per_minute: u32, burst: u32) -> Self {
         Self {
             buckets: HashMap::new(),
             by_use: BTreeMap::new(),
             uses: 0,
             capacity,
+            per_minute,
+            burst,
         }
     }
 
@@ -1565,12 +1811,12 @@ impl ReadRateLimiter {
     fn try_take(&mut self, identity: &ClientIdentity, now: Instant) -> bool {
         self.uses += 1;
         let use_stamp = self.uses;
-        let burst = f64::from(SUMMARY_READ_BURST);
+        let burst = f64::from(self.burst);
         let bucket = match self.buckets.get_mut(identity) {
             Some(bucket) => {
                 self.by_use.remove(&bucket.last_used);
                 let elapsed = now.saturating_duration_since(bucket.refilled_at);
-                let earned = elapsed.as_secs_f64() * f64::from(SUMMARY_READS_PER_MINUTE) / 60.0;
+                let earned = elapsed.as_secs_f64() * f64::from(self.per_minute) / 60.0;
                 bucket.tokens = (bucket.tokens + earned).min(burst);
                 bucket.refilled_at = now;
                 bucket
@@ -1771,6 +2017,12 @@ pub struct CoordinatorRPCServerSharedBase {
     n: u64,
     t: u64,
     read_rate: ReadRateLimiter,
+    /// `get_node_roster`'s own bucket; see `ROSTER_READ_BURST`.
+    roster_rate: ReadRateLimiter,
+    /// Which run of this process the executions below belong to. Published on every snapshot,
+    /// because `executions` does not outlive the process and a node must be able to tell a
+    /// snapshot of its own admissions from a restarted coordinator's empty one.
+    incarnation: CoordinatorIncarnation,
     executions: HashMap<ExecutionId, CoordinatorExecutionState>,
     /// Executions that reached the retirement quorum and were evicted. Their protocol state has
     /// been dropped; only the acknowledging identities are kept so that stragglers can still
@@ -1788,6 +2040,26 @@ pub struct CoordinatorRPCServerSharedBase {
     /// Wakes the deadline sweeper when a registration or a retention changes its schedule.
     sweeper_wake: Arc<Notify>,
     hooks: DeliveryHooks,
+    /// The coordinator-wide publication sequence; every notice takes the next value.
+    publication_seq: u64,
+    /// The most recent notices, so a node that has taken its snapshot can catch up on whatever
+    /// was published while it was still sending that snapshot. Bounded: a subscriber whose
+    /// cursor falls out of this window has its stream closed and resubscribes.
+    publications: VecDeque<PublishedNotice>,
+    /// Parked `sub_executions` subscriptions, bounded per caller like every other parked list.
+    execution_sinks: ParkedSinks,
+    /// The identities allowed to tell this coordinator what to run, fixed at startup. Empty by
+    /// default: a coordinator that was given no operator certificate accepts no submission, so
+    /// forgetting to configure one is a refusal rather than an open door.
+    operators: Vec<ClientIdentity>,
+}
+
+/// One published `ExecutionNotice`, serialized once and kept in the backlog under its sequence
+/// number.
+#[derive(Clone)]
+struct PublishedNotice {
+    seq: u64,
+    json: Box<JsonRawValue>,
 }
 
 /// A bounded, insertion-ordered set of executions that have been sealed but not yet
@@ -1870,6 +2142,11 @@ struct CoordinatorExecutionState {
     retirement_acks: HashSet<ClientIdentity>,
     /// Set at unanimous retirement of an execution with output slots: removed then.
     retained_until: Option<Instant>,
+    /// The publication sequence this execution's `Prepare` took, which orders a snapshot.
+    published_seq: u64,
+    /// Whether this execution has already been published as cancelled, so an abort followed by
+    /// a removal publishes one `Cancel` rather than two.
+    cancel_published: bool,
     /// Parties that have proposed each round transition. A round is applied once its proposer
     /// set reaches the transition quorum.
     transition_votes: HashMap<Round, HashSet<ClientIdentity>>,
@@ -2002,6 +2279,16 @@ impl ReplayItem {
             Self::Round(event) => event_json(event),
         }
     }
+}
+
+/// What a `sub_executions` subscription does after one look at the state.
+enum PublicationStep {
+    /// Items to send, in publication order.
+    Send(Vec<PublishedNotice>),
+    Parked(oneshot::Receiver<()>),
+    /// The backlog no longer reaches back to the subscriber's cursor, so it must resubscribe
+    /// onto a fresh snapshot rather than miss a notice.
+    Missed,
 }
 
 /// What a subscription does after one look at the state.
@@ -2160,7 +2447,17 @@ impl CoordinatorRPCServerSharedBase {
             t: node_roster.t(),
             node_roster,
             server_spki,
-            read_rate: ReadRateLimiter::new(SUMMARY_READ_BUCKETS),
+            read_rate: ReadRateLimiter::new(
+                SUMMARY_READ_BUCKETS,
+                SUMMARY_READS_PER_MINUTE,
+                SUMMARY_READ_BURST,
+            ),
+            roster_rate: ReadRateLimiter::new(
+                SUMMARY_READ_BUCKETS,
+                ROSTER_READS_PER_MINUTE,
+                ROSTER_READ_BURST,
+            ),
+            incarnation: CoordinatorIncarnation::generate(),
             executions: HashMap::new(),
             retired: RetiredExecutions::default(),
             ended: EndedExecutions::default(),
@@ -2169,17 +2466,32 @@ impl CoordinatorRPCServerSharedBase {
             retirement_changed: Arc::new(Notify::new()),
             sweeper_wake: Arc::new(Notify::new()),
             hooks: DeliveryHooks::default(),
+            publication_seq: 0,
+            publications: VecDeque::new(),
+            execution_sinks: ParkedSinks::default(),
+            operators: Vec::new(),
         }
     }
 
+    /// The identities allowed to submit and abort executions on this coordinator.
+    ///
+    /// These are `caller_identity` values of operator certificates, the same identity space the
+    /// roster uses, so an operator is authorized by the certificate it opens the link with and
+    /// by nothing else. A node is not an operator unless its certificate is also listed here.
+    pub fn with_operators(mut self, operators: Vec<ClientIdentity>) -> Self {
+        self.operators = operators;
+        self
+    }
+
+    /// A coordinator serving one execution, minted from `request`.
     pub fn new_for_execution(
         node_roster: NodeRoster,
         server_spki: SpkiDer,
-        registration: ExecutionRegistration,
-    ) -> Result<Self, CoordinatorError> {
+        request: ExecutionRequest,
+    ) -> Result<(Self, RegisteredExecution), CoordinatorError> {
         let mut shared = Self::new(node_roster, server_spki);
-        shared.register_execution(registration)?;
-        Ok(shared)
+        let registered = shared.register_execution(request)?;
+        Ok((shared, registered))
     }
 
     /// How long an execution with output slots is kept after its unanimous retirement
@@ -2241,12 +2553,49 @@ impl CoordinatorRPCServerSharedBase {
         (self.n - self.t) as usize
     }
 
+    /// Mints an identity for `request`, registers it, and returns both the minted
+    /// `ExecutionId` and the nonce that names this registration of it. Registering is the only
+    /// way an execution comes into existence, and this is the only place its identity is drawn:
+    /// no node, client or operator supplies one.
+    ///
+    /// A minted id that collides with a live or an ended execution would mean the operating
+    /// system random source repeated 32 bytes, which is a failed random source rather than bad
+    /// luck, so the collision is refused (`ConflictingRegistration`, `ExecutionIdRetired`)
+    /// rather than redrawn.
+    pub fn register_execution(
+        &mut self,
+        request: ExecutionRequest,
+    ) -> Result<RegisteredExecution, CoordinatorError> {
+        let registration = ExecutionRegistration::mint(request);
+        let execution_id = registration.execution_id;
+        let registration_nonce = self.insert_registration(registration)?;
+        Ok(RegisteredExecution {
+            execution_id,
+            registration_nonce,
+        })
+    }
+
+    /// `register_execution` with the identity given rather than minted, for tests that have to
+    /// name an execution — above all to re-register one this coordinator has already ended.
+    #[doc(hidden)]
+    pub fn register_execution_at(
+        &mut self,
+        execution_id: ExecutionId,
+        request: ExecutionRequest,
+    ) -> Result<RegistrationNonce, CoordinatorError> {
+        self.insert_registration(ExecutionRegistration {
+            execution_id,
+            request,
+        })
+    }
+
     /// Registers an execution, running the checks strictly in this order: an identical live
     /// registration returns its nonce; an ended id is `ExecutionIdRetired`; a different live
     /// registration is `ConflictingRegistration`; `ExecutionRegistration::validate`; then, at
     /// `DEFAULT_MAX_CONCURRENT_EXECUTIONS`, one evictable execution is evicted or the
-    /// registration is `ExecutionCapacityReached`. Finally draws the nonce and registers.
-    pub fn register_execution(
+    /// registration is `ExecutionCapacityReached`. Finally draws the nonce, registers, and
+    /// publishes the execution to the roster.
+    fn insert_registration(
         &mut self,
         registration: ExecutionRegistration,
     ) -> Result<RegistrationNonce, CoordinatorError> {
@@ -2292,7 +2641,125 @@ impl CoordinatorRPCServerSharedBase {
         }
         self.executions.insert(execution_id, execution);
         self.sweeper_wake.notify_one();
+        self.publish_prepare(execution_id);
         Ok(nonce)
+    }
+
+    /// Publishes `execution_id` as runnable and records the sequence number it took, which is
+    /// the order a snapshot replays it in.
+    fn publish_prepare(&mut self, execution_id: ExecutionId) {
+        let Some(execution) = self.executions.get(&execution_id) else {
+            return;
+        };
+        let notice = ExecutionNotice::Prepare(PublishedExecution {
+            registration: ExecutionRegistration::clone(&execution.registration),
+            registration_nonce: execution.registration_nonce,
+        });
+        let seq = self.publish(notice);
+        if let Some(execution) = self.executions.get_mut(&execution_id) {
+            execution.published_seq = seq;
+        }
+    }
+
+    /// Publishes `execution_id` as no longer runnable, at most once per execution.
+    fn publish_cancel(&mut self, execution_id: ExecutionId, outcome: ExecutionOutcome) {
+        self.publish(ExecutionNotice::Cancel {
+            execution_id,
+            outcome,
+        });
+    }
+
+    /// Appends `notice` to the publication log and hands it to every parked `sub_executions`
+    /// subscriber, returning the sequence number it took.
+    ///
+    /// `SubscriptionSink::try_send` only enqueues on the subscriber's own connection channel:
+    /// it performs no socket I/O and never awaits, so publishing while the state mutex is held
+    /// is what gives every subscriber the same coordinator-wide notice order. A subscriber whose
+    /// queue is full is dropped, which ends its stream instead of silently skipping a notice;
+    /// it resubscribes onto a fresh snapshot.
+    fn publish(&mut self, notice: ExecutionNotice) -> u64 {
+        self.publication_seq += 1;
+        let seq = self.publication_seq;
+        let json = notice_json(&notice);
+        self.publications.push_back(PublishedNotice {
+            seq,
+            json: json.clone(),
+        });
+        while self.publications.len() > MAX_PUBLICATION_BACKLOG {
+            self.publications.pop_front();
+        }
+        let mut delivered = Vec::new();
+        for mut entry in self.execution_sinks.take() {
+            if entry.try_send(json.clone()) {
+                delivered.push(entry);
+            }
+        }
+        for entry in delivered {
+            self.execution_sinks.park(entry);
+        }
+        seq
+    }
+
+    /// Every execution the coordinator still wants `node` to run, in registration order, closed
+    /// by `ExecutionNotice::SnapshotComplete`, and the publication sequence that snapshot is
+    /// complete as of.
+    ///
+    /// The snapshot is per node, because what the coordinator wants stopped is per node. An
+    /// execution `node` has acknowledged is finished as far as that node is concerned, and one
+    /// it has not is still its work — even after the retirement quorum, and even in a terminal
+    /// round, which is exactly the state a healthy straggler resubscribes in. An aborted
+    /// execution is nobody's work, and one being retained only so late output clients can read
+    /// their shares has already been acknowledged unanimously.
+    ///
+    /// The closing notice is what makes omission actionable: a node stops whatever it is still
+    /// running *that this incarnation admitted* and this snapshot did not name, which is how a
+    /// resubscribing node recovers a `Cancel` its ended stream never delivered. The incarnation
+    /// is what keeps that from becoming "a restarted coordinator aborts the whole roster's
+    /// work": this state is in memory only, so a fresh process's first snapshot names nothing. Omitting a straggler's own unfinished
+    /// execution would therefore order it to abandon work the coordinator is deliberately
+    /// keeping alive for it, so the predicate is "not acknowledged by this node", never "a node
+    /// joining now could still contribute".
+    fn runnable_snapshot(&self, node: &ClientIdentity) -> (Vec<PublishedNotice>, u64) {
+        let mut runnable = self
+            .executions
+            .values()
+            .filter(|execution| {
+                execution.aborted.is_none()
+                    && execution.retained_until.is_none()
+                    && !execution.retirement_acks.contains(node)
+            })
+            .map(|execution| PublishedNotice {
+                seq: execution.published_seq,
+                json: notice_json(&ExecutionNotice::Prepare(PublishedExecution {
+                    registration: ExecutionRegistration::clone(&execution.registration),
+                    registration_nonce: execution.registration_nonce,
+                })),
+            })
+            .collect::<Vec<_>>();
+        runnable.sort_by_key(|notice| notice.seq);
+        runnable.push(PublishedNotice {
+            seq: self.publication_seq,
+            json: notice_json(&ExecutionNotice::SnapshotComplete {
+                incarnation: self.incarnation,
+            }),
+        });
+        (runnable, self.publication_seq)
+    }
+
+    /// The notices published after `cursor`, or `None` when the backlog no longer reaches that
+    /// far back and the subscriber has to resubscribe onto a fresh snapshot.
+    fn publications_after(&self, cursor: u64) -> Option<Vec<PublishedNotice>> {
+        let oldest = self.publications.front().map(|notice| notice.seq);
+        if oldest.is_some_and(|oldest| oldest > cursor + 1) {
+            return None;
+        }
+        Some(
+            self.publications
+                .iter()
+                .filter(|notice| notice.seq > cursor)
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Returns the current round of the given execution, or `None` if it is not registered
@@ -2365,7 +2832,12 @@ impl CoordinatorRPCServerSharedBase {
         };
         execution.retirement_acks.insert(party.clone());
         let unanimous = execution.retirement_acks.len() >= n;
-        let retain = unanimous && execution.registration.client_slots.has_output_slots();
+        let retain = unanimous
+            && execution
+                .registration
+                .request
+                .client_slots
+                .has_output_slots();
         if retain && execution.retained_until.is_none() {
             execution.retained_until = Some(Instant::now() + output_retention);
             self.sweeper_wake.notify_one();
@@ -2444,8 +2916,9 @@ impl CoordinatorRPCServerSharedBase {
         }
     }
 
-    /// Removes `execution_id` by any path, records how it ended and unbinds its identities.
-    /// Dropping its parked sinks ends their subscribers' streams.
+    /// Removes `execution_id` by any path, records how it ended, unbinds its identities and
+    /// publishes its cancellation to the roster. Dropping its parked sinks ends their
+    /// subscribers' streams.
     fn remove_execution(&mut self, execution_id: ExecutionId) -> Option<CoordinatorExecutionState> {
         let execution = self.executions.remove(&execution_id)?;
         for identity in execution.admissions.identities() {
@@ -2460,7 +2933,10 @@ impl CoordinatorRPCServerSharedBase {
             Some(reason) => ExecutionOutcome::Aborted(reason.clone()),
             None => ExecutionOutcome::Finished,
         };
-        self.ended.record(execution_id, outcome);
+        self.ended.record(execution_id, outcome.clone());
+        if !execution.cancel_published {
+            self.publish_cancel(execution_id, outcome);
+        }
         self.retirement_changed.notify_waiters();
         Some(execution)
     }
@@ -2551,14 +3027,15 @@ impl CoordinatorExecutionState {
         registration: Arc<ExecutionRegistration>,
         registration_nonce: RegistrationNonce,
     ) -> Self {
-        let slots = &registration.client_slots;
+        let slots = &registration.request.client_slots;
         let mut admissions = ClientAdmissions::new(slots.slots().len());
-        if let AdmissionPolicy::PreRegistered { clients } = &registration.admission {
-            for (position, client) in clients.iter().enumerate() {
-                let client_index = ClientIndex(position as u32);
+        if let AdmissionPolicy::PreRegistered { clients } = &registration.request.admission {
+            // The slot each client names, not its position: the position is the node-side
+            // client ordinal, which the coordinator never reasons about.
+            for client in clients {
                 admissions.bind(
-                    client.clone(),
-                    admission_of(&registration, client_index),
+                    client.identity.clone(),
+                    admission_of(&registration, client.client_slot),
                     None,
                 );
             }
@@ -2572,6 +3049,8 @@ impl CoordinatorExecutionState {
             aborted: None,
             retirement_acks: HashSet::new(),
             retained_until: None,
+            published_seq: 0,
+            cancel_published: false,
             transition_votes: HashMap::new(),
             round_events: HashMap::new(),
             round_sinks: HashMap::new(),
@@ -2590,6 +3069,7 @@ impl CoordinatorExecutionState {
     /// The masked inputs of slots that have inputs but no submission.
     fn missing_inputs(&self) -> u64 {
         self.registration
+            .request
             .client_slots
             .slots()
             .iter()
@@ -2621,7 +3101,7 @@ impl CoordinatorExecutionState {
         if self.aborted.is_some() {
             return None;
         }
-        let deadlines = self.registration.deadlines?;
+        let deadlines = self.registration.request.deadlines?;
         let unbound_slots = self.admissions.unbound();
         if now >= deadlines.association.as_system_time()
             && self.association_open()
@@ -2647,7 +3127,7 @@ impl CoordinatorExecutionState {
 
     /// The deadlines that could still abort this execution when they pass.
     fn pending_deadlines(&self) -> Vec<UnixSeconds> {
-        let Some(deadlines) = self.registration.deadlines else {
+        let Some(deadlines) = self.registration.request.deadlines else {
             return Vec::new();
         };
         let mut pending = Vec::new();
@@ -2678,7 +3158,7 @@ impl CoordinatorExecutionState {
     /// is not enough: entering `MPCExecution` while input slots are still empty would run the
     /// program on a truncated input set, silently censoring the clients that had not submitted.
     fn blocking_precondition(&self, next_round: Round) -> Option<String> {
-        let slots = &self.registration.client_slots;
+        let slots = &self.registration.request.client_slots;
         let input_skip = self.is_input_skip(next_round);
         if next_round == Round::MPCExecution && !input_skip {
             let missing = self.missing_inputs();
@@ -2850,8 +3330,11 @@ fn admission_of(
     ClientAdmission {
         execution_id: registration.execution_id,
         client_index,
-        input_range: registration.client_slots.input_range(client_index),
-        output_rights: registration.client_slots.output_rights(client_index),
+        input_range: registration.request.client_slots.input_range(client_index),
+        output_rights: registration
+            .request
+            .client_slots
+            .output_rights(client_index),
     }
 }
 
@@ -2859,6 +3342,29 @@ fn admission_of(
 async fn abort_if_due(
     state: &Arc<Mutex<CoordinatorRPCServerSharedBase>>,
     execution_id: ExecutionId,
+) {
+    abort_execution_for(state, execution_id, None).await
+}
+
+/// Aborts `execution_id` for `reason`, whatever its deadlines say.
+///
+/// This is the operator-requested path. It takes the same locks in the same order as the
+/// deadline sweeper and publishes the same `Cancel`, so an operator abort and a deadline abort
+/// are indistinguishable to a node.
+async fn abort_execution_now(
+    state: &Arc<Mutex<CoordinatorRPCServerSharedBase>>,
+    execution_id: ExecutionId,
+    reason: AbortReason,
+) {
+    abort_execution_for(state, execution_id, Some(reason)).await
+}
+
+/// One abort path. With no `reason` the execution's own deadlines decide whether it aborts at
+/// all; with one, it aborts for that reason.
+async fn abort_execution_for(
+    state: &Arc<Mutex<CoordinatorRPCServerSharedBase>>,
+    execution_id: ExecutionId,
+    requested: Option<AbortReason>,
 ) {
     let Some(delivery) = ({
         let shared = state.lock().await;
@@ -2876,13 +3382,26 @@ async fn abort_if_due(
         let Some(execution) = shared.executions.get_mut(&execution_id) else {
             return;
         };
-        let Some(reason) = execution.abort_condition(SystemTime::now()) else {
+        // An execution already aborted has already had its `Cancel` published, and publishing a
+        // second one would tell the roster to stop something twice.
+        if execution.aborted.is_some() {
             return;
+        }
+        let reason = match requested.clone() {
+            Some(reason) => reason,
+            None => match execution.abort_condition(SystemTime::now()) {
+                Some(reason) => reason,
+                None => return,
+            },
         };
         execution.round = Round::Aborted;
         execution.aborted = Some(reason.clone());
+        execution.cancel_published = true;
         let (event_sinks, waiters) = execution.take_all_sinks();
         retirement_changed.notify_waiters();
+        // An aborted execution stays live until it is removed, so the roster learns here, while
+        // its nodes are still running it, rather than at removal.
+        shared.publish_cancel(execution_id, ExecutionOutcome::Aborted(reason.clone()));
         (reason, event_sinks, waiters)
     };
     eprintln!("coordinator aborted execution {execution_id}: {reason}");
@@ -2928,7 +3447,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
     async fn get_node_roster(&self) -> RpcResult<NodeRosterWire> {
         let roster = {
             let mut shared = self.d.lock().await;
-            if !shared.read_rate.try_take(&self.id, Instant::now()) {
+            if !shared.roster_rate.try_take(&self.id, Instant::now()) {
                 return Err(refusal(
                     CoordinatorRPCBaseError::RateLimited,
                     "Too many roster reads from this identity; retry later.",
@@ -2937,6 +3456,114 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             shared.node_roster_wire.clone()
         };
         Ok(NodeRosterWire::clone(&roster))
+    }
+
+    async fn sub_executions(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+        // Accepting a JSON-RPC subscription performs WebSocket I/O. Never do that while holding
+        // the coordinator-wide state mutex.
+        let gate = {
+            let shared = self.d.lock().await;
+            if shared.mpc_nodes.contains(&self.id) {
+                Ok(shared.hooks.after_subscription_accept.clone())
+            } else {
+                Err(not_party("subscribe to executions"))
+            }
+        };
+        let hook = match gate {
+            Ok(hook) => hook,
+            Err(error) => {
+                pending.reject(error).await;
+                return Ok(());
+            }
+        };
+        let sink = pending.accept().await?;
+        pause_at(&hook).await;
+
+        let caller = self.id.clone();
+        // `None` until the snapshot is taken; afterwards the sequence this stream has sent
+        // everything up to.
+        let mut cursor: Option<u64> = None;
+        loop {
+            let step = {
+                let mut shared = self.d.lock().await;
+                match cursor {
+                    None => {
+                        let (snapshot, taken_at) = shared.runnable_snapshot(&caller);
+                        cursor = Some(taken_at);
+                        PublicationStep::Send(snapshot)
+                    }
+                    Some(sent_through) => match shared.publications_after(sent_through) {
+                        None => PublicationStep::Missed,
+                        Some(notices) => match notices.last() {
+                            Some(last) => {
+                                cursor = Some(last.seq);
+                                PublicationStep::Send(notices)
+                            }
+                            None => {
+                                // Parking under the same lock the publisher takes is what makes
+                                // "nothing new" and "park" one atomic decision.
+                                let (entry, released) = ParkedSink::new(caller.clone(), &sink);
+                                shared.execution_sinks.park(entry);
+                                PublicationStep::Parked(released)
+                            }
+                        },
+                    },
+                }
+            };
+            match step {
+                PublicationStep::Send(notices) => {
+                    for notice in notices {
+                        if sink
+                            .send_timeout(notice.json, SUBSCRIPTION_SEND_TIMEOUT)
+                            .await
+                            .is_err()
+                        {
+                            eprintln!("coordinator execution subscriber disconnected or timed out");
+                            return Ok(());
+                        }
+                    }
+                }
+                PublicationStep::Parked(released) => {
+                    return hold_until_released(&sink, released).await
+                }
+                PublicationStep::Missed => {
+                    return Err("the coordinator closed this subscription".into())
+                }
+            }
+        }
+    }
+
+    async fn submit_execution(&self, request: ExecutionRequest) -> RpcResult<RegisteredExecution> {
+        let mut shared = self.d.lock().await;
+        if !shared.operators.contains(&self.id) {
+            return Err(not_operator("submit an execution"));
+        }
+        // `register_execution` mints the identity and publishes the execution to every parked
+        // roster subscriber under this same lock, so a node can never see the registration
+        // before the coordinator has recorded it.
+        shared
+            .register_execution(request)
+            .map_err(|error| match error {
+                CoordinatorError::Registration(error) => registration_refusal(error),
+                other => refusal(
+                    CoordinatorRPCBaseError::RegistrationRefused,
+                    other.to_string(),
+                ),
+            })
+    }
+
+    async fn abort_execution(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        {
+            let shared = self.d.lock().await;
+            if !shared.operators.contains(&self.id) {
+                return Err(not_operator("abort an execution"));
+            }
+            if !shared.executions.contains_key(&execution_id) {
+                return Err(execution_not_found(execution_id));
+            }
+        }
+        abort_execution_now(&self.d, execution_id, AbortReason::OperatorRequest).await;
+        Ok(())
     }
 
     async fn get_execution_summary(
@@ -2965,10 +3592,10 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         Ok(ExecutionSummary {
             execution_id,
             registration_nonce,
-            program_hash: registration.program_hash,
-            client_slots: registration.client_slots.clone(),
-            admission: registration.admission.kind(),
-            deadlines: registration.deadlines,
+            program_hash: registration.request.program_hash,
+            client_slots: registration.request.client_slots.clone(),
+            admission: registration.request.admission.kind(),
+            deadlines: registration.request.deadlines,
             round,
         })
     }
@@ -3048,7 +3675,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         }
 
         // 7. Policy.
-        let requested = match &registration.admission {
+        let requested = match &registration.request.admission {
             AdmissionPolicy::PreRegistered { .. } => {
                 return Err(admission_refusal(AdmissionError::NotPreRegistered {
                     execution_id,
@@ -3058,7 +3685,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         };
 
         // 8. Slot.
-        let capacity = registration.client_slots.capacity();
+        let capacity = registration.request.client_slots.capacity();
         let client_index = match requested {
             Some(requested) => {
                 if requested.0 >= capacity {
@@ -3088,7 +3715,8 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         };
 
         // 9. Output slots need a key output shares can be sealed to.
-        if registration.client_slots.slots()[client_index.0 as usize].output_count > 0 && !sealable
+        if registration.request.client_slots.slots()[client_index.0 as usize].output_count > 0
+            && !sealable
         {
             return Err(admission_refusal(AdmissionError::UnsupportedClientKey {
                 client_index,
@@ -3821,6 +4449,42 @@ impl CoordinatorLink {
     /// The key of the certificate this link authenticated with.
     pub fn own_spki(&self) -> &SpkiDer {
         &self.own_spki
+    }
+
+    /// Subscribes a roster node to every execution this coordinator wants it to run, and every
+    /// one it wants stopped.
+    ///
+    /// One subscription per node, for the node's whole life: the stream opens with one
+    /// `ExecutionNotice::Prepare` per execution that is already runnable and then carries each
+    /// later notice. A stream that ends means the node must subscribe again, which takes a
+    /// fresh snapshot.
+    pub async fn subscribe_executions(
+        &self,
+    ) -> Result<Subscription<ExecutionNotice>, CoordinatorError> {
+        CoordinatorRPCBaseClient::sub_executions(&self.rpc)
+            .await
+            .map_err(|error| CoordinatorError::JSONError(error.to_string()))
+    }
+
+    /// Asks this coordinator to run `request`, returning the identity it minted.
+    ///
+    /// The caller must hold one of the operator certificates the coordinator was started with;
+    /// anything else is `RpcRefusal::NotOperator`. The execution is published to every roster
+    /// node before this returns.
+    pub async fn submit_execution(
+        &self,
+        request: ExecutionRequest,
+    ) -> Result<RegisteredExecution, CoordinatorError> {
+        CoordinatorRPCBaseClient::submit_execution(&self.rpc, request)
+            .await
+            .map_err(|error| decode_client_error(ExecutionId::from_bytes([0; 32]), error))
+    }
+
+    /// Asks this coordinator to stop `execution_id` on every node running it. Operators only.
+    pub async fn abort_execution(&self, execution_id: ExecutionId) -> Result<(), CoordinatorError> {
+        CoordinatorRPCBaseClient::abort_execution(&self.rpc, execution_id)
+            .await
+            .map_err(|error| decode_client_error(execution_id, error))
     }
 }
 
@@ -4718,7 +5382,7 @@ mod read_rate_limiter_tests {
     #[test]
     fn buckets_refill_at_the_configured_rate_and_forget_the_least_recently_used() {
         let start = Instant::now();
-        let mut limiter = ReadRateLimiter::new(2);
+        let mut limiter = ReadRateLimiter::new(2, SUMMARY_READS_PER_MINUTE, SUMMARY_READ_BURST);
         let first = vec![1u8; 65];
         let second = vec![2u8; 65];
         let third = vec![3u8; 65];
@@ -4741,5 +5405,42 @@ mod read_rate_limiter_tests {
         assert!(!limiter.buckets.contains_key(&first));
         assert!(limiter.buckets.contains_key(&second));
         assert_eq!(limiter.by_use.len(), 2);
+    }
+
+    #[test]
+    fn the_roster_bucket_admits_the_links_a_concurrent_deployment_opens() {
+        // Every link fetches the roster once, so this bucket is sized in links, not in
+        // requests a caller chose to make: five nodes and a dozen clients of one identity
+        // must be able to open and reopen links without being refused, while a flood from
+        // one identity still is.
+        let start = Instant::now();
+        let mut limiter = ReadRateLimiter::new(
+            SUMMARY_READ_BUCKETS,
+            ROSTER_READS_PER_MINUTE,
+            ROSTER_READ_BURST,
+        );
+        let identity = vec![7u8; 65];
+        for taken in 0..ROSTER_READ_BURST {
+            assert!(
+                limiter.try_take(&identity, start),
+                "link {taken} of one identity's burst must be admitted"
+            );
+        }
+        assert!(
+            !limiter.try_take(&identity, start),
+            "the burst is still bounded"
+        );
+        let one_token = Duration::from_secs(60) / ROSTER_READS_PER_MINUTE;
+        assert!(
+            limiter.try_take(&identity, start + one_token),
+            "one token is earned per 60 / ROSTER_READS_PER_MINUTE seconds"
+        );
+        const {
+            assert!(
+                ROSTER_READS_PER_MINUTE > SUMMARY_READS_PER_MINUTE,
+                "the roster bucket exists because the roster refills faster: it is read once \
+                 per link opened, which no caller chooses, while a summary read is a request"
+            )
+        };
     }
 }

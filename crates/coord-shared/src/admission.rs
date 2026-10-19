@@ -27,6 +27,9 @@ pub const MAX_INPUTS: u64 = 1 << 20;
 /// One masked input's encoding. Every `ShareBound::ValueType` in use is a 32-byte compressed
 /// scalar; 64 leaves room for a wider field without re-measuring the wire bounds.
 pub const MAX_MASKED_INPUT_BYTES: u64 = 64;
+/// One registration's entry function name. The name is published to every roster node, which
+/// looks it up in the compiled program, so it only has to be long enough for a symbol.
+pub const MAX_ENTRY_NAME_BYTES: u64 = 256;
 /// One node's sealed output ciphertext for one client.
 pub const MAX_SEALED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -270,10 +273,26 @@ pub enum OutputRights {
     Receive { output_count: NonZeroU64 },
 }
 
+/// One client bound at registration, and the slot it owns.
+///
+/// The two indices this value carries are different index spaces, and both are meaningful.
+/// `client_slot` is the program's slot: it fixes the input range and the output rights this
+/// client holds, and it is the only index the coordinator reasons about. The position of this
+/// entry in `AdmissionPolicy::PreRegistered`'s vector is the execution-local client ordinal the
+/// MPC backend numbers its clients by, which a node needs in order to place each client in its
+/// own protocol run. The two coincide in the common case and need not: a registration may list
+/// its clients in any order, so long as their slots are each of the program's slots exactly once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreRegisteredClient {
+    pub identity: ClientIdentity,
+    pub client_slot: ClientIndex,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdmissionPolicy {
-    /// `clients[i]` is bound to slot `i` at registration.
-    PreRegistered { clients: Vec<ClientIdentity> },
+    /// `clients[i]` is bound at registration to the slot it names, with `i` as its
+    /// execution-local client ordinal. Every slot of the table is named exactly once.
+    PreRegistered { clients: Vec<PreRegisteredClient> },
     /// Any certificate holder may bind a free slot, first come, first served. The slot table is
     /// the capacity. Use it only where association is already access-controlled: anyone who can
     /// reach the coordinator can bind every slot.
@@ -306,23 +325,40 @@ impl AdmissionPolicy {
                         clients: clients.len() as u64,
                     });
                 }
-                for (position, (client, slot)) in clients.iter().zip(slots.slots()).enumerate() {
-                    let supported = match KeyAlgorithm::of_client_identity(client) {
+                // The slots the clients name must be the table's slots, each exactly once: with
+                // the count already equal, no gap can hide behind a duplicate.
+                let mut claimed = HashSet::with_capacity(clients.len());
+                for client in clients {
+                    if client.client_slot.0 >= slots.capacity() {
+                        return Err(RegistrationError::PreRegisteredSlotOutOfRange {
+                            client_slot: client.client_slot,
+                            slots: slots.slots().len() as u64,
+                        });
+                    }
+                    if !claimed.insert(client.client_slot) {
+                        return Err(RegistrationError::DuplicatePreRegisteredSlot {
+                            client_slot: client.client_slot,
+                        });
+                    }
+                }
+                for client in clients {
+                    let slot = slots.slots()[client.client_slot.0 as usize];
+                    let supported = match KeyAlgorithm::of_client_identity(&client.identity) {
                         Some(KeyAlgorithm::EcdsaP256) => true,
                         Some(KeyAlgorithm::Ed25519) => slot.output_count == 0,
                         None => false,
                     };
                     if !supported {
                         return Err(RegistrationError::UnsupportedPreRegisteredKey {
-                            client_index: ClientIndex(position as u32),
+                            client_slot: client.client_slot,
                         });
                     }
                 }
                 let mut seen = HashSet::with_capacity(clients.len());
-                for (position, client) in clients.iter().enumerate() {
-                    if !seen.insert(client) {
+                for client in clients {
+                    if !seen.insert(&client.identity) {
                         return Err(RegistrationError::DuplicatePreRegisteredClient {
-                            client_index: ClientIndex(position as u32),
+                            client_slot: client.client_slot,
                         });
                     }
                 }
@@ -496,6 +532,11 @@ pub enum AbortReason {
         deadline: UnixSeconds,
         missing_inputs: u64,
     },
+    /// An operator of this coordinator asked for the execution to stop. It is the only abort
+    /// reason that is not a deadline, and the only one an identity rather than the clock
+    /// produces.
+    #[error("an operator asked this coordinator to abort the execution")]
+    OperatorRequest,
 }
 
 /// How an execution this process no longer serves ended.
@@ -512,6 +553,10 @@ pub enum RegistrationError {
     ZeroExecutionId,
     #[error("the program hash must be nonzero")]
     ZeroProgramHash,
+    #[error("the entry function name must not be empty")]
+    EmptyEntry,
+    #[error("the entry function name is {bytes} bytes, above the bound of {max}")]
+    EntryTooLong { bytes: u64, max: u64 },
     #[error("{slots} client slots exceed the bound of {max}")]
     TooManyClientSlots { slots: u64, max: u32 },
     #[error("client slot {client_index} has neither inputs nor outputs")]
@@ -532,10 +577,21 @@ pub enum RegistrationError {
     TooManyInputs { n_inputs: u64, max: u64 },
     #[error("{clients} pre-registered clients were given for {slots} client slots")]
     PreRegisteredCountMismatch { slots: u64, clients: u64 },
-    #[error("the client pre-registered for slot {client_index} has a key this slot cannot use")]
-    UnsupportedPreRegisteredKey { client_index: ClientIndex },
-    #[error("the client pre-registered for slot {client_index} is pre-registered for an earlier slot too")]
-    DuplicatePreRegisteredClient { client_index: ClientIndex },
+    #[error(
+        "a client is pre-registered for slot {client_slot}, outside the {slots} slots of the table"
+    )]
+    PreRegisteredSlotOutOfRange {
+        client_slot: ClientIndex,
+        slots: u64,
+    },
+    #[error("two clients are pre-registered for slot {client_slot}")]
+    DuplicatePreRegisteredSlot { client_slot: ClientIndex },
+    #[error("the client pre-registered for slot {client_slot} has a key this slot cannot use")]
+    UnsupportedPreRegisteredKey { client_slot: ClientIndex },
+    #[error(
+        "the client pre-registered for slot {client_slot} is pre-registered for another slot too"
+    )]
+    DuplicatePreRegisteredClient { client_slot: ClientIndex },
     #[error("open admission requires association and input deadlines")]
     DeadlinesRequired,
     #[error("the association deadline {association} is after the input deadline {input}")]
@@ -658,22 +714,34 @@ mod tests {
         let slots = ClientSlotTable::new(vec![slot(1, 1), slot(1, 0)]);
 
         let compressed = vec![0x02; 33];
-        let check =
-            |clients: Vec<ClientIdentity>| AdmissionPolicy::PreRegistered { clients }.check(&slots);
+        // In slot order, so the vector position is each client's ordinal and its slot.
+        let check = |clients: Vec<ClientIdentity>| {
+            AdmissionPolicy::PreRegistered {
+                clients: clients
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, identity)| PreRegisteredClient {
+                        identity,
+                        client_slot: ClientIndex(position as u32),
+                    })
+                    .collect(),
+            }
+            .check(&slots)
+        };
         assert_eq!(
             check(vec![compressed, p256_client.clone()]),
             Err(RegistrationError::UnsupportedPreRegisteredKey {
-                client_index: ClientIndex(0)
+                client_slot: ClientIndex(0)
             })
         );
         assert_eq!(
             check(vec![ed_client.clone(), p256_client.clone()]),
             Err(RegistrationError::UnsupportedPreRegisteredKey {
-                client_index: ClientIndex(0)
+                client_slot: ClientIndex(0)
             }),
             "an output slot needs a key output shares can be sealed to"
         );
-        assert_eq!(check(vec![p256_client.clone(), ed_client]), Ok(()));
+        assert_eq!(check(vec![p256_client.clone(), ed_client.clone()]), Ok(()));
         assert_eq!(
             check(vec![p256_client.clone()]),
             Err(RegistrationError::PreRegisteredCountMismatch {
@@ -682,10 +750,51 @@ mod tests {
             })
         );
         assert_eq!(
-            check(vec![p256_client.clone(), p256_client]),
+            check(vec![p256_client.clone(), p256_client.clone()]),
             Err(RegistrationError::DuplicatePreRegisteredClient {
-                client_index: ClientIndex(1)
+                client_slot: ClientIndex(1)
             })
+        );
+
+        // The client ordinal is the vector position and the slot is named explicitly, so a
+        // registration may list its clients in an order the program's slots do not dictate.
+        let bound = |pairs: Vec<(ClientIdentity, u32)>| {
+            AdmissionPolicy::PreRegistered {
+                clients: pairs
+                    .into_iter()
+                    .map(|(identity, client_slot)| PreRegisteredClient {
+                        identity,
+                        client_slot: ClientIndex(client_slot),
+                    })
+                    .collect(),
+            }
+            .check(&slots)
+        };
+        assert_eq!(
+            bound(vec![(ed_client.clone(), 1), (p256_client.clone(), 0)]),
+            Ok(()),
+            "the output slot still holds the P-256 key, at ordinal 1"
+        );
+        assert_eq!(
+            bound(vec![(p256_client.clone(), 1), (ed_client.clone(), 0)]),
+            Err(RegistrationError::UnsupportedPreRegisteredKey {
+                client_slot: ClientIndex(0)
+            }),
+            "the slot the client names decides which keys it may use, not its ordinal"
+        );
+        assert_eq!(
+            bound(vec![(p256_client.clone(), 0), (ed_client.clone(), 2)]),
+            Err(RegistrationError::PreRegisteredSlotOutOfRange {
+                client_slot: ClientIndex(2),
+                slots: 2
+            })
+        );
+        assert_eq!(
+            bound(vec![(p256_client.clone(), 1), (ed_client, 1)]),
+            Err(RegistrationError::DuplicatePreRegisteredSlot {
+                client_slot: ClientIndex(1)
+            }),
+            "an equal count cannot hide a gap behind a duplicate"
         );
     }
 

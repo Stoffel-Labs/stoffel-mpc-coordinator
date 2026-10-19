@@ -33,14 +33,16 @@ Install a mock on-chain coordinator with
 Deployment derives the program hash, input count, and MPC backend threshold from the compiled program manifest.
 
 For the off-chain coordinator, generate identities using `cargo run --bin generate-ids -- ids 2 5` (output directory `ids`, 2 clients, 5 nodes).
-Every program invocation needs one nonzero 256-bit execution ID shared by its coordinator, MPC
-nodes, and clients. The commands below use
-`0000000000000000000000000000000000000000000000000000000000000001` as a readable example;
-use a freshly generated value (for example, `openssl rand -hex 32`) for each real invocation.
-Then run the off-chain coordinator. It registers exactly one execution at startup — its program,
-its client slot table and its admission policy — and nothing can register an execution remotely:
+Then run the off-chain coordinator. It registers one execution at startup — its program, its
+entry function, its client slot table and its admission policy — and mints that execution's
+256-bit identity itself, printing it as `Minted execution <id> (registration nonce <nonce>)`.
+The identity is the coordinator's to issue: nodes learn it, with everything else they need to run
+the execution, from the node-only `sub_executions` subscription, and clients are told it out of
+band.
 
-`cargo run --bin run-coord -- --execution-id 0000000000000000000000000000000000000000000000000000000000000001 --program program.stflb --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --t 1 --node-certs ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --client-bindings 0=ids/pub/clients/client0.crt`
+`cargo run --bin run-coord -- --program program.stflb --entry main --server-cert ids/pub/coord.crt --server-key ids/priv/coord.der --t 1 --node-certs ids/pub/nodes/node0.crt,ids/pub/nodes/node1.crt,ids/pub/nodes/node2.crt,ids/pub/nodes/node3.crt,ids/pub/nodes/node4.crt --client-bindings 0=ids/pub/clients/client0.crt --operator-certs ids/pub/operator.crt`. `--operator-certs` names the identities allowed to submit and abort further executions over the authenticated link; with none, the coordinator runs only the execution these flags registered.
+
+`--entry` names the function a node calls in the compiled program, and defaults to `main`.
 
 With `--program`, the client slots come from the program's IO manifest (its `client_slot`s must be
 `0..k`), and the registration hash is `program_hash_of` the program bytes; `--hash <64-hex>`
@@ -120,8 +122,10 @@ The off-chain coordinator operates over JSON-RPC (WebSockets) with mutual TLS, w
 Key behaviors:
 
 - **Node roster**: the coordinator is built from a `NodeRoster` of node certificates and serves it unchanged for its lifetime through `get_node_roster`. Nodes and clients connect with `CoordinatorLink`, which pins the coordinator's key and fetches and verifies the roster once.
+- **Minted execution identity**: the coordinator draws every execution's 256-bit `ExecutionId` itself when the execution is registered; no caller supplies one. `register_execution` takes an `ExecutionRequest` with no identity in it and returns the `RegisteredExecution` it minted.
+- **Publication to the roster**: roster nodes learn what to run from the node-only `sub_executions` subscription, which publishes `ExecutionNotice::Prepare` for each execution and `Cancel` when one is aborted or forgotten. A subscription opens with a snapshot of every execution the coordinator still wants *that* node to run, closed by `SnapshotComplete`; the snapshot is authoritative in both directions, so a node stops whatever it is running that the snapshot does not name. The snapshot is per node, and it still names an execution the subscriber has not acknowledged even after the retirement quorum and in a terminal round, so a healthy straggler is never told to abandon its own unfinished work. A node that cannot keep up has its stream closed and resubscribes onto a fresh snapshot.
 - **Round management**: parties trigger transitions by calling `transition(Round)` over RPC; all subscribers receive the corresponding event. An execution that misses its association or input deadline ends in the terminal `Round::Aborted`.
-- **Registration and admission**: an execution is registered in the coordinator's process with a client slot table and an admission policy (`PreRegistered` or `Open`). Clients bind a slot with `associate_client`, keyed on their mTLS identity; node transport never lists client certificates.
+- **Registration and admission**: a registration fixes an execution's program, entry function, client slot table and admission policy (`PreRegistered` or `Open`). Clients bind a slot with `associate_client`, keyed on their mTLS identity; node transport never lists client certificates. A `PreRegistered` entry names the slot it owns, so its position in the list is free to be the execution-local client ordinal a node numbers its clients by.
 - **Index reservation and input**: an admitted client reserves exactly its slot's input range during `InputMaskReservation`, and submits all of its masked inputs in one call signed with its certificate key. Reservations are broadcast to `sub_reserved_indices` subscribers, including MPC nodes.
 - **Mask-share distribution**: each MPC node runs a `node_rpc::NodeRPCServer`, registers the admitted reservations it fetched with `get_client_admissions`, and delivers each mask share only to the certificate that holds its index. The client pins every node by roster membership, attributes each share to the node's roster position, and reconstructs the mask locally.
 - **Output distribution**: MPC nodes HPKE-seal their output shares under the admitted client's P-256 public key, sign them, and call `send_output_shares`; the client's `obtain_output_shares` subscription receives one `SealedOutputShares` per node.

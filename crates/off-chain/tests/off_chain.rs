@@ -1,10 +1,11 @@
 use ark_bls12_381::Fr;
 use ark_std::test_rng;
 use jsonrpsee::async_client::Client;
-use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
+use jsonrpsee::core::client::{ClientT, Subscription, SubscriptionClientT};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::rpc_params;
 use jsonrpsee::RpcModule;
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,12 +18,14 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     HoneyBadgerOffChainCoordinatorServer,
 };
 use stoffel_mpc_coordinator_off_chain::{
-    admitted_reservations, AssignedMaskReservation, CoordinatorLink, CoordinatorRPCBaseClient,
-    CoordinatorRPCServerSharedBase, DeliveryHooks, Event, ExecutionRegistration, ExecutionSummary,
-    OneOffShutdownConfig, PausePoint, SealedOutput, SealedOutputShares,
-    DEFAULT_MAX_CONCURRENT_EXECUTIONS, DEFAULT_MAX_ENDED_EXECUTIONS, SUMMARY_READ_BURST,
+    admitted_reservations, AssignedMaskReservation, CoordinatorIncarnation, CoordinatorLink,
+    CoordinatorRPCBaseClient, CoordinatorRPCServerSharedBase, DeliveryHooks, Event,
+    ExecutionNotice, ExecutionRegistration, ExecutionRequest, ExecutionSummary,
+    OneOffShutdownConfig, PausePoint, PublishedExecution, SealedOutput, SealedOutputShares,
+    DEFAULT_MAX_CONCURRENT_EXECUTIONS, DEFAULT_MAX_ENDED_EXECUTIONS, ROSTER_READ_BURST,
+    SUMMARY_READ_BURST,
 };
-use stoffel_mpc_coordinator_shared::rpc::{RPCServerConnection, RpcServerLimits};
+use stoffel_mpc_coordinator_shared::rpc::{caller_identity, RPCServerConnection, RpcServerLimits};
 use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert, setup_client};
 use stoffel_mpc_coordinator_shared::tests::fake_coord::{AvssShareType, HoneyBadgerShareType};
 use stoffel_mpc_coordinator_shared::NodeRPCError;
@@ -31,9 +34,9 @@ use stoffel_mpc_coordinator_shared::{
     AdmissionError, AdmissionPolicy, AdmissionPolicyKind, AssociationRequest, ClientAdmission,
     ClientIndex, ClientSlotSpec, ClientSlotTable, Coordinator, CoordinatorError,
     ExecutionDeadlines, ExecutionOutcome, InputRange, KeyAlgorithm, NodeCertificateDer, NodeRoster,
-    NodeRosterWire, OutputRights, RegistrationError, RegistrationNonce, RosterDigest, RosterError,
-    RpcRefusal, ServerPin, ShareBound, SpkiDer, SubmissionError, UnixSeconds,
-    MAX_MASKED_INPUT_BYTES, MAX_SEALED_OUTPUT_BYTES,
+    NodeRosterWire, OutputRights, PreRegisteredClient, RegistrationError, RegistrationNonce,
+    RosterDigest, RosterError, RpcRefusal, ServerPin, ShareBound, SpkiDer, SubmissionError,
+    UnixSeconds, MAX_MASKED_INPUT_BYTES, MAX_SEALED_OUTPUT_BYTES,
 };
 use stoffel_mpc_coordinator_shared::{ExecutionId, Round};
 use stoffelmpc_mpc::common::SecretSharingScheme;
@@ -138,6 +141,22 @@ fn deadlines_in(association: u64, input: u64) -> Option<ExecutionDeadlines> {
     })
 }
 
+/// The operator's request, which carries no identity: the coordinator mints that.
+fn request(
+    slots: Vec<ClientSlotSpec>,
+    admission: AdmissionPolicy,
+    deadlines: Option<ExecutionDeadlines>,
+) -> ExecutionRequest {
+    ExecutionRequest {
+        program_hash: [1; 32],
+        entry: "main".to_string(),
+        client_slots: ClientSlotTable::new(slots),
+        admission,
+        deadlines,
+    }
+}
+
+/// A request bound to the identity a test needs to name, as `register_execution_at` takes it.
 fn registration(
     execution_id: ExecutionId,
     slots: Vec<ClientSlotSpec>,
@@ -146,11 +165,26 @@ fn registration(
 ) -> ExecutionRegistration {
     ExecutionRegistration {
         execution_id,
-        program_hash: [1; 32],
-        client_slots: ClientSlotTable::new(slots),
-        admission,
-        deadlines,
+        request: request(slots, admission, deadlines),
     }
+}
+
+/// Registers `registration` under the identity it names, for the tests that have to reason
+/// about identities rather than let the coordinator mint them.
+fn register(
+    state: &mut CoordinatorRPCServerSharedBase,
+    registration: ExecutionRegistration,
+) -> Result<RegistrationNonce, CoordinatorError> {
+    state.register_execution_at(registration.execution_id, registration.request)
+}
+
+/// A request with no client slots.
+fn empty_request() -> ExecutionRequest {
+    request(
+        vec![],
+        AdmissionPolicy::PreRegistered { clients: vec![] },
+        None,
+    )
 }
 
 /// A registration with no client slots.
@@ -176,6 +210,20 @@ fn open_registration(
     )
 }
 
+/// Pre-registers `identities` in slot order, so each client's execution-local ordinal is also
+/// its slot. `a_pre_registered_client_owns_the_slot_it_names_not_its_position` covers the case
+/// where the two differ.
+fn in_slot_order(identities: Vec<Vec<u8>>) -> Vec<PreRegisteredClient> {
+    identities
+        .into_iter()
+        .enumerate()
+        .map(|(slot, identity)| PreRegisteredClient {
+            identity,
+            client_slot: ClientIndex(slot as u32),
+        })
+        .collect()
+}
+
 fn pre_registered(
     execution_id: ExecutionId,
     slots: Vec<ClientSlotSpec>,
@@ -185,24 +233,25 @@ fn pre_registered(
         execution_id,
         slots,
         AdmissionPolicy::PreRegistered {
-            clients: clients.iter().map(|cert| identity_of(cert)).collect(),
+            clients: in_slot_order(clients.iter().map(|cert| identity_of(cert)).collect()),
         },
         None,
     )
 }
 
+/// A coordinator serving `registration` under the identity the test named for it.
 fn coordinator_state(
     t: u64,
     nodes: &[Certified],
     coordinator: &Certified,
     registration: ExecutionRegistration,
 ) -> HoneyBadgerCoordinatorRPCServerSharedBase {
-    HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
-        roster_of(t, nodes),
-        spki_of(coordinator),
-        registration,
-    )
-    .unwrap()
+    let mut state =
+        HoneyBadgerCoordinatorRPCServerSharedBase::new(roster_of(t, nodes), spki_of(coordinator));
+    state
+        .register_execution_at(registration.execution_id, registration.request)
+        .unwrap();
+    state
 }
 
 async fn start_coordinator(
@@ -544,24 +593,25 @@ fn rejects_invalid_mpc_rosters() {
     );
 
     let coordinator = server_cert();
+    let mut zero_entry = empty_request();
+    zero_entry.entry = String::new();
     assert!(matches!(
         HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
             roster_of(1, &certs),
             spki_of(&coordinator),
-            empty_registration(ExecutionId::from_bytes([0; 32])),
+            zero_entry,
         ),
         Err(CoordinatorError::Registration(
-            RegistrationError::ZeroExecutionId
+            RegistrationError::EmptyEntry
         ))
     ));
-    assert!(
-        HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
-            roster_of(1, &certs),
-            spki_of(&coordinator),
-            empty_registration(ExecutionId::from_bytes([1; 32])),
-        )
-        .is_ok()
-    );
+    let (_, registered) = HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
+        roster_of(1, &certs),
+        spki_of(&coordinator),
+        empty_request(),
+    )
+    .unwrap();
+    assert!(!registered.execution_id.is_zero());
 }
 
 #[tokio::test]
@@ -581,10 +631,13 @@ async fn one_listener_isolates_and_retires_concurrent_executions() {
             .state()
             .lock()
             .await
-            .register_execution(ExecutionRegistration {
-                program_hash,
-                ..empty_registration(execution_id)
-            })
+            .register_execution_at(
+                execution_id,
+                ExecutionRequest {
+                    program_hash,
+                    ..empty_request()
+                },
+            )
             .unwrap();
     }
     let first = connect_all(first_id, port, &coordinator, &nodes).await;
@@ -916,10 +969,9 @@ async fn retirement_drains_healthy_stragglers_without_pinning_capacity() {
         empty_registration(ExecutionId::from_bytes(bytes))
     };
     for number in 1..DEFAULT_MAX_CONCURRENT_EXECUTIONS {
-        state.register_execution(numbered(number)).unwrap();
+        register(&mut state, numbered(number)).unwrap();
     }
-    state
-        .register_execution(numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS))
+    register(&mut state, numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS))
         .expect("capacity pressure must compact a quorum-retired execution");
     assert!(
         state.round(execution_id).is_none(),
@@ -1064,12 +1116,11 @@ async fn the_node_roster_is_identical_across_calls_for_the_process_lifetime() {
 
     // Protocol activity — registrations and transitions — leaves the roster untouched.
     let coords = connect_all(execution_id, port, &coordinator, &nodes).await;
-    server
-        .state()
-        .lock()
-        .await
-        .register_execution(empty_registration(execution(0x73)))
-        .unwrap();
+    register(
+        &mut *server.state().lock().await,
+        empty_registration(execution(0x73)),
+    )
+    .unwrap();
     propose_round(&coords, Round::Preprocessing).await;
     coords[0]
         .wait_for_round(Round::Preprocessing)
@@ -1111,10 +1162,10 @@ async fn roster_reads_are_rate_limited_per_caller_identity() {
 
     let reader = client_cert();
     let first = raw_client(port, &coordinator, &reader).await;
-    for _ in 0..SUMMARY_READ_BURST {
+    for read in 0..ROSTER_READ_BURST {
         CoordinatorRPCBaseClient::get_node_roster(&first)
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("roster read {read} of the burst: {error}"));
     }
     let limited = CoordinatorRPCBaseClient::get_node_roster(&first).await;
     assert_eq!(
@@ -1935,20 +1986,26 @@ async fn registration_checks_state_in_order_and_never_evicts_for_a_refused_one()
         AdmissionPolicy::Open,
         deadlines_in(1, 600),
     );
-    let nonce = state.register_execution(live.clone()).unwrap();
+    let nonce = register(&mut state, live.clone()).unwrap();
     tokio::time::sleep(Duration::from_millis(2_100)).await;
     assert!(matches!(
         live.validate(UnixSeconds::now()),
         Err(RegistrationError::DeadlineElapsed { .. })
     ));
-    assert_eq!(state.register_execution(live.clone()).unwrap(), nonce);
+    assert_eq!(register(&mut state, live.clone()).unwrap(), nonce);
 
     // A different registration of the live id conflicts.
     assert!(matches!(
-        state.register_execution(ExecutionRegistration {
-            program_hash: [2; 32],
-            ..live.clone()
-        }),
+        register(
+            &mut state,
+            ExecutionRegistration {
+                request: ExecutionRequest {
+                    program_hash: [2; 32],
+                    ..live.request.clone()
+                },
+                ..live.clone()
+            }
+        ),
         Err(CoordinatorError::Registration(
             RegistrationError::ConflictingRegistration { .. }
         ))
@@ -1956,7 +2013,7 @@ async fn registration_checks_state_in_order_and_never_evicts_for_a_refused_one()
 
     // An ended id is retired, whatever the registration.
     let ended = empty_registration(execution(0x82));
-    state.register_execution(ended.clone()).unwrap();
+    register(&mut state, ended.clone()).unwrap();
     for node in &nodes {
         state
             .retire_execution(ended.execution_id, &identity_of(node))
@@ -1964,7 +2021,7 @@ async fn registration_checks_state_in_order_and_never_evicts_for_a_refused_one()
     }
     assert_eq!(state.round(ended.execution_id), None);
     assert!(matches!(
-        state.register_execution(ended),
+        register(&mut state, ended),
         Err(CoordinatorError::Registration(
             RegistrationError::ExecutionIdRetired { .. }
         ))
@@ -1978,7 +2035,7 @@ async fn registration_checks_state_in_order_and_never_evicts_for_a_refused_one()
         empty_registration(ExecutionId::from_bytes(bytes))
     };
     for number in 1..DEFAULT_MAX_CONCURRENT_EXECUTIONS {
-        state.register_execution(numbered(number)).unwrap();
+        register(&mut state, numbered(number)).unwrap();
     }
     let evictable = numbered(1).execution_id;
     for node in nodes.iter().take(3) {
@@ -1988,10 +2045,16 @@ async fn registration_checks_state_in_order_and_never_evicts_for_a_refused_one()
     }
     assert!(state.is_retired(evictable));
     assert!(matches!(
-        state.register_execution(ExecutionRegistration {
-            program_hash: [0; 32],
-            ..numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS)
-        }),
+        register(
+            &mut state,
+            ExecutionRegistration {
+                request: ExecutionRequest {
+                    program_hash: [0; 32],
+                    ..empty_request()
+                },
+                ..numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS)
+            }
+        ),
         Err(CoordinatorError::Registration(
             RegistrationError::ZeroProgramHash
         ))
@@ -2000,14 +2063,12 @@ async fn registration_checks_state_in_order_and_never_evicts_for_a_refused_one()
         state.round(evictable).is_some(),
         "a refused registration never evicts"
     );
-    state
-        .register_execution(numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS))
-        .unwrap();
+    register(&mut state, numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS)).unwrap();
     assert_eq!(state.round(evictable), None);
 
     // With nothing evictable, capacity is reached.
     assert!(matches!(
-        state.register_execution(numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS + 1)),
+        register(&mut state, numbered(DEFAULT_MAX_CONCURRENT_EXECUTIONS + 1)),
         Err(CoordinatorError::Registration(
             RegistrationError::ExecutionCapacityReached { .. }
         ))
@@ -2054,25 +2115,30 @@ async fn summary_reads_are_rate_limited_per_identity() {
     let reader = client_cert();
     let raw = harness.raw(&reader).await;
 
-    // Both read methods draw on one bucket.
+    // The two read methods draw on separate buckets: a summary read is a walk of one
+    // execution's state that a caller chooses to make, while a roster read is what every
+    // link open costs, so spending one must not spend the other.
     for call in 0..SUMMARY_READ_BURST {
-        if call % 2 == 0 {
-            CoordinatorRPCBaseClient::get_execution_summary(&raw, execution_id)
-                .await
-                .unwrap();
-        } else {
-            CoordinatorRPCBaseClient::get_node_roster(&raw)
-                .await
-                .unwrap();
-        }
+        CoordinatorRPCBaseClient::get_execution_summary(&raw, execution_id)
+            .await
+            .unwrap_or_else(|error| panic!("summary read {call} of the burst: {error}"));
     }
     assert_eq!(
         call_code(CoordinatorRPCBaseClient::get_execution_summary(&raw, execution_id).await),
         41
     );
+    CoordinatorRPCBaseClient::get_node_roster(&raw)
+        .await
+        .expect("an empty summary bucket does not refuse a roster read");
+    for read in 1..ROSTER_READ_BURST {
+        CoordinatorRPCBaseClient::get_node_roster(&raw)
+            .await
+            .unwrap_or_else(|error| panic!("roster read {read} of the burst: {error}"));
+    }
     assert_eq!(
         call_code(CoordinatorRPCBaseClient::get_node_roster(&raw).await),
-        41
+        41,
+        "the roster bucket is separate, not absent"
     );
 
     // Another identity is unaffected.
@@ -2149,6 +2215,61 @@ async fn pre_registered_admission_binds_only_the_registered_identities() {
     assert_eq!(
         state.capacity_class(&identity_of(&client_cert())),
         stoffel_mpc_coordinator_shared::rpc::CapacityClass::Unreserved
+    );
+}
+
+/// A registration lists its pre-registered clients in the order the node will number them, which
+/// need not be slot order: `clients[i]` is client ordinal `i`, and the slot it owns — its input
+/// range and its output rights — is the one it names.
+#[tokio::test]
+async fn a_pre_registered_client_owns_the_slot_it_names_not_its_position() {
+    let first = client_cert();
+    let second = client_cert();
+    let execution_id = execution(0x86);
+    // Ordinal 0 owns slot 1, ordinal 1 owns slot 0.
+    let registration = registration(
+        execution_id,
+        vec![slot(2, 1), slot(1, 0)],
+        AdmissionPolicy::PreRegistered {
+            clients: vec![
+                PreRegisteredClient {
+                    identity: identity_of(&first),
+                    client_slot: ClientIndex(1),
+                },
+                PreRegisteredClient {
+                    identity: identity_of(&second),
+                    client_slot: ClientIndex(0),
+                },
+            ],
+        },
+        None,
+    );
+    let harness = Harness::start(registration).await;
+
+    let mut first_client = harness.client(&first).await;
+    assert_eq!(
+        first_client.associate_client(open_request()).await.unwrap(),
+        ClientAdmission {
+            execution_id,
+            client_index: ClientIndex(1),
+            input_range: Some(range(2, 1)),
+            output_rights: OutputRights::None,
+        },
+        "the client at ordinal 0 holds slot 1's one input and no outputs"
+    );
+    let mut second_client = harness.client(&second).await;
+    assert_eq!(
+        second_client
+            .associate_client(open_request())
+            .await
+            .unwrap(),
+        ClientAdmission {
+            execution_id,
+            client_index: ClientIndex(0),
+            input_range: Some(range(0, 2)),
+            output_rights: receive(1),
+        },
+        "the client at ordinal 1 holds slot 0's two inputs and its output"
     );
 }
 
@@ -3248,7 +3369,7 @@ async fn an_unbound_slot_at_the_association_deadline_aborts_the_execution() {
         AdmissionPolicy::Open,
         deadlines_in(2, 600),
     );
-    let deadline = registration.deadlines.unwrap().association;
+    let deadline = registration.request.deadlines.unwrap().association;
     let harness = Harness::start(registration.clone()).await;
     let node_raw = harness.raw(&harness.nodes[0]).await;
     let mut waiter =
@@ -3308,7 +3429,7 @@ async fn an_unbound_slot_at_the_association_deadline_aborts_the_execution() {
         empty_registration(ExecutionId::from_bytes(bytes))
     };
     for number in 1..=DEFAULT_MAX_CONCURRENT_EXECUTIONS {
-        state.register_execution(numbered(number)).unwrap();
+        register(&mut state, numbered(number)).unwrap();
     }
     assert_eq!(state.round(execution_id), None);
     assert_eq!(
@@ -3316,7 +3437,7 @@ async fn an_unbound_slot_at_the_association_deadline_aborts_the_execution() {
         Some(ExecutionOutcome::Aborted(expected))
     );
     assert!(matches!(
-        state.register_execution(registration),
+        register(&mut state, registration),
         Err(CoordinatorError::Registration(
             RegistrationError::ExecutionIdRetired { .. }
         ))
@@ -3390,11 +3511,11 @@ async fn a_missing_input_at_the_input_deadline_aborts_the_execution() {
         execution_id,
         vec![slot(1, 0)],
         AdmissionPolicy::PreRegistered {
-            clients: vec![identity_of(&client)],
+            clients: in_slot_order(vec![identity_of(&client)]),
         },
         deadlines_in(1, 3),
     );
-    let deadline = registration.deadlines.unwrap().input;
+    let deadline = registration.request.deadlines.unwrap().input;
     let harness = Harness::start(registration).await;
     harness.advance(Round::Preprocessing).await;
     harness.advance(Round::InputMaskReservation).await;
@@ -3425,11 +3546,11 @@ async fn an_input_deadline_with_every_input_present_does_not_abort() {
         execution_id,
         vec![slot(1, 0)],
         AdmissionPolicy::PreRegistered {
-            clients: vec![identity_of(&client_cert)],
+            clients: in_slot_order(vec![identity_of(&client_cert)]),
         },
         deadlines_in(2, 3),
     );
-    let input_deadline = registration.deadlines.unwrap().input;
+    let input_deadline = registration.request.deadlines.unwrap().input;
     let harness = Harness::start(registration).await;
     let mut client = harness.client(&client_cert).await;
     client.associate_client(open_request()).await.unwrap();
@@ -3463,11 +3584,11 @@ async fn an_abort_reaches_sinks_a_broadcast_holds_and_subscriptions_between_acce
         execution_id,
         vec![slot(1, 0), slot(1, 0)],
         AdmissionPolicy::PreRegistered {
-            clients: vec![identity_of(&submitter), identity_of(&absent)],
+            clients: in_slot_order(vec![identity_of(&submitter), identity_of(&absent)]),
         },
         deadlines_in(2, 3),
     );
-    let input_deadline = registration.deadlines.unwrap().input;
+    let input_deadline = registration.request.deadlines.unwrap().input;
     let hooks = DeliveryHooks {
         during_masked_input_broadcast: Some(broadcast.clone()),
         ..DeliveryHooks::default()
@@ -3611,12 +3732,7 @@ async fn an_ended_execution_stays_refused_after_unanimous_retirement() {
         .await
         .expect("acknowledging an ended execution stays a success");
     assert!(matches!(
-        harness
-            .server
-            .state()
-            .lock()
-            .await
-            .register_execution(registration),
+        register(&mut *harness.server.state().lock().await, registration),
         Err(CoordinatorError::Registration(
             RegistrationError::ExecutionIdRetired { .. }
         ))
@@ -3624,13 +3740,11 @@ async fn an_ended_execution_stays_refused_after_unanimous_retirement() {
 
     // A normal finish.
     let finished_id = execution(0xa5);
-    harness
-        .server
-        .state()
-        .lock()
-        .await
-        .register_execution(empty_registration(finished_id))
-        .unwrap();
+    register(
+        &mut *harness.server.state().lock().await,
+        empty_registration(finished_id),
+    )
+    .unwrap();
     let finished = connect_all(
         finished_id,
         harness.port,
@@ -3653,12 +3767,10 @@ async fn an_ended_execution_stays_refused_after_unanimous_retirement() {
         RpcRefusal::ExecutionNotFound
     );
     assert!(matches!(
-        harness
-            .server
-            .state()
-            .lock()
-            .await
-            .register_execution(empty_registration(finished_id)),
+        register(
+            &mut *harness.server.state().lock().await,
+            empty_registration(finished_id)
+        ),
         Err(CoordinatorError::Registration(
             RegistrationError::ExecutionIdRetired { .. }
         ))
@@ -3676,7 +3788,7 @@ async fn an_ended_execution_stays_refused_after_unanimous_retirement() {
     };
     let end = |state: &mut CoordinatorRPCServerSharedBase, number: usize| {
         let registration = numbered(number);
-        state.register_execution(registration.clone()).unwrap();
+        register(state, registration.clone()).unwrap();
         for node in &nodes {
             state
                 .retire_execution(registration.execution_id, &identity_of(node))
@@ -3686,16 +3798,14 @@ async fn an_ended_execution_stays_refused_after_unanimous_retirement() {
     for number in 0..DEFAULT_MAX_ENDED_EXECUTIONS {
         end(&mut state, number);
     }
-    assert!(state.register_execution(numbered(0)).is_err());
+    assert!(register(&mut state, numbered(0)).is_err());
     end(&mut state, DEFAULT_MAX_ENDED_EXECUTIONS);
     assert_eq!(state.ended_outcome(numbered(0).execution_id), None);
     assert_eq!(
         state.ended_outcome(numbered(1).execution_id),
         Some(ExecutionOutcome::Finished)
     );
-    state
-        .register_execution(numbered(0))
-        .expect("the forgotten id registers again");
+    register(&mut state, numbered(0)).expect("the forgotten id registers again");
 }
 
 #[tokio::test]
@@ -4155,13 +4265,11 @@ async fn no_subscriber_holds_the_state_mutex_or_another_subscriber() {
     ))
     .await;
     let other_id = execution(0xb1);
-    harness
-        .server
-        .state()
-        .lock()
-        .await
-        .register_execution(open_registration(other_id, vec![slot(1, 0)]))
-        .unwrap();
+    register(
+        &mut *harness.server.state().lock().await,
+        open_registration(other_id, vec![slot(1, 0)]),
+    )
+    .unwrap();
 
     let mut clients = Vec::new();
     for _ in 0..SLOTS {
@@ -4494,7 +4602,7 @@ async fn open_admission_end_to_end_with_a_client_minted_at_test_time() {
     // Only now is the client's certificate minted: it cannot appear in any registration field.
     let client = client_cert();
     let identity = identity_of(&client);
-    let AdmissionPolicy::Open = &registration.admission else {
+    let AdmissionPolicy::Open = &registration.request.admission else {
         panic!("the registration is open");
     };
     assert!(!format!("{registration:?}").contains(&format!("{identity:?}")));
@@ -4530,4 +4638,743 @@ async fn open_admission_end_to_end_with_a_client_minted_at_test_time() {
     while let Some(node) = nodes.join_next().await {
         node.unwrap().unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Minting and publication
+// ---------------------------------------------------------------------------------------------
+
+/// The next notice on `stream`, which must arrive within `PUBLICATION_WAIT`.
+async fn next_notice(stream: &mut Subscription<ExecutionNotice>) -> ExecutionNotice {
+    tokio::time::timeout(PUBLICATION_WAIT, stream.next())
+        .await
+        .expect("a published notice must reach a subscribed node")
+        .expect("the subscription must not end")
+        .expect("a notice must deserialize")
+}
+
+const PUBLICATION_WAIT: Duration = Duration::from_secs(5);
+
+/// Consumes the notice that closes a subscription's opening snapshot, answering the run of the
+/// coordinator it names.
+async fn expect_snapshot_complete(
+    stream: &mut Subscription<ExecutionNotice>,
+) -> CoordinatorIncarnation {
+    match next_notice(stream).await {
+        ExecutionNotice::SnapshotComplete { incarnation } => incarnation,
+        other => {
+            panic!("every subscription's snapshot is closed by SnapshotComplete, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_snapshot_names_the_run_of_the_coordinator_that_took_it() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let _server = start_coordinator(state, port, &coordinator).await;
+
+    let link = node_link(&nodes[0], port, &coordinator).await;
+    let mut first = link.subscribe_executions().await.unwrap();
+    let one = expect_snapshot_complete(&mut first).await;
+    let mut second = link.subscribe_executions().await.unwrap();
+    assert_eq!(
+        expect_snapshot_complete(&mut second).await,
+        one,
+        "every snapshot one run of the coordinator takes names that run"
+    );
+
+    // A restarted coordinator: fresh state, and so no memory of any execution it admitted
+    // before. Its snapshot names nothing, and a node that could not tell it apart from a
+    // snapshot of its own admissions would stop every instance it is running.
+    let restarted_port = free_port();
+    let restarted =
+        CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let _restarted_server = start_coordinator(restarted, restarted_port, &coordinator).await;
+    let restarted_link = node_link(&nodes[0], restarted_port, &coordinator).await;
+    let mut third = restarted_link.subscribe_executions().await.unwrap();
+    assert_ne!(
+        expect_snapshot_complete(&mut third).await,
+        one,
+        "a restarted coordinator must be distinguishable from the one that admitted the \
+         instances a node is running"
+    );
+}
+
+/// A non-node's link to the coordinator at `port`: an operator, or a stranger.
+async fn client_link(client: &Certified, port: u16, coordinator: &Certified) -> CoordinatorLink {
+    let (cert_der, key_der) = cert_parts(client);
+    CoordinatorLink::connect(ADDR, port, &spki_of(coordinator), None, cert_der, key_der)
+        .await
+        .unwrap()
+}
+
+/// A node's link to the coordinator at `port`.
+async fn node_link(node: &Certified, port: u16, coordinator: &Certified) -> CoordinatorLink {
+    let (cert_der, key_der) = cert_parts(node);
+    CoordinatorLink::connect(ADDR, port, &spki_of(coordinator), None, cert_der, key_der)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn registering_mints_an_identity_the_operator_never_supplies() {
+    let nodes = node_certs(4);
+    let mut state =
+        CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&server_cert()));
+
+    let first = state.register_execution(empty_request()).unwrap();
+    let second = state.register_execution(empty_request()).unwrap();
+    assert!(!first.execution_id.is_zero());
+    assert!(!second.execution_id.is_zero());
+    assert_ne!(
+        first.execution_id, second.execution_id,
+        "two registrations of the same request are two executions"
+    );
+    assert_ne!(first.registration_nonce, second.registration_nonce);
+
+    // The registration answers the identity it minted, and that identity is the live one.
+    assert_eq!(state.round(first.execution_id), Some(Round::Idle));
+    assert_eq!(
+        state.registration_nonce(first.execution_id),
+        Some(first.registration_nonce)
+    );
+
+    // A request that fails validation mints nothing.
+    let mut nameless = empty_request();
+    nameless.entry = String::new();
+    assert!(matches!(
+        state.register_execution(nameless),
+        Err(CoordinatorError::Registration(
+            RegistrationError::EmptyEntry
+        ))
+    ));
+    let mut overlong = empty_request();
+    overlong.entry = "e".repeat(257);
+    assert!(matches!(
+        state.register_execution(overlong),
+        Err(CoordinatorError::Registration(
+            RegistrationError::EntryTooLong { bytes: 257, .. }
+        ))
+    ));
+
+    // A minted identity is single use for this coordinator's memory: once the execution has
+    // ended, that identity is refused however it is presented again.
+    for node in &nodes {
+        state
+            .retire_execution(first.execution_id, &identity_of(node))
+            .unwrap();
+    }
+    assert_eq!(state.round(first.execution_id), None);
+    assert!(matches!(
+        state.register_execution_at(first.execution_id, empty_request()),
+        Err(CoordinatorError::Registration(
+            RegistrationError::ExecutionIdRetired { .. }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn the_coordinator_publishes_minted_executions_to_the_roster() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let port = free_port();
+    // No execution exists when the listener starts: a standing coordinator is told what to run
+    // while it is running.
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let server = start_coordinator(state, port, &coordinator).await;
+
+    // A node that subscribes before anything is registered waits, rather than being refused.
+    let early_link = node_link(&nodes[0], port, &coordinator).await;
+    let mut early = early_link.subscribe_executions().await.unwrap();
+    expect_snapshot_complete(&mut early).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), early.next())
+            .await
+            .is_err(),
+        "an idle coordinator publishes nothing"
+    );
+
+    // Registering publishes the minted identity, with everything the node needs to run it.
+    let requested = request(
+        vec![slot(1, 1), slot(2, 0)],
+        AdmissionPolicy::Open,
+        deadlines_in(600, 1200),
+    );
+    let registered = server
+        .state()
+        .lock()
+        .await
+        .register_execution(requested.clone())
+        .unwrap();
+    assert_eq!(
+        next_notice(&mut early).await,
+        ExecutionNotice::Prepare(PublishedExecution {
+            registration: ExecutionRegistration {
+                execution_id: registered.execution_id,
+                request: requested.clone(),
+            },
+            registration_nonce: registered.registration_nonce,
+        }),
+    );
+
+    // A node that subscribes afterwards is told at once: the snapshot covers every execution
+    // registered before it connected.
+    let late_link = node_link(&nodes[1], port, &coordinator).await;
+    let mut late = late_link.subscribe_executions().await.unwrap();
+    let ExecutionNotice::Prepare(published) = next_notice(&mut late).await else {
+        panic!("a runnable execution is published as Prepare");
+    };
+    assert_eq!(published.registration.execution_id, registered.execution_id);
+    assert_eq!(published.registration.request.entry, "main");
+    assert_eq!(published.registration.request, requested);
+    expect_snapshot_complete(&mut late).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), late.next())
+            .await
+            .is_err(),
+        "a snapshot publishes each execution once"
+    );
+
+    // A second execution reaches both subscribers, in publication order.
+    let second = server
+        .state()
+        .lock()
+        .await
+        .register_execution(empty_request())
+        .unwrap();
+    for stream in [&mut early, &mut late] {
+        let ExecutionNotice::Prepare(published) = next_notice(stream).await else {
+            panic!("a newly registered execution is published as Prepare");
+        };
+        assert_eq!(published.registration.execution_id, second.execution_id);
+    }
+
+    // Retirement reaches every subscriber, once the roster has unanimously acknowledged it and
+    // the coordinator has forgotten its protocol state.
+    {
+        let state = server.state();
+        let mut shared = state.lock().await;
+        for node in &nodes {
+            shared
+                .retire_execution(second.execution_id, &identity_of(node))
+                .unwrap();
+        }
+    }
+    for stream in [&mut early, &mut late] {
+        assert_eq!(
+            next_notice(stream).await,
+            ExecutionNotice::Cancel {
+                execution_id: second.execution_id,
+                outcome: ExecutionOutcome::Finished,
+            },
+        );
+    }
+
+    // An execution that has ended is not runnable, so it is absent from a later snapshot.
+    let newcomer_link = node_link(&nodes[2], port, &coordinator).await;
+    let mut newcomer = newcomer_link.subscribe_executions().await.unwrap();
+    let ExecutionNotice::Prepare(published) = next_notice(&mut newcomer).await else {
+        panic!("the live execution is still published");
+    };
+    assert_eq!(published.registration.execution_id, registered.execution_id);
+    expect_snapshot_complete(&mut newcomer).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), newcomer.next())
+            .await
+            .is_err(),
+        "a retired execution is never published as runnable"
+    );
+
+    // An identity that is not on the roster is refused, as it is for every other node-only
+    // method.
+    let stranger = client_cert();
+    let stranger_link = node_link(&stranger, port, &coordinator).await;
+    let refusal = stranger_link
+        .subscribe_executions()
+        .await
+        .expect_err("only roster nodes learn what to run");
+    assert!(
+        format!("{refusal}").contains("Only roster nodes can subscribe to executions"),
+        "unexpected refusal: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn an_abort_cancels_the_execution_on_every_node_running_it() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let server = start_coordinator(state, port, &coordinator).await;
+
+    let link = node_link(&nodes[0], port, &coordinator).await;
+    let mut stream = link.subscribe_executions().await.unwrap();
+    expect_snapshot_complete(&mut stream).await;
+
+    // Open admission with an association deadline nothing will meet: the sweeper aborts the
+    // execution while the roster is still running it.
+    let requested = request(
+        vec![slot(1, 0)],
+        AdmissionPolicy::Open,
+        deadlines_in(2, 600),
+    );
+    let deadline = requested.deadlines.unwrap().association;
+    let registered = server
+        .state()
+        .lock()
+        .await
+        .register_execution(requested)
+        .unwrap();
+    let ExecutionNotice::Prepare(published) = next_notice(&mut stream).await else {
+        panic!("the execution is published before it aborts");
+    };
+    assert_eq!(published.registration.execution_id, registered.execution_id);
+
+    assert_eq!(
+        next_notice(&mut stream).await,
+        ExecutionNotice::Cancel {
+            execution_id: registered.execution_id,
+            outcome: ExecutionOutcome::Aborted(AbortReason::AssociationDeadline {
+                deadline,
+                unbound_slots: 1,
+            }),
+        },
+    );
+
+    // The abort published the cancellation once; removing the aborted execution does not
+    // publish it again.
+    {
+        let state = server.state();
+        let mut shared = state.lock().await;
+        for node in &nodes {
+            shared
+                .retire_execution(registered.execution_id, &identity_of(node))
+                .unwrap();
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .is_err(),
+        "one execution is cancelled once"
+    );
+}
+
+/// A `Cancel` is the one notice an ended stream can swallow, so the snapshot has to be
+/// authoritative in both directions: a node that resubscribes while it is still running an
+/// execution the coordinator has since forgotten is told nothing about it, and must read its
+/// absence from the snapshot as the cancellation it missed.
+#[tokio::test]
+async fn a_fresh_snapshot_tells_a_node_which_of_its_running_executions_to_stop() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let server = start_coordinator(state, port, &coordinator).await;
+
+    let (live, doomed) = {
+        let state = server.state();
+        let mut shared = state.lock().await;
+        (
+            shared.register_execution(empty_request()).unwrap(),
+            shared.register_execution(empty_request()).unwrap(),
+        )
+    };
+
+    // The node learns of both and starts running both.
+    let link = node_link(&nodes[0], port, &coordinator).await;
+    let mut stream = link.subscribe_executions().await.unwrap();
+    let mut running = HashSet::new();
+    for _ in 0..2 {
+        let ExecutionNotice::Prepare(published) = next_notice(&mut stream).await else {
+            panic!("both runnable executions are published");
+        };
+        running.insert(published.registration.execution_id);
+    }
+    expect_snapshot_complete(&mut stream).await;
+    assert_eq!(
+        running,
+        HashSet::from([live.execution_id, doomed.execution_id])
+    );
+
+    // Its stream ends, and one of the two is cancelled while it has none: this is the Cancel a
+    // full connection queue drops, and nothing redelivers it.
+    drop(stream);
+    {
+        let state = server.state();
+        let mut shared = state.lock().await;
+        for node in &nodes {
+            shared
+                .retire_execution(doomed.execution_id, &identity_of(node))
+                .unwrap();
+        }
+    }
+
+    // Resubscribing recovers it: the snapshot names the live execution and not the other, so
+    // the diff against what the node is running is exactly the lost cancellation.
+    let mut stream = link.subscribe_executions().await.unwrap();
+    let ExecutionNotice::Prepare(published) = next_notice(&mut stream).await else {
+        panic!("the live execution is still runnable");
+    };
+    assert_eq!(published.registration.execution_id, live.execution_id);
+    expect_snapshot_complete(&mut stream).await;
+    let snapshot = HashSet::from([published.registration.execution_id]);
+    assert_eq!(
+        running.difference(&snapshot).copied().collect::<Vec<_>>(),
+        vec![doomed.execution_id],
+        "the snapshot's omission is the cancellation the ended stream never delivered"
+    );
+}
+
+/// Omission in the snapshot is an order to stop, so the snapshot must never omit a straggler's
+/// own unfinished execution. A quorum of fast parties can acknowledge an execution and drive it
+/// to a terminal round while the last party is still working, and the coordinator deliberately
+/// keeps the whole round history live for exactly that party. Telling it to stop would abandon
+/// work the coordinator is still waiting for.
+#[tokio::test]
+async fn a_terminal_quorum_retired_execution_is_still_published_to_the_party_still_running_it() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    // n = 5, t = 1: the retirement quorum is four and the transition quorum is three.
+    let nodes = node_certs(5);
+    let coordinator = server_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let server = start_coordinator(state, port, &coordinator).await;
+
+    let registered = {
+        let state = server.state();
+        let mut shared = state.lock().await;
+        shared.register_execution(empty_request()).unwrap()
+    };
+
+    // Three fast parties drive it to ProgramFinished, and four acknowledge it. The fifth has
+    // acknowledged nothing: it is the healthy straggler.
+    let coords = connect_all(registered.execution_id, port, &coordinator, &nodes).await;
+    for round in [
+        Round::Preprocessing,
+        Round::MPCExecution,
+        Round::OutputDistribution,
+        Round::ProgramFinished,
+    ] {
+        for coord in coords.iter().take(3) {
+            coord.trigger_round(round).await.unwrap();
+        }
+    }
+    coords[0]
+        .wait_for_round(Round::ProgramFinished)
+        .await
+        .unwrap();
+    for coord in coords.iter().take(4) {
+        coord.retire_execution().await.unwrap();
+    }
+    {
+        let state = server.state();
+        let shared = state.lock().await;
+        assert!(
+            shared.is_retired(registered.execution_id),
+            "four of five acknowledgements reach the retirement quorum"
+        );
+        assert_eq!(
+            shared.round(registered.execution_id),
+            Some(Round::ProgramFinished),
+            "the round history stays live for the straggler"
+        );
+    }
+
+    // The straggler resubscribes and is still told to run it.
+    let straggler = node_link(&nodes[4], port, &coordinator).await;
+    let mut stream = straggler.subscribe_executions().await.unwrap();
+    let ExecutionNotice::Prepare(published) = next_notice(&mut stream).await else {
+        panic!("the straggler's own unfinished execution must still be published to it");
+    };
+    assert_eq!(published.registration.execution_id, registered.execution_id);
+    expect_snapshot_complete(&mut stream).await;
+
+    // A party that acknowledged it is finished with it, and its snapshot says so.
+    let finished = node_link(&nodes[0], port, &coordinator).await;
+    let mut stream = finished.subscribe_executions().await.unwrap();
+    expect_snapshot_complete(&mut stream).await;
+}
+
+#[tokio::test]
+async fn a_stalled_node_never_blocks_publication_or_another_node() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let server = start_coordinator(state, port, &coordinator).await;
+
+    // One node subscribes and never reads, so the coordinator's queue for it fills.
+    let _stalled = stalled_subscriber(
+        port,
+        &coordinator,
+        &nodes[0],
+        "sub_executions",
+        serde_json::json!([]),
+    )
+    .await;
+    let link = node_link(&nodes[1], port, &coordinator).await;
+    let mut reader = link.subscribe_executions().await.unwrap();
+    expect_snapshot_complete(&mut reader).await;
+
+    // Well past the per-connection message buffer, so the stalled node's queue fills and it is
+    // dropped. Publication never waits on a subscriber, so every registration still completes
+    // and the reading node receives every one of them, in publication order.
+    const REGISTRATIONS: usize = 40;
+    for _ in 0..REGISTRATIONS {
+        let expected = {
+            let state = server.state();
+            let mut shared = tokio::time::timeout(Duration::from_secs(2), state.lock())
+                .await
+                .expect("a stalled subscriber never holds the state mutex");
+            shared
+                .register_execution(empty_request())
+                .unwrap()
+                .execution_id
+        };
+        let ExecutionNotice::Prepare(published) = next_notice(&mut reader).await else {
+            panic!("every registration is published as Prepare");
+        };
+        assert_eq!(published.registration.execution_id, expected);
+    }
+}
+
+/// The mounted control directory a standing node used to read its commands from had the
+/// filesystem as its authorization boundary: whoever could write the mount could admit an
+/// execution and name its clients. The coordinator carries that authority now, and the
+/// certificate an operator opens its link with is the whole gate. These tests pin that the gate
+/// exists, that it is closed by default, and that being a roster node does not open it.
+#[tokio::test]
+async fn only_an_operator_can_tell_the_coordinator_what_to_run() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let operator = client_cert();
+    let stranger = client_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator))
+        .with_operators(vec![caller_identity(operator.cert.der()).unwrap()]);
+    let _server = start_coordinator(state, port, &coordinator).await;
+
+    // A roster node subscribes, so it sees what the operator submits.
+    let node = node_link(&nodes[0], port, &coordinator).await;
+    let mut stream = node.subscribe_executions().await.unwrap();
+    expect_snapshot_complete(&mut stream).await;
+
+    // An identity that holds no operator certificate is refused, and so is a roster node: being
+    // trusted to run executions is not being trusted to choose them.
+    for (who, link) in [
+        (
+            "a stranger",
+            client_link(&stranger, port, &coordinator).await,
+        ),
+        (
+            "a roster node",
+            node_link(&nodes[1], port, &coordinator).await,
+        ),
+    ] {
+        let refused = link.submit_execution(empty_request()).await.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                CoordinatorError::Refused {
+                    refusal: RpcRefusal::NotOperator,
+                    ..
+                }
+            ),
+            "{who} must not be able to submit an execution, got {refused:?}"
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .is_err(),
+        "a refused submission publishes nothing"
+    );
+
+    // The operator submits, and never names an identity: the coordinator mints it and the node
+    // is told about it on the stream it already holds.
+    let operator_link = client_link(&operator, port, &coordinator).await;
+    let requested = request(
+        vec![slot(1, 1)],
+        AdmissionPolicy::Open,
+        deadlines_in(600, 1200),
+    );
+    let submitted = operator_link
+        .submit_execution(requested.clone())
+        .await
+        .unwrap();
+    assert!(!submitted.execution_id.is_zero());
+    assert_eq!(
+        next_notice(&mut stream).await,
+        ExecutionNotice::Prepare(PublishedExecution {
+            registration: ExecutionRegistration {
+                execution_id: submitted.execution_id,
+                request: requested,
+            },
+            registration_nonce: submitted.registration_nonce,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn a_coordinator_with_no_operator_accepts_no_submission() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let port = free_port();
+    // No `with_operators`: forgetting to configure one must be a closed door, not an open one.
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator));
+    let _server = start_coordinator(state, port, &coordinator).await;
+
+    let refused = client_link(&client_cert(), port, &coordinator)
+        .await
+        .submit_execution(empty_request())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            CoordinatorError::Refused {
+                refusal: RpcRefusal::NotOperator,
+                ..
+            }
+        ),
+        "unexpected refusal: {refused:?}"
+    );
+    // Nothing was registered, so a node that subscribes now is handed an empty snapshot.
+    let node = node_link(&nodes[0], port, &coordinator).await;
+    let mut stream = node.subscribe_executions().await.unwrap();
+    expect_snapshot_complete(&mut stream).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .is_err(),
+        "a refused submission registered nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_operator_abort_stops_the_execution_on_every_node_running_it() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let operator = client_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator))
+        .with_operators(vec![caller_identity(operator.cert.der()).unwrap()]);
+    let _server = start_coordinator(state, port, &coordinator).await;
+
+    let mut streams = Vec::new();
+    for node in &nodes {
+        let link = node_link(node, port, &coordinator).await;
+        let mut stream = link.subscribe_executions().await.unwrap();
+        expect_snapshot_complete(&mut stream).await;
+        streams.push((link, stream));
+    }
+
+    let operator_link = client_link(&operator, port, &coordinator).await;
+    // Deadlines far enough out that nothing but the operator can abort this.
+    let submitted = operator_link
+        .submit_execution(request(
+            vec![slot(1, 0)],
+            AdmissionPolicy::Open,
+            deadlines_in(3600, 7200),
+        ))
+        .await
+        .unwrap();
+    for (_, stream) in &mut streams {
+        let ExecutionNotice::Prepare(published) = next_notice(stream).await else {
+            panic!("the submitted execution is published as Prepare");
+        };
+        assert_eq!(published.registration.execution_id, submitted.execution_id);
+    }
+
+    operator_link
+        .abort_execution(submitted.execution_id)
+        .await
+        .unwrap();
+    for (_, stream) in &mut streams {
+        assert_eq!(
+            next_notice(stream).await,
+            ExecutionNotice::Cancel {
+                execution_id: submitted.execution_id,
+                outcome: ExecutionOutcome::Aborted(AbortReason::OperatorRequest),
+            },
+            "every node running the execution is told to stop it"
+        );
+    }
+
+    // Aborting twice is accepted and publishes nothing more: a second cancellation would tell
+    // the roster to stop the same execution twice.
+    operator_link
+        .abort_execution(submitted.execution_id)
+        .await
+        .unwrap();
+    for (_, stream) in &mut streams {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "an already-aborted execution publishes no second Cancel"
+        );
+    }
+
+    // An execution this coordinator does not have is a refusal, not a silent success.
+    let unknown = operator_link
+        .abort_execution(ExecutionId::from_bytes([0x5a; 32]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            unknown,
+            CoordinatorError::Refused {
+                refusal: RpcRefusal::ExecutionNotFound,
+                ..
+            }
+        ),
+        "unexpected refusal: {unknown:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_submission_names_the_registration_row_that_refused_it() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let nodes = node_certs(4);
+    let coordinator = server_cert();
+    let operator = client_cert();
+    let port = free_port();
+    let state = CoordinatorRPCServerSharedBase::new(roster_of(1, &nodes), spki_of(&coordinator))
+        .with_operators(vec![caller_identity(operator.cert.der()).unwrap()]);
+    let _server = start_coordinator(state, port, &coordinator).await;
+
+    let operator_link = client_link(&operator, port, &coordinator).await;
+    let mut invalid = empty_request();
+    invalid.program_hash = [0; 32];
+    let refused = operator_link.submit_execution(invalid).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            CoordinatorError::Registration(RegistrationError::ZeroProgramHash)
+        ),
+        "a refused submission must carry the typed registration error, got {refused:?}"
+    );
 }

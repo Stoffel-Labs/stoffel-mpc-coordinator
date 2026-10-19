@@ -1,23 +1,25 @@
 //! Runs an off-chain coordinator that registers exactly one execution at startup.
 //!
 //! Registration is in-process and operator-only: this binary is where the operator fixes the
-//! execution's program, its client slot table and its admission policy. Standing mode keeps
-//! serving after the execution finishes; `--one-off` drains once the retirement quorum of a
-//! terminal round has acknowledged it, and exits.
+//! execution's program, its entry function, its client slot table and its admission policy. The
+//! coordinator mints the execution's identity itself and prints it, and publishes it to the
+//! roster; nothing here names an execution. Standing mode keeps serving after the execution
+//! finishes; `--one-off` drains once the retirement quorum of a terminal round has acknowledged
+//! it, and exits.
 
 use clap::{ArgGroup, Parser, ValueEnum};
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 use stoffel_mpc_coordinator_off_chain::{
-    CoordinatorRPCServerSharedBase, ExecutionRegistration, OffChainCoordinatorConnection,
+    CoordinatorRPCServerSharedBase, ExecutionRequest, OffChainCoordinatorConnection,
     OffChainCoordinatorServer, OneOffShutdownConfig, DEFAULT_ONE_OFF_SHUTDOWN_GRACE,
 };
 use stoffel_mpc_coordinator_shared::rpc::{caller_identity, RpcServerLimits};
 use stoffel_mpc_coordinator_shared::{
-    program_hash_of, AdmissionPolicy, ClientIdentity, ClientSlotSpec, ClientSlotTable,
-    CoordinatorError, ExecutionDeadlines, ExecutionId, NodeCertificateDer, NodeRoster, PinError,
-    RegistrationError, RosterError, SpkiDer, UnixSeconds,
+    program_hash_of, AdmissionPolicy, ClientIdentity, ClientIndex, ClientSlotSpec, ClientSlotTable,
+    CoordinatorError, ExecutionDeadlines, NodeCertificateDer, NodeRoster, PinError,
+    PreRegisteredClient, RegistrationError, RosterError, SpkiDer, UnixSeconds,
 };
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, CompiledBinary};
 
@@ -46,9 +48,9 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_ONE_OFF_SHUTDOWN_GRACE.as_secs())]
     one_off_shutdown_grace_secs: u64,
 
-    /// The execution registered at startup, 64 hexadecimal characters, nonzero.
-    #[arg(long, value_parser = parse_nonzero_execution_id)]
-    execution_id: ExecutionId,
+    /// The function the nodes call in the registered program.
+    #[arg(long, default_value = "main")]
+    entry: String,
 
     /// Compiled program: registers `program_hash_of(bytes)`, and the manifest's client slots.
     #[arg(long)]
@@ -61,6 +63,15 @@ struct Args {
     /// Roster node certificates (DER), comma-separated.
     #[arg(long, required = true, value_delimiter = ',', num_args = 1..)]
     node_certs: Vec<String>,
+
+    /// Operator certificates (DER), comma-separated: the identities allowed to
+    /// submit and abort executions over the authenticated link. The certificate
+    /// an operator connects with is the whole authorization, and the list is
+    /// fixed for this process's life. With none, this coordinator runs only the
+    /// execution these flags registered. A roster node is not an operator
+    /// unless its certificate is also listed here.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    operator_certs: Vec<String>,
 
     /// The corruption threshold of the node roster.
     #[arg(long)]
@@ -156,14 +167,6 @@ enum RunCoordError {
     Coordinator(#[from] CoordinatorError),
 }
 
-fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
-    let execution_id = value.parse::<ExecutionId>()?;
-    if execution_id.is_zero() {
-        return Err("execution ID must be nonzero".to_string());
-    }
-    Ok(execution_id)
-}
-
 fn parse_program_hash(value: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(value).map_err(|error| format!("invalid program hash: {error}"))?;
     bytes
@@ -241,16 +244,30 @@ fn client_slots_from_flag(client_io: &[String]) -> Result<ClientSlotTable, RunCo
         .map(ClientSlotTable::new)
 }
 
+/// The clients `--client-certs` or `--client-bindings` pre-registers, in slot order: `run-coord`
+/// takes a slot per client and nothing else, so each client's execution-local ordinal is its
+/// slot. A registration built by another operator tool may order them differently.
 fn pre_registered_clients(
     args: &Args,
     slots: &ClientSlotTable,
-) -> Result<Vec<ClientIdentity>, RunCoordError> {
+) -> Result<Vec<PreRegisteredClient>, RunCoordError> {
+    let in_slot_order = |identities: Vec<ClientIdentity>| {
+        identities
+            .into_iter()
+            .enumerate()
+            .map(|(slot, identity)| PreRegisteredClient {
+                identity,
+                client_slot: ClientIndex(slot as u32),
+            })
+            .collect()
+    };
     match (entries(&args.client_certs), entries(&args.client_bindings)) {
         (Some(_), Some(_)) => Err(RunCoordError::ClientCertsAndBindings),
         (Some(certs), None) => certs
             .iter()
             .map(|path| identity_of_certificate(path))
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()
+            .map(in_slot_order),
         (None, Some(bindings)) => {
             let mut clients: Vec<Option<ClientIdentity>> = vec![None; slots.slots().len()];
             for entry in bindings {
@@ -274,18 +291,19 @@ fn pre_registered_clients(
                 .into_iter()
                 .enumerate()
                 .map(|(slot, client)| client.ok_or(RunCoordError::UnboundClientSlot { slot }))
-                .collect()
+                .collect::<Result<Vec<_>, _>>()
+                .map(in_slot_order)
         }
         (None, None) => Ok(Vec::new()),
     }
 }
 
-/// The node roster, the served key and the one registration the flags describe. Refuses a
+/// The node roster, the served key and the one execution request the flags describe. Refuses a
 /// non-empty flag the chosen admission does not read.
-fn registration_from_args(
+fn request_from_args(
     args: &Args,
     now: UnixSeconds,
-) -> Result<(NodeRoster, SpkiDer, ExecutionRegistration), RunCoordError> {
+) -> Result<(NodeRoster, SpkiDer, ExecutionRequest), RunCoordError> {
     let node_certificates = args
         .node_certs
         .iter()
@@ -348,28 +366,40 @@ fn registration_from_args(
         _ => return Err(RunCoordError::PartialDeadlines),
     };
 
-    let registration = ExecutionRegistration {
-        execution_id: args.execution_id,
+    let request = ExecutionRequest {
         program_hash,
+        entry: args.entry.clone(),
         client_slots,
         admission,
         deadlines,
     };
-    registration.validate(now)?;
-    Ok((node_roster, server_spki, registration))
+    request.validate(now)?;
+    Ok((node_roster, server_spki, request))
 }
 
 async fn run(args: Args) -> Result<(), RunCoordError> {
-    let (node_roster, server_spki, registration) =
-        registration_from_args(&args, UnixSeconds::now())?;
+    let (node_roster, server_spki, request) = request_from_args(&args, UnixSeconds::now())?;
     let server_cert_der = read(&args.server_cert)?;
     let server_key_der = read(&args.server_key)?;
     println!("Node roster digest: {}", node_roster.digest());
 
-    let execution_id = registration.execution_id;
-    let mut state = CoordinatorRPCServerSharedBase::new(node_roster, server_spki);
-    let nonce = state.register_execution(registration)?;
-    println!("Registered execution {execution_id} (registration nonce {nonce})");
+    let operators = args
+        .operator_certs
+        .iter()
+        .map(|path| identity_of_certificate(path))
+        .collect::<Result<Vec<_>, RunCoordError>>()?;
+    println!(
+        "Operators authorized to submit executions: {}",
+        operators.len()
+    );
+    let mut state =
+        CoordinatorRPCServerSharedBase::new(node_roster, server_spki).with_operators(operators);
+    let registered = state.register_execution(request)?;
+    let execution_id = registered.execution_id;
+    println!(
+        "Minted execution {execution_id} (registration nonce {})",
+        registered.registration_nonce
+    );
 
     let limits = RpcServerLimits {
         max_connections: args.max_connections,
@@ -474,8 +504,6 @@ mod tests {
         fn base_args(&self) -> Vec<String> {
             vec![
                 "run-coord".to_string(),
-                "--execution-id".to_string(),
-                "07".repeat(32),
                 "--node-certs".to_string(),
                 ["node0", "node1", "node2", "node3"]
                     .map(|node| self.path(&format!("{node}.crt")))
@@ -556,16 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_id_validation_rejects_zero() {
-        assert!(parse_nonzero_execution_id(&"00".repeat(32)).is_err());
-        let execution_id = ExecutionId::from_bytes([7; 32]);
-        assert_eq!(
-            parse_nonzero_execution_id(&execution_id.to_string()).unwrap(),
-            execution_id,
-        );
-    }
-
-    #[test]
     fn run_coord_registers_its_execution_at_startup_in_both_modes() {
         let fixture = Fixture::new("modes");
         let now = UnixSeconds::now();
@@ -594,27 +612,32 @@ mod tests {
         let one_off = pre_registered(true);
         assert!(!standing.one_off);
         assert!(one_off.one_off);
-        let (roster, _, standing_registration) = registration_from_args(&standing, now).unwrap();
-        let (_, _, one_off_registration) = registration_from_args(&one_off, now).unwrap();
-        assert_eq!(standing_registration, one_off_registration);
+        let (roster, _, standing_request) = request_from_args(&standing, now).unwrap();
+        let (_, _, one_off_request) = request_from_args(&one_off, now).unwrap();
+        assert_eq!(standing_request, one_off_request);
         assert_eq!(roster.n(), 4);
-        assert_eq!(standing_registration.program_hash, [0xab; 32]);
-        assert_eq!(standing_registration.client_slots.capacity(), 2);
-        assert_eq!(standing_registration.client_slots.n_inputs(), 3);
+        assert_eq!(standing_request.program_hash, [0xab; 32]);
+        assert_eq!(standing_request.entry, "main");
+        assert_eq!(standing_request.client_slots.capacity(), 2);
+        assert_eq!(standing_request.client_slots.n_inputs(), 3);
         assert_eq!(
-            standing_registration
+            standing_request
                 .client_slots
                 .input_range(ClientIndex(1))
                 .unwrap()
                 .start,
             1
         );
-        let AdmissionPolicy::PreRegistered { clients } = &standing_registration.admission else {
+        let AdmissionPolicy::PreRegistered { clients } = &standing_request.admission else {
             panic!("the default admission is pre-registered");
         };
         assert_eq!(
             clients[1],
-            identity_of_certificate(&fixture.path("client1.crt")).unwrap()
+            PreRegisteredClient {
+                identity: identity_of_certificate(&fixture.path("client1.crt")).unwrap(),
+                client_slot: ClientIndex(1),
+            },
+            "run-coord pre-registers in slot order, so ordinal 1 owns slot 1"
         );
 
         // Open with deadlines relative to startup.
@@ -636,8 +659,7 @@ mod tests {
             ]
             .map(str::to_string),
         );
-        let (_, _, registration) =
-            registration_from_args(&parse(open.clone()).unwrap(), now).unwrap();
+        let (_, _, registration) = request_from_args(&parse(open.clone()).unwrap(), now).unwrap();
         assert_eq!(registration.admission, AdmissionPolicy::Open);
         assert_eq!(
             registration.deadlines,
@@ -652,7 +674,7 @@ mod tests {
         let position = with_certs.iter().rposition(|arg| arg.is_empty()).unwrap();
         with_certs[position] = fixture.path("client0.crt");
         assert!(matches!(
-            registration_from_args(&parse(with_certs).unwrap(), now),
+            request_from_args(&parse(with_certs).unwrap(), now),
             Err(RunCoordError::UnusedFlag {
                 flag: "--client-certs",
                 ..
@@ -666,7 +688,7 @@ mod tests {
             ["--hash", &hash, "--client-io", "1:1", "--admission", "open"].map(str::to_string),
         );
         assert!(matches!(
-            registration_from_args(&parse(no_deadlines).unwrap(), now),
+            request_from_args(&parse(no_deadlines).unwrap(), now),
             Err(RunCoordError::Registration(
                 RegistrationError::DeadlinesRequired
             ))
@@ -674,7 +696,7 @@ mod tests {
         let mut no_certs = fixture.base_args();
         no_certs.extend(["--hash", &hash, "--client-io", "1:1"].map(str::to_string));
         assert!(matches!(
-            registration_from_args(&parse(no_certs).unwrap(), now),
+            request_from_args(&parse(no_certs).unwrap(), now),
             Err(RunCoordError::Registration(
                 RegistrationError::PreRegisteredCountMismatch {
                     slots: 1,
@@ -691,6 +713,7 @@ mod tests {
 
         // The removed flags are unknown.
         for removed in [
+            ["--execution-id", &"07".repeat(32)],
             ["--backend", "avss"],
             ["--min-output-shares", "3"],
             ["--n", "4"],

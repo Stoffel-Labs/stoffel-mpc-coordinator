@@ -35,6 +35,7 @@ pub mod tests;
 use ark_ec::CurveGroup;
 use ark_ff::FftField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -53,9 +54,9 @@ pub use admission::{
     program_hash_of, AbortReason, AdmissionError, AdmissionPolicy, AdmissionPolicyKind,
     AssociationRequest, ClientAdmission, ClientAdmissionRecord, ClientAdmissionSet, ClientIndex,
     ClientSlotSpec, ClientSlotTable, ExecutionDeadlines, ExecutionOutcome, InputRange,
-    OutputRights, RegistrationError, RegistrationNonce, SubmissionError, UnixSeconds,
-    MAX_CLIENT_SLOTS, MAX_INPUTS, MAX_INPUTS_PER_SLOT, MAX_MASKED_INPUT_BYTES,
-    MAX_OUTPUTS_PER_SLOT, MAX_SEALED_OUTPUT_BYTES,
+    OutputRights, PreRegisteredClient, RegistrationError, RegistrationNonce, SubmissionError,
+    UnixSeconds, MAX_CLIENT_SLOTS, MAX_ENTRY_NAME_BYTES, MAX_INPUTS, MAX_INPUTS_PER_SLOT,
+    MAX_MASKED_INPUT_BYTES, MAX_OUTPUTS_PER_SLOT, MAX_SEALED_OUTPUT_BYTES,
 };
 pub use pin::{KeyAlgorithm, PinError, RosterKeys, ServerPin, SpkiDer};
 pub use roster::{
@@ -79,11 +80,37 @@ pub type ClientIdentity = Vec<u8>;
 /// A program hash is deliberately not used as the execution identity: two invocations of the
 /// same program must be able to overlap without sharing coordinator or node state. The all-zero
 /// value is reserved and rejected by persistent/concurrent RPC paths.
+///
+/// The coordinator is the only party that mints one, with [`ExecutionId::new`]: it draws the id
+/// when it registers an execution request and publishes it to the roster, so no node or client
+/// ever proposes an identity of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ExecutionId([u8; 32]);
 
 impl ExecutionId {
+    /// Draws a fresh execution identity from the operating system's random source.
+    ///
+    /// Never zero: the all-zero value is reserved, and the node transport refuses it on the
+    /// wire, so a minted id that happened to be zero would be unusable rather than merely
+    /// unlucky. 32 bytes make an accidental repeat impossible to reach in practice, so the
+    /// coordinator treats a collision with an id it still remembers as a failed random source
+    /// and refuses the registration instead of redrawing.
+    pub fn new() -> Self {
+        let mut bytes = [0u8; 32];
+        loop {
+            // `SystemRandom` reads the OS source (getrandom); it fails only when the kernel has
+            // no random source at all, in which case no key in this process could be trusted
+            // either.
+            SystemRandom::new()
+                .fill(&mut bytes)
+                .expect("the operating system random source is unavailable");
+            if bytes != [0; 32] {
+                return Self(bytes);
+            }
+        }
+    }
+
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -94,6 +121,12 @@ impl ExecutionId {
 
     pub fn is_zero(self) -> bool {
         self.0 == [0; 32]
+    }
+}
+
+impl Default for ExecutionId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -123,6 +156,20 @@ impl FromStr for ExecutionId {
 #[cfg(test)]
 mod execution_id_tests {
     use super::*;
+
+    #[test]
+    fn a_minted_execution_id_is_never_zero_and_never_repeats() {
+        let first = ExecutionId::new();
+        assert!(!first.is_zero());
+        let second = ExecutionId::new();
+        assert!(!second.is_zero());
+        assert_ne!(
+            first, second,
+            "two mints from the OS random source must differ"
+        );
+        assert!(!ExecutionId::default().is_zero());
+        assert_ne!(ExecutionId::default(), ExecutionId::default());
+    }
 
     #[test]
     fn hex_round_trip_is_strict_and_stable() {
@@ -571,6 +618,7 @@ pub enum RpcRefusal {
     ClientAlreadyReserved,
     ExecutionNotFound,
     RateLimited,
+    NotOperator,
 }
 
 #[derive(Error, Clone, Debug)]
