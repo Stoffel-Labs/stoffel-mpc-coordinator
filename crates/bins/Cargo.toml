@@ -36,6 +36,7 @@ ark-ff = { workspace = true }
 ark-serialize = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
+interprocess = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 stoffelmpc-mpc = { workspace = true }
