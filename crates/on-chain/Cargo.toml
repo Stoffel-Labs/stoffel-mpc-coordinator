@@ -23,6 +23,7 @@ ark-serialize = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 hpke = { workspace = true }
+interprocess = { workspace = true }
 jsonrpsee = { workspace = true }
 p256 = { workspace = true }
 rand = { workspace = true }
