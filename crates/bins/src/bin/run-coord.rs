@@ -71,6 +71,46 @@ struct Args {
 
     #[arg(long, default_value = "honeybadger")]
     backend: Backend,
+
+    /// Bind address for an additional browser-client listener, served over ordinary
+    /// server-authenticated TLS instead of the mutual TLS --addr/--port uses (a browser cannot
+    /// present a TLS client certificate at all; see stoffel_mpc_coordinator_off_chain::browser_rpc's
+    /// module doc). Requires --browser-tls-cert-chain and --browser-tls-key. Not yet supported
+    /// together with --one-off.
+    #[arg(long, requires = "browser_tls_cert_chain", requires = "browser_tls_key")]
+    browser_addr: Option<String>,
+
+    #[arg(long, default_value_t = 31416)]
+    browser_port: u16,
+
+    /// PEM certificate chain (leaf first) for the browser listener. Typically CA-issued (e.g.
+    /// Let's Encrypt/ACM): browsers reject a self-signed certificate on a raw WebSocket handshake
+    /// outright, with no prompt to accept it.
+    #[arg(long, requires = "browser_addr")]
+    browser_tls_cert_chain: Option<String>,
+
+    #[arg(long, requires = "browser_addr")]
+    browser_tls_key: Option<String>,
+
+    /// WebAuthn relying party ID for the browser listener's `browser_bind_webauthn_identity`
+    /// RPC - the site's own hostname exactly as it appears in the URL bar for every page that
+    /// calls `navigator.credentials.get()`/`create()` (e.g. `vote.example.com`, not an IP or a
+    /// bare `--browser-addr` bind address, which is typically not what voters' browsers see).
+    #[arg(long, requires = "browser_addr")]
+    webauthn_rp_id: Option<String>,
+
+    /// Directory of registered clients' raw public-key files (`{client_name}.crt`) - the same
+    /// catalog StoffelVM's standing parties already load. Paired with
+    /// --client-credential-id-dir to let the browser listener's `browser_bind_webauthn_identity`
+    /// look a WebAuthn credential up directly instead of scanning every roster candidate. Both
+    /// flags are optional - omitting either just falls back to the scan for every bind.
+    #[arg(long, requires = "browser_addr")]
+    client_cert_dir: Option<String>,
+
+    /// Directory of registered clients' WebAuthn credential-ID files (`{client_name}.id`,
+    /// raw `credential.rawId` bytes) - see --client-cert-dir.
+    #[arg(long, requires = "browser_addr")]
+    client_credential_id_dir: Option<String>,
 }
 
 fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
@@ -169,6 +209,21 @@ fn build_input_assignment(
     Ok((InputAssignment { clients, ranges }, output_clients))
 }
 
+/// A browser-client listener's bind address and PEM certificate chain/key, distinct from the
+/// native mTLS listener's self-signed DER cert/key: browsers need a real, CA-trusted chain since
+/// there is no prompt to accept a self-signed one on a raw WebSocket handshake.
+struct BrowserTls {
+    addr: String,
+    port: u16,
+    cert_chain_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    webauthn_rp_id: String,
+    /// (client_cert_dir, client_credential_id_dir) - see
+    /// stoffel_mpc_coordinator_off_chain::browser_rpc::coordinator_browser_methods's doc.
+    /// `None` unless both --client-cert-dir and --client-credential-id-dir were given.
+    client_credential_id_dirs: Option<(String, String)>,
+}
+
 async fn run_coord<C>(
     server_state: CoordinatorRPCServerSharedBase,
     addr: &str,
@@ -176,19 +231,48 @@ async fn run_coord<C>(
     t: u64,
     server_cert_der: Vec<u8>,
     server_key_der: Vec<u8>,
+    browser_tls: Option<BrowserTls>,
 ) where
     C: RPCServerConnection<Internal = CoordinatorRPCServerSharedBase>,
 {
-    let _coord = OffChainCoordinatorServer::<C>::start_coord(
-        server_state,
-        addr,
-        port,
-        t,
-        server_cert_der,
-        server_key_der,
-    )
-    .await
-    .expect("failed to start coordinator");
+    let _coord = match browser_tls {
+        Some(browser_tls) => {
+            let client_credential_id_dirs = browser_tls
+                .client_credential_id_dirs
+                .as_ref()
+                .map(|(cert_dir, credential_id_dir)| {
+                    (
+                        std::path::Path::new(cert_dir.as_str()),
+                        std::path::Path::new(credential_id_dir.as_str()),
+                    )
+                });
+            OffChainCoordinatorServer::<C>::start_coord_with_browser_tls(
+                server_state,
+                addr,
+                port,
+                server_cert_der,
+                server_key_der,
+                &browser_tls.addr,
+                browser_tls.port,
+                browser_tls.cert_chain_pem,
+                browser_tls.key_pem,
+                &browser_tls.webauthn_rp_id,
+                client_credential_id_dirs,
+            )
+            .await
+            .expect("failed to start coordinator")
+        }
+        None => OffChainCoordinatorServer::<C>::start_coord(
+            server_state,
+            addr,
+            port,
+            t,
+            server_cert_der,
+            server_key_der,
+        )
+        .await
+        .expect("failed to start coordinator"),
+    };
     println!("Listening on {}:{}", addr, port);
 
     tokio::time::sleep(tokio::time::Duration::MAX).await;
@@ -304,6 +388,43 @@ async fn main() {
         .unwrap_or_else(|_| panic!("could not read certificate file {}", args.server_cert));
     let server_key_der = fs::read(args.server_key).unwrap();
 
+    assert!(
+        args.browser_addr.is_none() || args.one_off.is_none(),
+        "--browser-addr is not yet supported together with --one-off"
+    );
+    let browser_tls = args.browser_addr.map(|browser_addr| {
+        let cert_chain_pem = fs::read(
+            args.browser_tls_cert_chain
+                .as_deref()
+                .expect("--browser-tls-cert-chain (clap requires it with --browser-addr)"),
+        )
+        .expect("could not read --browser-tls-cert-chain");
+        let key_pem = fs::read(
+            args.browser_tls_key
+                .as_deref()
+                .expect("--browser-tls-key (clap requires it with --browser-addr)"),
+        )
+        .expect("could not read --browser-tls-key");
+        let webauthn_rp_id = args
+            .webauthn_rp_id
+            .expect("--webauthn-rp-id (clap requires it with --browser-addr)");
+        // Both flags are required together (see load_credential_id_index) - if only one was
+        // given, the other is silently treated as absent too rather than erroring, matching
+        // that function's own "missing just falls back to the scan" tolerance.
+        let client_credential_id_dirs = match (args.client_cert_dir, args.client_credential_id_dir) {
+            (Some(cert_dir), Some(credential_id_dir)) => Some((cert_dir, credential_id_dir)),
+            _ => None,
+        };
+        BrowserTls {
+            addr: browser_addr,
+            port: args.browser_port,
+            cert_chain_pem,
+            key_pem,
+            webauthn_rp_id,
+            client_credential_id_dirs,
+        }
+    });
+
     let addr = args.addr.as_str();
     let port = args.port;
     let mut server_state =
@@ -394,6 +515,7 @@ async fn main() {
                 t,
                 server_cert_der,
                 server_key_der,
+                browser_tls,
             )
             .await;
         }
