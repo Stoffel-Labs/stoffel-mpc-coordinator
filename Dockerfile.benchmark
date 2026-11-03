@@ -51,10 +51,22 @@ RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registr
     mkdir -p /build/artifacts && \
     cp target/release/run-coord /build/artifacts/run-coord
 
+# Optional bpftrace profiles. Empty by default, so a plain build ships no
+# profiles and no bpftrace. To add some, pass a directory of *.bt files as a
+# build context named "profiles", which replaces this stage:
+#
+#   docker buildx build -f Dockerfile.benchmark --build-context profiles=../my-profiles .
+#   compose:  build: { additional_contexts: { profiles: ../my-profiles } }
+#   CDK:      build_contexts={"profiles": "/absolute/path/to/my-profiles"}
+#
+# Each top-level *.bt file lands at /app/<name>.bt. A __TARGET_BINARY__
+# placeholder in a script (for uprobes) is replaced with /app/run-coord.
+# For readable user stacks, also pass --build-arg PROFILE_BUILD=true.
+FROM scratch AS profiles
+
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y \
-    bpftrace \
     ca-certificates \
     libssl3 \
     net-tools \
@@ -65,6 +77,14 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=builder /build/artifacts/run-coord /app/run-coord
-COPY docker/profile.bt /app/profile.bt
+
+COPY --from=profiles / /tmp/bt-profiles/
+RUN if ls /tmp/bt-profiles/*.bt >/dev/null 2>&1; then \
+        apt-get update && apt-get install -y bpftrace && \
+        rm -rf /var/lib/apt/lists/* && \
+        cp /tmp/bt-profiles/*.bt /app/ && \
+        sed -i 's|__TARGET_BINARY__|/app/run-coord|g' /app/*.bt; \
+    fi && \
+    rm -rf /tmp/bt-profiles
 
 ENTRYPOINT ["/app/run-coord"]
