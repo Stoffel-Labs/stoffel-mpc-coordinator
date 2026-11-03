@@ -15,14 +15,14 @@ Add the off-chain coordinator library with:
 
 ```toml
 [dependencies]
-stoffel-mpc-coordinator-off-chain = "0.2.0"
+stoffel-mpc-coordinator-off-chain = "0.2.1"
 ```
 
-The shared crate is pulled in automatically. Depend on `stoffel-mpc-coordinator-shared = "0.2.0"` directly when implementing against transport-independent coordinator traits and types.
+The shared crate is pulled in automatically. Depend on `stoffel-mpc-coordinator-shared = "0.2.1"` directly when implementing against transport-independent coordinator traits and types.
 
 ## Package status
 
-Version `0.2.0` publishes the shared and off-chain libraries. The on-chain and binary crates remain excluded from crates.io because they depend on pinned Stoffel Solidity SDK binding crates from Git.
+Version `0.2.1` publishes the shared and off-chain libraries. The on-chain and binary crates remain excluded from crates.io because they depend on pinned Stoffel Solidity SDK binding crates from Git.
 
 ## Deploying the on-chain coordinator
 

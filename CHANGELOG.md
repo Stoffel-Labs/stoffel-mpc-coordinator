@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1
+## 0.2.1 - 2026-11-02
 
 ### Added
 
@@ -11,6 +11,7 @@
 ### Changed
 
 - One-off coordinators now exit only when the designated party calls `request_shutdown` after the execution reached `ProgramFinished`, then wait a bounded grace period for the remaining parties to acknowledge, instead of shutting down on the round transition itself.
+- Updated the MPC protocol dependency to stoffelcrypto 0.1.2, pinning interprocess 2.4.5 and tokio 1.46.1 to keep the on-chain IPC transport compatible.
 
 ### Fixed
 
