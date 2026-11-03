@@ -1265,7 +1265,9 @@ impl CoordinatorRPCServerSharedBase {
             shutdown_notify: None,
             one_off_execution: None,
             retired: RetiredExecutions::default(),
-            webauthn_bindings: Arc::new(Mutex::new(crate::browser_rpc::WebauthnBindings::default())),
+            webauthn_bindings: Arc::new(
+                Mutex::new(crate::browser_rpc::WebauthnBindings::default()),
+            ),
         })
     }
 

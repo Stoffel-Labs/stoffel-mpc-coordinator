@@ -77,7 +77,11 @@ struct Args {
     /// present a TLS client certificate at all; see stoffel_mpc_coordinator_off_chain::browser_rpc's
     /// module doc). Requires --browser-tls-cert-chain and --browser-tls-key. Not yet supported
     /// together with --one-off.
-    #[arg(long, requires = "browser_tls_cert_chain", requires = "browser_tls_key")]
+    #[arg(
+        long,
+        requires = "browser_tls_cert_chain",
+        requires = "browser_tls_key"
+    )]
     browser_addr: Option<String>,
 
     #[arg(long, default_value_t = 31416)]
@@ -237,15 +241,14 @@ async fn run_coord<C>(
 {
     let _coord = match browser_tls {
         Some(browser_tls) => {
-            let client_credential_id_dirs = browser_tls
-                .client_credential_id_dirs
-                .as_ref()
-                .map(|(cert_dir, credential_id_dir)| {
+            let client_credential_id_dirs = browser_tls.client_credential_id_dirs.as_ref().map(
+                |(cert_dir, credential_id_dir)| {
                     (
                         std::path::Path::new(cert_dir.as_str()),
                         std::path::Path::new(credential_id_dir.as_str()),
                     )
-                });
+                },
+            );
             OffChainCoordinatorServer::<C>::start_coord_with_browser_tls(
                 server_state,
                 addr,
@@ -411,7 +414,8 @@ async fn main() {
         // Both flags are required together (see load_credential_id_index) - if only one was
         // given, the other is silently treated as absent too rather than erroring, matching
         // that function's own "missing just falls back to the scan" tolerance.
-        let client_credential_id_dirs = match (args.client_cert_dir, args.client_credential_id_dir) {
+        let client_credential_id_dirs = match (args.client_cert_dir, args.client_credential_id_dir)
+        {
             (Some(cert_dir), Some(credential_id_dir)) => Some((cert_dir, credential_id_dir)),
             _ => None,
         };

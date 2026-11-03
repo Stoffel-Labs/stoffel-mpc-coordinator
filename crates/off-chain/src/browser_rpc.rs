@@ -193,8 +193,10 @@ impl WebauthnBindings {
             let token = URL_SAFE_NO_PAD.encode(token_bytes);
             if let Entry::Vacant(entry) = self.by_token.entry(token.clone()) {
                 if let Some(execution_id) = execution_id {
-                    self.by_execution_and_client_identity
-                        .insert((execution_id, binding.client_identity.clone()), binding.clone());
+                    self.by_execution_and_client_identity.insert(
+                        (execution_id, binding.client_identity.clone()),
+                        binding.clone(),
+                    );
                 }
                 entry.insert(binding);
                 return token;
@@ -230,7 +232,11 @@ impl WebauthnBindings {
     /// re-records which one already exists. Combined with that rejection, this is
     /// guaranteed to be the last write `by_execution_and_client_identity` ever receives
     /// for this identity in this execution.
-    pub(crate) fn pin_binding_from_token(&mut self, execution_id: ExecutionId, session_token: &str) {
+    pub(crate) fn pin_binding_from_token(
+        &mut self,
+        execution_id: ExecutionId,
+        session_token: &str,
+    ) {
         if let Some(binding) = self.by_token.get(session_token).cloned() {
             self.by_execution_and_client_identity
                 .insert((execution_id, binding.client_identity.clone()), binding);
@@ -304,7 +310,9 @@ impl NonceBook {
         now: u64,
     ) -> RpcResult<()> {
         if now.abs_diff(created) > NONCE_WINDOW_SECONDS {
-            return Err(auth_error("request timestamp is outside the accepted window"));
+            return Err(auth_error(
+                "request timestamp is outside the accepted window",
+            ));
         }
         let key = (execution_id, identity.clone());
         let entries = self.seen.entry(key).or_default();
@@ -500,9 +508,13 @@ pub async fn coordinator_browser_methods(
             "browser_execution_status",
             |params, state, _| async move {
                 let call: BrowserCall = params.one()?;
-                let identity =
-                    authenticate("browser_execution_status", &call, &state.nonces, &state.bindings)
-                        .await?;
+                let identity = authenticate(
+                    "browser_execution_status",
+                    &call,
+                    &state.nonces,
+                    &state.bindings,
+                )
+                .await?;
                 state
                     .coordinator
                     .lock()
@@ -592,9 +604,13 @@ pub async fn coordinator_browser_methods(
             "browser_output_shares",
             |params, state, _| async move {
                 let call: BrowserCall = params.one()?;
-                let identity =
-                    authenticate("browser_output_shares", &call, &state.nonces, &state.bindings)
-                        .await?;
+                let identity = authenticate(
+                    "browser_output_shares",
+                    &call,
+                    &state.nonces,
+                    &state.bindings,
+                )
+                .await?;
                 state
                     .coordinator
                     .lock()
@@ -977,9 +993,7 @@ async fn authenticate(
             .get(&call.request.session_token)
             .ok_or_else(|| auth_error("unknown or expired session token"))?;
         if binding.ecdsa_public_key != call.request.public_key {
-            return Err(auth_error(
-                "session token is not bound to this signing key",
-            ));
+            return Err(auth_error("session token is not bound to this signing key"));
         }
         binding.client_identity.clone()
     };
@@ -988,10 +1002,13 @@ async fn authenticate(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    nonces
-        .lock()
-        .await
-        .accept(call.execution_id, &identity, call.request.created, nonce, now)?;
+    nonces.lock().await.accept(
+        call.execution_id,
+        &identity,
+        call.request.created,
+        nonce,
+        now,
+    )?;
     Ok(identity)
 }
 
@@ -1106,7 +1123,8 @@ fn verify_webauthn_assertion(
     let key = VerifyingKey::from_sec1_bytes(candidate_public_key).map_err(|_| ())?;
     let signature = Signature::from_der(&assertion.signature).map_err(|_| ())?;
     let client_data_hash = Sha256::digest(&assertion.client_data_json);
-    let mut signed = Vec::with_capacity(assertion.authenticator_data.len() + client_data_hash.len());
+    let mut signed =
+        Vec::with_capacity(assertion.authenticator_data.len() + client_data_hash.len());
     signed.extend_from_slice(&assertion.authenticator_data);
     signed.extend_from_slice(&client_data_hash);
     key.verify(&signed, &signature).map_err(|_| ())?;
@@ -1159,7 +1177,14 @@ mod tests {
         user_present: bool,
         user_verified: bool,
     ) -> WebauthnAssertion {
-        make_assertion_with_sign_count(signing_key, challenge, origin, user_present, user_verified, 1)
+        make_assertion_with_sign_count(
+            signing_key,
+            challenge,
+            origin,
+            user_present,
+            user_verified,
+            1,
+        )
     }
 
     fn make_assertion_with_sign_count(
@@ -1351,7 +1376,9 @@ mod tests {
         // Both the "authenticator never counts" case (0) and an ordinary
         // first use (nonzero) must go through - there's nothing to compare
         // against yet.
-        sign_counts.accept(&identity, 0).expect("first use, count 0");
+        sign_counts
+            .accept(&identity, 0)
+            .expect("first use, count 0");
         let mut fresh = SignCounts::default();
         fresh
             .accept(&identity, 5)
@@ -1364,7 +1391,9 @@ mod tests {
         let identity: ClientIdentity = vec![42];
         sign_counts.accept(&identity, 1).expect("first bind");
         sign_counts.accept(&identity, 2).expect("count increased");
-        sign_counts.accept(&identity, 10).expect("count increased again");
+        sign_counts
+            .accept(&identity, 10)
+            .expect("count increased again");
     }
 
     #[test]
@@ -1388,7 +1417,9 @@ mod tests {
         let mut sign_counts = SignCounts::default();
         let identity: ClientIdentity = vec![42];
         sign_counts.accept(&identity, 0).expect("first use");
-        sign_counts.accept(&identity, 0).expect("still zero, still fine");
+        sign_counts
+            .accept(&identity, 0)
+            .expect("still zero, still fine");
     }
 
     #[test]
@@ -1514,9 +1545,7 @@ mod tests {
     #[tokio::test]
     async fn authenticate_resolves_the_bound_identity_for_a_session_token() {
         let signing_key = test_signing_key();
-        let ecdsa_public_key = VerifyingKey::from(&signing_key)
-            .to_sec1_bytes()
-            .to_vec();
+        let ecdsa_public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
         let stable_identity: ClientIdentity = vec![42];
         let mut bindings = WebauthnBindings::default();
         let token = bindings.insert(
@@ -1649,9 +1678,7 @@ mod tests {
     #[tokio::test]
     async fn authenticate_rejects_a_nonce_of_the_wrong_length() {
         let signing_key = test_signing_key();
-        let ecdsa_public_key = VerifyingKey::from(&signing_key)
-            .to_sec1_bytes()
-            .to_vec();
+        let ecdsa_public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
         let mut bindings = WebauthnBindings::default();
         let token = bindings.insert(
             Some(execution_id()),
@@ -1746,10 +1773,22 @@ mod tests {
         let mut nonces = NonceBook::default();
 
         nonces
-            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .accept(
+                execution,
+                &identity,
+                TEST_CREATED,
+                test_nonce(1),
+                TEST_CREATED,
+            )
             .expect("first use of this nonce");
         assert!(nonces
-            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED + 5)
+            .accept(
+                execution,
+                &identity,
+                TEST_CREATED,
+                test_nonce(1),
+                TEST_CREATED + 5
+            )
             .is_err());
     }
 
@@ -1763,10 +1802,22 @@ mod tests {
         let mut nonces = NonceBook::default();
 
         nonces
-            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .accept(
+                execution,
+                &identity,
+                TEST_CREATED,
+                test_nonce(1),
+                TEST_CREATED,
+            )
             .expect("first nonce");
         nonces
-            .accept(execution, &identity, TEST_CREATED, test_nonce(2), TEST_CREATED)
+            .accept(
+                execution,
+                &identity,
+                TEST_CREATED,
+                test_nonce(2),
+                TEST_CREATED,
+            )
             .expect("second, distinct nonce with the same created timestamp");
     }
 
@@ -1781,7 +1832,13 @@ mod tests {
             .accept(execution, &identity, TEST_CREATED, test_nonce(1), now) // too old
             .is_err());
         assert!(nonces
-            .accept(execution, &identity, now + 1000, test_nonce(2), TEST_CREATED) // too far in the future
+            .accept(
+                execution,
+                &identity,
+                now + 1000,
+                test_nonce(2),
+                TEST_CREATED
+            ) // too far in the future
             .is_err());
     }
 
@@ -1792,7 +1849,13 @@ mod tests {
         let mut nonces = NonceBook::default();
 
         nonces
-            .accept(execution, &identity, TEST_CREATED, test_nonce(1), TEST_CREATED)
+            .accept(
+                execution,
+                &identity,
+                TEST_CREATED,
+                test_nonce(1),
+                TEST_CREATED,
+            )
             .expect("first use of this nonce");
         // Well past the window - the earlier entry should have aged out, so
         // the *same* nonce is accepted again as a fresh request rather than
@@ -1900,8 +1963,9 @@ mod tests {
             .call("browser_bind_webauthn_identity", (params,))
             .await
             .expect("an indexed, on-roster credential must be able to bind");
-        let resolved_identity: Vec<u8> = serde_json::from_value(response["client_identity"].clone())
-            .expect("client_identity field");
+        let resolved_identity: Vec<u8> =
+            serde_json::from_value(response["client_identity"].clone())
+                .expect("client_identity field");
         assert_eq!(resolved_identity, on_roster_public_key);
     }
 
@@ -1921,7 +1985,11 @@ mod tests {
 
         let (cert_dir, credential_id_dir) = temp_catalog_dirs("off-roster-rejected");
         std::fs::write(cert_dir.join("intruder.crt"), &intruder_public_key).unwrap();
-        std::fs::write(credential_id_dir.join("intruder.id"), b"intruder-credential-id").unwrap();
+        std::fs::write(
+            credential_id_dir.join("intruder.id"),
+            b"intruder-credential-id",
+        )
+        .unwrap();
 
         let methods =
             coordinator_browser_methods(shared, TEST_RP_ID, Some((&cert_dir, &credential_id_dir)))
@@ -1984,7 +2052,8 @@ mod tests {
 
         let second_assertion =
             make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 2);
-        let second_params = bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        let second_params =
+            bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
         let result: Result<serde_json::Value, _> = methods
             .call("browser_bind_webauthn_identity", (second_params,))
             .await;
@@ -2021,7 +2090,8 @@ mod tests {
 
         let second_assertion =
             make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 2);
-        let second_params = bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        let second_params =
+            bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
         methods
             .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (second_params,))
             .await
@@ -2042,9 +2112,8 @@ mod tests {
         let ecdh_public_key = b"ecdh-pub".to_vec();
         let challenge = webauthn_bind_challenge(&ecdsa_public_key, &ecdh_public_key);
 
-        let first_assertion = make_assertion_with_sign_count(
-            &signing_key, &challenge, TEST_ORIGIN, true, true, 5,
-        );
+        let first_assertion =
+            make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 5);
         let first_params = bind_params(&first_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
         methods
             .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (first_params,))
@@ -2053,10 +2122,10 @@ mod tests {
 
         // Same credential, a second ceremony whose signCount didn't increase past the
         // first - exactly the WebAuthn Level 3 §7.2 step 20 clone signal.
-        let second_assertion = make_assertion_with_sign_count(
-            &signing_key, &challenge, TEST_ORIGIN, true, true, 5,
-        );
-        let second_params = bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
+        let second_assertion =
+            make_assertion_with_sign_count(&signing_key, &challenge, TEST_ORIGIN, true, true, 5);
+        let second_params =
+            bind_params(&second_assertion, &ecdsa_public_key, &ecdh_public_key, b"");
         let result: Result<serde_json::Value, _> = methods
             .call("browser_bind_webauthn_identity", (second_params,))
             .await;
@@ -2186,7 +2255,12 @@ mod tests {
         let ecdh_key_a = b"ecdh-key-a".to_vec();
         let challenge_a = webauthn_bind_challenge(&request_ecdsa_public_key, &ecdh_key_a);
         let bind_a = make_assertion_with_sign_count(
-            &identity_signing_key, &challenge_a, TEST_ORIGIN, true, true, 1,
+            &identity_signing_key,
+            &challenge_a,
+            TEST_ORIGIN,
+            true,
+            true,
+            1,
         );
         let bind_a_params = bind_params(&bind_a, &request_ecdsa_public_key, &ecdh_key_a, b"");
         let bind_a_response: serde_json::Value = methods
@@ -2201,7 +2275,12 @@ mod tests {
         let ecdh_key_b = b"ecdh-key-b".to_vec();
         let challenge_b = webauthn_bind_challenge(&request_ecdsa_public_key, &ecdh_key_b);
         let bind_b = make_assertion_with_sign_count(
-            &identity_signing_key, &challenge_b, TEST_ORIGIN, true, true, 2,
+            &identity_signing_key,
+            &challenge_b,
+            TEST_ORIGIN,
+            true,
+            true,
+            2,
         );
         let bind_b_params = bind_params(&bind_b, &request_ecdsa_public_key, &ecdh_key_b, b"");
         methods

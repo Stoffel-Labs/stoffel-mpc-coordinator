@@ -157,9 +157,12 @@ pub fn browser_tls_config(
     cert_chain_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<rustls::ServerConfig, CoordinatorError> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut Cursor::new(cert_chain_pem))
-        .collect::<Result<_, _>>()
-        .map_err(|e| CoordinatorError::TlsConfigError(format!("invalid certificate chain PEM: {e}")))?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut Cursor::new(cert_chain_pem))
+            .collect::<Result<_, _>>()
+            .map_err(|e| {
+                CoordinatorError::TlsConfigError(format!("invalid certificate chain PEM: {e}"))
+            })?;
     if certs.is_empty() {
         return Err(CoordinatorError::TlsConfigError(
             "certificate chain PEM contained no certificates".to_string(),
