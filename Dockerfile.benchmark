@@ -20,34 +20,26 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
-ARG PROFILE_BUILD=false
+# Always built for profiling: keeps run-coord's debug info and symbols and
+# forces frame pointers, so bpftrace stack samples resolve to function names
+# and uprobes can attach by name.
+ENV CARGO_PROFILE_RELEASE_DEBUG=2 \
+    CARGO_PROFILE_RELEASE_STRIP=none \
+    RUSTFLAGS="-C force-frame-pointers=yes"
 
 COPY --from=planner /build/recipe.json /build/recipe.json
 
 RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=stoffel-coordinator-target-${PROFILE_BUILD},target=/build/target,sharing=locked \
-    if [ "$PROFILE_BUILD" = "true" ]; then \
-        export CARGO_PROFILE_RELEASE_DEBUG=2; \
-        export CARGO_PROFILE_RELEASE_STRIP=none; \
-        export RUSTFLAGS="-C force-frame-pointers=yes"; \
-    fi; \
+    --mount=type=cache,id=stoffel-coordinator-target-profiling,target=/build/target,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json --features benchmark
 
 COPY . .
 
 RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=stoffel-coordinator-target-${PROFILE_BUILD},target=/build/target,sharing=locked \
-    if [ "$PROFILE_BUILD" = "true" ]; then \
-        export CARGO_PROFILE_RELEASE_DEBUG=2; \
-        export CARGO_PROFILE_RELEASE_STRIP=none; \
-        export RUSTFLAGS="-C force-frame-pointers=yes"; \
-    fi; \
+    --mount=type=cache,id=stoffel-coordinator-target-profiling,target=/build/target,sharing=locked \
     cargo build --release --features benchmark && \
-    if [ "$PROFILE_BUILD" != "true" ]; then \
-        strip target/release/run-coord; \
-    fi; \
     mkdir -p /build/artifacts && \
     cp target/release/run-coord /build/artifacts/run-coord
 
@@ -61,7 +53,6 @@ RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registr
 #
 # Each top-level *.bt file lands at /app/<name>.bt. A __TARGET_BINARY__
 # placeholder in a script (for uprobes) is replaced with /app/run-coord.
-# For readable user stacks, also pass --build-arg PROFILE_BUILD=true.
 FROM scratch AS profiles
 
 FROM debian:bookworm-slim AS runtime
