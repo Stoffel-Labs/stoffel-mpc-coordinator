@@ -111,6 +111,28 @@ pub trait ShareBound<F: FftField>:
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError>;
 
     fn min_shares(t: usize) -> usize;
+
+    /// Reconstructs many secrets in one call. `shares_by_index[k]` is the share set for the
+    /// k-th secret, same semantics as `recover_secret`'s `shares` argument. Callers must only
+    /// use this when every share set in the batch was contributed by the same senders (share
+    /// ids) -- e.g. a client's per-round mask fetch, where each node either answers for the
+    /// whole requested range or not at all -- since implementors are free to assume that.
+    ///
+    /// The default implementation just calls `recover_secret` once per entry, so implementors
+    /// get this for free; `RobustShare` overrides it with a real batched decoder, for the same
+    /// reason `off-chain` overrides `reserve_mask_indices`/`send_masked_inputs`: reconstructing
+    /// shares one at a time redoes the same fixed-cost interpolation setup for every entry,
+    /// which is what makes clients with many inputs blow past the RPC timeout under load.
+    fn batch_recover_secret(
+        shares_by_index: &[Vec<Self>],
+        n: usize,
+        t: usize,
+    ) -> Result<Vec<Self::ValueType>, Self::Error> {
+        shares_by_index
+            .iter()
+            .map(|shares| Self::recover_secret(shares, n, t).map(|(_, secret)| secret))
+            .collect()
+    }
 }
 
 impl<F: FftField> ShareBound<F> for RobustShare<F> {
@@ -126,6 +148,79 @@ impl<F: FftField> ShareBound<F> for RobustShare<F> {
 
     fn min_shares(t: usize) -> usize {
         2 * t + 1
+    }
+
+    fn batch_recover_secret(
+        shares_by_index: &[Vec<Self>],
+        n: usize,
+        t: usize,
+    ) -> Result<Vec<Self::ValueType>, Self::Error> {
+        let Some(degree) = shares_by_index.iter().find_map(|s| s.first()).map(|s| s.degree) else {
+            return Ok(Vec::new());
+        };
+
+        // Every share set in the batch is assumed to come from the same senders (see the trait
+        // doc comment), so group by sender id once instead of redoing per-sender bookkeeping for
+        // every index. `evals_by_sender[i].1[c]` is that sender's evaluation for chunk `c`.
+        let batch_len = shares_by_index.len();
+        let mut by_sender: HashMap<usize, Vec<F>> = HashMap::new();
+        for (chunk, shares) in shares_by_index.iter().enumerate() {
+            for share in shares {
+                by_sender.entry(share.id).or_insert_with(|| vec![F::zero(); batch_len])[chunk] =
+                    share.share[0];
+            }
+        }
+        let evals_by_sender: Vec<(usize, Vec<F>)> = by_sender.into_iter().collect();
+
+        stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::batch_recover_secret(
+            &evals_by_sender, n, degree, t,
+        )
+        .map(|coeffs_by_index| coeffs_by_index.into_iter().map(|coeffs| coeffs[0]).collect())
+    }
+}
+
+#[cfg(test)]
+mod robust_share_batch_recover_tests {
+    use super::*;
+    use ark_bls12_381::Fr;
+    use ark_std::{test_rng, UniformRand};
+
+    #[test]
+    fn batch_recover_secret_matches_per_index_recover_secret() {
+        let n = 5;
+        let t = 1;
+        let degree = t;
+        let mut rng = test_rng();
+
+        let secrets: Vec<Fr> = (0..10).map(|_| Fr::rand(&mut rng)).collect();
+        let shares_by_index: Vec<Vec<RobustShare<Fr>>> = secrets
+            .iter()
+            .map(|&secret| {
+                let mut shares =
+                    RobustShare::compute_shares(secret, n, degree, None, &mut rng).unwrap();
+                // Same senders for every index: keep only ids 0, 1, 2 (min_shares(1) = 3).
+                shares.retain(|s| s.id < RobustShare::<Fr>::min_shares(t));
+                shares
+            })
+            .collect();
+
+        let batched = RobustShare::batch_recover_secret(&shares_by_index, n, t).unwrap();
+        assert_eq!(batched, secrets, "batched reconstruction must match the original secrets");
+
+        let per_index: Vec<Fr> = shares_by_index
+            .iter()
+            .map(|shares| RobustShare::recover_secret(shares, n, t).unwrap().1)
+            .collect();
+        assert_eq!(
+            batched, per_index,
+            "batched reconstruction must match the existing per-index recover_secret path"
+        );
+    }
+
+    #[test]
+    fn batch_recover_secret_empty_batch_returns_empty() {
+        let result = RobustShare::<Fr>::batch_recover_secret(&[], 5, 1).unwrap();
+        assert!(result.is_empty());
     }
 }
 

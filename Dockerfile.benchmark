@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 
-FROM rustlang/rust:nightly-bookworm AS builder
+FROM rustlang/rust:nightly-bookworm AS chef
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -9,11 +9,51 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+RUN cargo install cargo-chef --locked
+
 WORKDIR /build
 
-COPY . /build
+FROM chef AS planner
 
-RUN cargo build --release --features benchmark && strip target/release/run-coord
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+
+# Always built for profiling: keeps run-coord's debug info and symbols and
+# forces frame pointers, so bpftrace stack samples resolve to function names
+# and uprobes can attach by name.
+ENV CARGO_PROFILE_RELEASE_DEBUG=2 \
+    CARGO_PROFILE_RELEASE_STRIP=none \
+    RUSTFLAGS="-C force-frame-pointers=yes"
+
+COPY --from=planner /build/recipe.json /build/recipe.json
+
+RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=stoffel-coordinator-target-profiling,target=/build/target,sharing=locked \
+    cargo chef cook --release --recipe-path recipe.json --features benchmark
+
+COPY . .
+
+RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=stoffel-coordinator-target-profiling,target=/build/target,sharing=locked \
+    cargo build --release --features benchmark && \
+    mkdir -p /build/artifacts && \
+    cp target/release/run-coord /build/artifacts/run-coord
+
+# Optional bpftrace profiles. Empty by default, so a plain build ships no
+# profiles and no bpftrace. To add some, pass a directory of *.bt files as a
+# build context named "profiles", which replaces this stage:
+#
+#   docker buildx build -f Dockerfile.benchmark --build-context profiles=../my-profiles .
+#   compose:  build: { additional_contexts: { profiles: ../my-profiles } }
+#   CDK:      build_contexts={"profiles": "/absolute/path/to/my-profiles"}
+#
+# Each top-level *.bt file lands at /app/<name>.bt. A __TARGET_BINARY__
+# placeholder in a script (for uprobes) is replaced with /app/run-coord.
+FROM scratch AS profiles
 
 FROM debian:bookworm-slim AS runtime
 
@@ -27,6 +67,15 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/run-coord /app/run-coord
+COPY --from=builder /build/artifacts/run-coord /app/run-coord
+
+COPY --from=profiles / /tmp/bt-profiles/
+RUN if ls /tmp/bt-profiles/*.bt >/dev/null 2>&1; then \
+        apt-get update && apt-get install -y bpftrace && \
+        rm -rf /var/lib/apt/lists/* && \
+        cp /tmp/bt-profiles/*.bt /app/ && \
+        sed -i 's|__TARGET_BINARY__|/app/run-coord|g' /app/*.bt; \
+    fi && \
+    rm -rf /tmp/bt-profiles
 
 ENTRYPOINT ["/app/run-coord"]
