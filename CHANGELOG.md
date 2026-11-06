@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** a node's `browser_bind_webauthn_identity` now requires `execution_id` and rejects identities outside that execution's browser roster, set through the new `NodeRPCServer::register_execution_with_browser_clients`. Executions registered with `register_execution` accept no browser clients.
+- **Breaking:** browser session tokens now belong to one execution and only authenticate requests for it.
+- Signed browser requests may now be dated at most 30 seconds ahead of the server's clock, down from 120.
+
 ### Fixed
 
+- Fixed unbounded memory growth on browser listeners. Nonces and sessions can now only be created for admitted clients of registered executions, are capped per client, and are dropped once their execution is gone.
 - Fixed batched mask reservation and masked-input submission accepting a repeated index. Such a batch is now rejected with the new `DuplicateIndex` RPC error without changing any state, and `wait_for_inputs` counts distinct indices and fails with `CoordinatorError::DuplicateIndex` on a repeat.
 
 ## 0.2.1 - 2026-11-02

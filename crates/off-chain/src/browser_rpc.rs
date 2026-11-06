@@ -38,7 +38,7 @@ use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{hash_map::Entry, HashMap, VecDeque},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -48,10 +48,10 @@ use tokio::sync::Mutex;
 const AUTH_DOMAIN: &[u8] = b"stoffel-browser-rpc-auth";
 const AUTH_ERROR: i32 = -32050;
 const BAD_BODY: i32 = -32602;
-/// How long a signed request stays valid, and how long `NonceBook` needs to
-/// remember a nonce to catch a replay of it - generous enough for normal RPC
-/// latency and browser/server clock drift.
 const NONCE_WINDOW_SECONDS: u64 = 120;
+const MAX_FUTURE_SKEW_SECONDS: u64 = 30;
+const MAX_SEEN_NONCES_PER_CLIENT: usize = 1024;
+const MAX_SESSIONS_PER_CLIENT: usize = 8;
 
 #[derive(Clone, Debug, Deserialize)]
 struct SignedBrowserRequest {
@@ -129,6 +129,7 @@ struct WebauthnBindingResponse {
 
 #[derive(Clone, Debug)]
 pub(crate) struct WebauthnBinding {
+    pub(crate) execution_id: ExecutionId,
     pub(crate) client_identity: ClientIdentity,
     pub(crate) ecdsa_public_key: Vec<u8>,
     pub(crate) ecdh_public_key: Vec<u8>,
@@ -139,13 +140,12 @@ pub(crate) struct WebauthnBinding {
 /// ephemeral key pair to act as a registered identity for every subsequent
 /// signed request that presents the returned `session_token`
 /// (`SignedBrowserRequest::session_token`, checked in `authenticate`).
-/// `by_token` is deliberately not scoped to one execution id: the bound
-/// identity itself is what's checked against each execution's own admitted
-/// roster downstream (`output_clients.contains`/`input_slot_client`,
-/// unchanged), so one binding is reusable across every execution the
-/// session subsequently interacts with. Scoped to this coordinator
-/// process's lifetime for now; an idle-timeout eviction policy is a
-/// reasonable future addition, not implemented yet.
+/// Each binding belongs to one execution and only authenticates requests for
+/// it, so that every `NonceBook` entry traces back to an admitted client of a
+/// real execution. Bindings are dropped once their execution is gone (see
+/// `retain_executions`), and each client keeps at most
+/// `MAX_SESSIONS_PER_CLIENT` of them, which together bound this table by the
+/// rosters of the registered executions.
 ///
 /// `pub(crate)`, not private to this module: `CoordinatorRPCServerSharedBase`
 /// (in `lib.rs`) holds a `webauthn_bindings: Arc<Mutex<WebauthnBindings>>` -
@@ -177,31 +177,42 @@ pub(crate) struct WebauthnBindings {
     /// still just overwrites its own entry with an identical value, so
     /// that case is unaffected.
     by_execution_and_client_identity: HashMap<(ExecutionId, ClientIdentity), WebauthnBinding>,
+    /// The live tokens of each client in each execution, oldest first.
+    tokens_by_client: HashMap<(ExecutionId, ClientIdentity), VecDeque<String>>,
 }
 
 impl WebauthnBindings {
-    /// `execution_id` is `None` for the party-side call site specifically:
-    /// a party's own `WebauthnBindings` instance never has
-    /// `resolve_ecdh_public_key` called against it (only the coordinator's
-    /// does, via `resolve_output_encryption_key` - see the struct doc), so
-    /// there's nothing to scope there and no `ExecutionId` to thread
-    /// through `BindWebauthnIdentityToNode`'s wire format for it.
-    fn insert(&mut self, execution_id: Option<ExecutionId>, binding: WebauthnBinding) -> String {
-        loop {
+    fn insert(&mut self, binding: WebauthnBinding) -> String {
+        let key = (binding.execution_id, binding.client_identity.clone());
+        let token = loop {
             let mut token_bytes = [0u8; 32];
             rand::rng().fill_bytes(&mut token_bytes);
             let token = URL_SAFE_NO_PAD.encode(token_bytes);
             if let Entry::Vacant(entry) = self.by_token.entry(token.clone()) {
-                if let Some(execution_id) = execution_id {
-                    self.by_execution_and_client_identity.insert(
-                        (execution_id, binding.client_identity.clone()),
-                        binding.clone(),
-                    );
-                }
+                self.by_execution_and_client_identity
+                    .insert(key.clone(), binding.clone());
                 entry.insert(binding);
-                return token;
+                break token;
+            }
+        };
+        let tokens = self.tokens_by_client.entry(key).or_default();
+        tokens.push_back(token.clone());
+        if tokens.len() > MAX_SESSIONS_PER_CLIENT {
+            if let Some(oldest) = tokens.pop_front() {
+                self.by_token.remove(&oldest);
             }
         }
+        token
+    }
+
+    /// Drops every session of an execution that is no longer registered.
+    fn retain_executions(&mut self, live: &HashSet<ExecutionId>) {
+        self.by_token
+            .retain(|_, binding| live.contains(&binding.execution_id));
+        self.by_execution_and_client_identity
+            .retain(|(execution_id, _), _| live.contains(execution_id));
+        self.tokens_by_client
+            .retain(|(execution_id, _), _| live.contains(execution_id));
     }
 
     /// The session-bound ECDH public key output shares for `execution_id`
@@ -290,11 +301,13 @@ type SeenNonces = VecDeque<(u64, [u8; 16])>;
 /// Tracks recently-seen `(created, nonce)` pairs per `(execution_id,
 /// identity)`, within a sliding `NONCE_WINDOW_SECONDS` window - see the
 /// module doc for why this replaces a simple monotonic counter. Every key
-/// that can reach `accept` has already passed `browser_bind_webauthn_identity`'s
-/// roster check (see `authenticate` and `SignedBrowserRequest::session_token`),
-/// so the identity space here is bounded by the execution's actual roster,
-/// not by attacker-chosen input - no separate cap on tracked identities is
-/// needed on top of the per-key window.
+/// that can reach `accept` comes from a session that passed
+/// `browser_bind_webauthn_identity`'s roster check for that same execution
+/// (see `authenticate`), and keys are dropped with their execution (see
+/// `retain_executions`), so the keys here are bounded by the rosters of the
+/// registered executions rather than by attacker-chosen input. Expired
+/// nonces are only removed when their own key is used again, which is why
+/// keys need that explicit cleanup and each key its own cap.
 #[derive(Default)]
 struct NonceBook {
     seen: HashMap<(ExecutionId, ClientIdentity), SeenNonces>,
@@ -309,7 +322,9 @@ impl NonceBook {
         nonce: [u8; 16],
         now: u64,
     ) -> RpcResult<()> {
-        if now.abs_diff(created) > NONCE_WINDOW_SECONDS {
+        if now.saturating_sub(created) > NONCE_WINDOW_SECONDS
+            || created.saturating_sub(now) > MAX_FUTURE_SKEW_SECONDS
+        {
             return Err(auth_error(
                 "request timestamp is outside the accepted window",
             ));
@@ -320,8 +335,17 @@ impl NonceBook {
         if entries.iter().any(|(_, seen_nonce)| *seen_nonce == nonce) {
             return Err(auth_error("request nonce was already used"));
         }
+        if entries.len() >= MAX_SEEN_NONCES_PER_CLIENT {
+            return Err(auth_error("too many recent requests from this client"));
+        }
         entries.push_back((created, nonce));
         Ok(())
+    }
+
+    /// Drops the nonces of every execution that is no longer registered.
+    fn retain_executions(&mut self, live: &HashSet<ExecutionId>) {
+        self.seen
+            .retain(|(execution_id, _), _| live.contains(execution_id));
     }
 }
 
@@ -388,17 +412,16 @@ struct NodeBrowserState {
     origin: String,
 }
 
-/// Request body for a node's own `browser_bind_webauthn_identity`. Unlike
-/// the coordinator's version, a node has no independently-held admission
-/// roster to scan candidates from (`NodeRPCExecutionState` only tracks
-/// index-to-client assignments as they happen, not a roster known up
-/// front - see its doc). The browser already learned its own registered
-/// identity from the coordinator's own bind response, so it's supplied
-/// directly here - safely, since acceptance is still gated purely by the
-/// WebAuthn assertion actually verifying against this exact claimed key,
-/// not by trusting the claim itself.
+/// Request body for a node's own `browser_bind_webauthn_identity`. The
+/// browser already learned its own registered identity from the
+/// coordinator's own bind response, so it's supplied directly here instead
+/// of being found by a scan. The claim is checked against the execution's
+/// roster and the WebAuthn assertion must verify against that key; the
+/// assertion alone proves nothing, since anyone can produce one for a key
+/// they just generated.
 #[derive(Clone, Debug, Deserialize)]
 struct BindWebauthnIdentityToNode {
+    execution_id: ExecutionId,
     client_identity: ClientIdentity,
     assertion: WebauthnAssertion,
     ecdsa_public_key: Vec<u8>,
@@ -719,6 +742,7 @@ pub async fn coordinator_browser_methods(
                         "this identity has already submitted its input for this execution and cannot bind again",
                     ));
                 }
+                let live_executions = coordinator.executions.keys().copied().collect();
                 drop(coordinator);
 
                 state
@@ -727,14 +751,16 @@ pub async fn coordinator_browser_methods(
                     .await
                     .accept(&client_identity, sign_count)?;
 
-                let session_token = state.bindings.lock().await.insert(
-                    Some(call.execution_id),
-                    WebauthnBinding {
-                        client_identity: client_identity.clone(),
-                        ecdsa_public_key: call.ecdsa_public_key,
-                        ecdh_public_key: call.ecdh_public_key,
-                    },
-                );
+                state.nonces.lock().await.retain_executions(&live_executions);
+                let mut bindings = state.bindings.lock().await;
+                bindings.retain_executions(&live_executions);
+                let session_token = bindings.insert(WebauthnBinding {
+                    execution_id: call.execution_id,
+                    client_identity: client_identity.clone(),
+                    ecdsa_public_key: call.ecdsa_public_key,
+                    ecdh_public_key: call.ecdh_public_key,
+                });
+                drop(bindings);
                 Ok(WebauthnBindingResponse {
                     session_token,
                     client_identity,
@@ -795,6 +821,23 @@ pub fn node_browser_methods(node: Arc<Mutex<NodeRPCServerInternal>>, rp_id: &str
             "browser_bind_webauthn_identity",
             |params, state, _| async move {
                 let call: BindWebauthnIdentityToNode = params.one()?;
+                // Checked first, because every later step keeps state for this identity. The
+                // browser client retries the "not registered" error, since a party can register
+                // an execution after the coordinator has already admitted the client.
+                let (execution, live_executions) = {
+                    let node = state.node.lock().await;
+                    let execution = node
+                        .execution_state(call.execution_id)
+                        .ok_or_else(|| rpc_error(-32016, "execution is not registered"))?;
+                    (execution, node.execution_ids())
+                };
+                if !execution
+                    .lock()
+                    .await
+                    .admits_browser_client(&call.client_identity)
+                {
+                    return Err(auth_error("identity is not admitted for this execution"));
+                }
                 let challenge =
                     webauthn_bind_challenge(&call.ecdsa_public_key, &call.ecdh_public_key);
                 let sign_count = verify_webauthn_assertion(
@@ -812,16 +855,20 @@ pub fn node_browser_methods(node: Arc<Mutex<NodeRPCServerInternal>>, rp_id: &str
                     .lock()
                     .await
                     .accept(&call.client_identity, sign_count)?;
-                // None: a party's own WebauthnBindings never has resolve_ecdh_public_key
-                // called against it - see the struct's doc.
-                let session_token = state.bindings.lock().await.insert(
-                    None,
-                    WebauthnBinding {
-                        client_identity: call.client_identity.clone(),
-                        ecdsa_public_key: call.ecdsa_public_key,
-                        ecdh_public_key: call.ecdh_public_key,
-                    },
-                );
+                state
+                    .nonces
+                    .lock()
+                    .await
+                    .retain_executions(&live_executions);
+                let mut bindings = state.bindings.lock().await;
+                bindings.retain_executions(&live_executions);
+                let session_token = bindings.insert(WebauthnBinding {
+                    execution_id: call.execution_id,
+                    client_identity: call.client_identity.clone(),
+                    ecdsa_public_key: call.ecdsa_public_key,
+                    ecdh_public_key: call.ecdh_public_key,
+                });
+                drop(bindings);
                 Ok(WebauthnBindingResponse {
                     session_token,
                     client_identity: call.client_identity,
@@ -994,6 +1041,9 @@ async fn authenticate(
             .ok_or_else(|| auth_error("unknown or expired session token"))?;
         if binding.ecdsa_public_key != call.request.public_key {
             return Err(auth_error("session token is not bound to this signing key"));
+        }
+        if binding.execution_id != call.execution_id {
+            return Err(auth_error("session token is not bound to this execution"));
         }
         binding.client_identity.clone()
     };
@@ -1548,14 +1598,12 @@ mod tests {
         let ecdsa_public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
         let stable_identity: ClientIdentity = vec![42];
         let mut bindings = WebauthnBindings::default();
-        let token = bindings.insert(
-            Some(execution_id()),
-            WebauthnBinding {
-                client_identity: stable_identity.clone(),
-                ecdsa_public_key: ecdsa_public_key.clone(),
-                ecdh_public_key: vec![7],
-            },
-        );
+        let token = bindings.insert(WebauthnBinding {
+            execution_id: execution_id(),
+            client_identity: stable_identity.clone(),
+            ecdsa_public_key: ecdsa_public_key.clone(),
+            ecdh_public_key: vec![7],
+        });
         let bindings = Mutex::new(bindings);
         let nonces = Mutex::new(NonceBook::default());
 
@@ -1595,14 +1643,12 @@ mod tests {
         let attacker_public_key = VerifyingKey::from(&attacker_key).to_sec1_bytes().to_vec();
 
         let mut bindings = WebauthnBindings::default();
-        let token = bindings.insert(
-            Some(execution_id()),
-            WebauthnBinding {
-                client_identity: vec![42],
-                ecdsa_public_key: bound_public_key,
-                ecdh_public_key: vec![7],
-            },
-        );
+        let token = bindings.insert(WebauthnBinding {
+            execution_id: execution_id(),
+            client_identity: vec![42],
+            ecdsa_public_key: bound_public_key,
+            ecdh_public_key: vec![7],
+        });
         let bindings = Mutex::new(bindings);
         let nonces = Mutex::new(NonceBook::default());
 
@@ -1680,14 +1726,12 @@ mod tests {
         let signing_key = test_signing_key();
         let ecdsa_public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
         let mut bindings = WebauthnBindings::default();
-        let token = bindings.insert(
-            Some(execution_id()),
-            WebauthnBinding {
-                client_identity: vec![42],
-                ecdsa_public_key: ecdsa_public_key.clone(),
-                ecdh_public_key: vec![7],
-            },
-        );
+        let token = bindings.insert(WebauthnBinding {
+            execution_id: execution_id(),
+            client_identity: vec![42],
+            ecdsa_public_key: ecdsa_public_key.clone(),
+            ecdh_public_key: vec![7],
+        });
         let bindings = Mutex::new(bindings);
         let nonces = Mutex::new(NonceBook::default());
 
@@ -1864,6 +1908,278 @@ mod tests {
         nonces
             .accept(execution, &identity, later, test_nonce(1), later)
             .expect("nonce reused only after its window has fully elapsed");
+    }
+
+    #[test]
+    fn nonce_book_limits_how_far_ahead_a_request_can_be_dated() {
+        let identity = vec![20];
+        let execution = execution_id();
+        let mut nonces = NonceBook::default();
+        let now = TEST_CREATED;
+
+        nonces
+            .accept(
+                execution,
+                &identity,
+                now + MAX_FUTURE_SKEW_SECONDS,
+                test_nonce(1),
+                now,
+            )
+            .expect("ordinary clock skew is tolerated");
+        assert!(nonces
+            .accept(
+                execution,
+                &identity,
+                now + MAX_FUTURE_SKEW_SECONDS + 1,
+                test_nonce(2),
+                now,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn nonce_book_still_rejects_a_replay_of_a_future_dated_request() {
+        let identity = vec![20];
+        let execution = execution_id();
+        let mut nonces = NonceBook::default();
+        let created = TEST_CREATED + MAX_FUTURE_SKEW_SECONDS;
+
+        nonces
+            .accept(execution, &identity, created, test_nonce(1), TEST_CREATED)
+            .expect("first use");
+        // The last moment this request is still valid: its nonce must not have been dropped.
+        let last_valid = created + NONCE_WINDOW_SECONDS;
+        assert!(nonces
+            .accept(execution, &identity, created, test_nonce(1), last_valid)
+            .is_err());
+    }
+
+    #[test]
+    fn nonce_book_refuses_new_nonces_for_a_full_client_instead_of_evicting() {
+        let identity = vec![20];
+        let execution = execution_id();
+        let mut nonces = NonceBook::default();
+
+        let mut nonce_bytes = [0u8; 16];
+        for i in 0..MAX_SEEN_NONCES_PER_CLIENT as u64 {
+            nonce_bytes[..8].copy_from_slice(&i.to_le_bytes());
+            nonces
+                .accept(
+                    execution,
+                    &identity,
+                    TEST_CREATED,
+                    nonce_bytes,
+                    TEST_CREATED,
+                )
+                .expect("below the cap");
+        }
+        nonce_bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(nonces
+            .accept(
+                execution,
+                &identity,
+                TEST_CREATED,
+                nonce_bytes,
+                TEST_CREATED
+            )
+            .is_err());
+
+        // The first nonce is still remembered, so that request cannot be replayed.
+        let first = nonces.seen.get(&(execution, identity.clone())).unwrap();
+        assert_eq!(first.len(), MAX_SEEN_NONCES_PER_CLIENT);
+        assert_eq!(first.front().unwrap().1, [0u8; 16]);
+
+        // Once the window moves on, the client can send again.
+        let later = TEST_CREATED + NONCE_WINDOW_SECONDS + 1;
+        nonces
+            .accept(execution, &identity, later, nonce_bytes, later)
+            .expect("expired nonces free the cap");
+    }
+
+    #[test]
+    fn nonce_book_drops_keys_of_retired_executions() {
+        let identity = vec![20];
+        let retired = ExecutionId::from_bytes([1; 32]);
+        let live = ExecutionId::from_bytes([2; 32]);
+        let mut nonces = NonceBook::default();
+
+        for execution in [retired, live] {
+            nonces
+                .accept(
+                    execution,
+                    &identity,
+                    TEST_CREATED,
+                    test_nonce(1),
+                    TEST_CREATED,
+                )
+                .expect("first use");
+        }
+        nonces.retain_executions(&HashSet::from([live]));
+
+        assert_eq!(nonces.seen.len(), 1);
+        assert!(nonces.seen.contains_key(&(live, identity)));
+    }
+
+    fn test_binding(execution_id: ExecutionId, client_identity: &[u8]) -> WebauthnBinding {
+        WebauthnBinding {
+            execution_id,
+            client_identity: client_identity.to_vec(),
+            ecdsa_public_key: vec![0xA1],
+            ecdh_public_key: vec![0xA; 65],
+        }
+    }
+
+    #[test]
+    fn a_new_session_replaces_a_clients_oldest_once_it_has_the_maximum() {
+        let mut bindings = WebauthnBindings::default();
+        let tokens = (0..=MAX_SESSIONS_PER_CLIENT)
+            .map(|_| bindings.insert(test_binding(execution_id(), &[42])))
+            .collect::<Vec<_>>();
+
+        assert!(bindings.get(&tokens[0]).is_none());
+        assert!(tokens[1..]
+            .iter()
+            .all(|token| bindings.get(token).is_some()));
+        assert_eq!(bindings.by_token.len(), MAX_SESSIONS_PER_CLIENT);
+    }
+
+    #[test]
+    fn retain_executions_drops_every_session_of_a_retired_execution() {
+        let retired = ExecutionId::from_bytes([1; 32]);
+        let live = ExecutionId::from_bytes([2; 32]);
+        let mut bindings = WebauthnBindings::default();
+        let retired_token = bindings.insert(test_binding(retired, &[42]));
+        let live_token = bindings.insert(test_binding(live, &[42]));
+
+        bindings.retain_executions(&HashSet::from([live]));
+
+        assert!(bindings.get(&retired_token).is_none());
+        assert!(bindings.get(&live_token).is_some());
+        assert_eq!(bindings.resolve_ecdh_public_key(retired, &vec![42]), None);
+        assert_eq!(bindings.tokens_by_client.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_a_session_token_from_another_execution_without_keeping_state() {
+        let signing_key = test_signing_key();
+        let ecdsa_public_key = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let mut bindings = WebauthnBindings::default();
+        let token = bindings.insert(WebauthnBinding {
+            execution_id: execution_id(),
+            client_identity: vec![42],
+            ecdsa_public_key: ecdsa_public_key.clone(),
+            ecdh_public_key: vec![7],
+        });
+        let bindings = Mutex::new(bindings);
+        let nonces = Mutex::new(NonceBook::default());
+
+        let other_execution = ExecutionId::from_bytes([0xEE; 32]);
+        let created = current_unix_time();
+        let nonce = test_nonce(1);
+        let message = authentication_message(
+            "browser_round",
+            other_execution,
+            created,
+            &nonce,
+            b"",
+            &token,
+        );
+        let signature: Signature = signing_key.sign(&message);
+        let call = BrowserCall {
+            execution_id: other_execution,
+            request: SignedBrowserRequest {
+                public_key: ecdsa_public_key,
+                created,
+                nonce: nonce.to_vec(),
+                signature: signature.to_vec(),
+                body: Vec::new(),
+                session_token: token,
+            },
+        };
+
+        assert!(authenticate("browser_round", &call, &nonces, &bindings)
+            .await
+            .is_err());
+        assert!(nonces.lock().await.seen.is_empty());
+    }
+
+    /// A node with `execution_id()` registered for `roster`, and the bind request a client
+    /// holding `signing_key` would send it.
+    async fn node_bind_fixture(
+        signing_key: &SigningKey,
+        roster: Vec<ClientIdentity>,
+        registered: bool,
+    ) -> (Methods, serde_json::Value) {
+        let mut node = NodeRPCServerInternal::new();
+        if registered {
+            node.register_execution(execution_id(), roster)
+                .expect("register execution");
+        }
+        let methods = node_browser_methods(Arc::new(Mutex::new(node)), TEST_RP_ID);
+
+        let ecdsa_public_key = b"ecdsa-pub".to_vec();
+        let ecdh_public_key = b"ecdh-pub".to_vec();
+        let challenge = webauthn_bind_challenge(&ecdsa_public_key, &ecdh_public_key);
+        let assertion =
+            make_assertion_with_sign_count(signing_key, &challenge, TEST_ORIGIN, true, true, 1);
+        let params = serde_json::json!({
+            "execution_id": execution_id().as_bytes(),
+            "client_identity": VerifyingKey::from(signing_key).to_sec1_bytes().to_vec(),
+            "assertion": {
+                "authenticator_data": assertion.authenticator_data,
+                "client_data_json": assertion.client_data_json,
+                "signature": assertion.signature,
+            },
+            "ecdsa_public_key": ecdsa_public_key,
+            "ecdh_public_key": ecdh_public_key,
+        });
+        (methods, params)
+    }
+
+    #[tokio::test]
+    async fn node_bind_accepts_a_client_on_the_execution_roster() {
+        let signing_key = test_signing_key();
+        let identity = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let (methods, params) = node_bind_fixture(&signing_key, vec![identity], true).await;
+
+        methods
+            .call::<_, serde_json::Value>("browser_bind_webauthn_identity", (params,))
+            .await
+            .expect("an admitted client must be able to bind");
+    }
+
+    // The key is self-generated and the assertion genuinely verifies against it, so only the
+    // roster stands between an arbitrary caller and a stored session.
+    #[tokio::test]
+    async fn node_bind_rejects_a_self_generated_identity_that_is_not_on_the_roster() {
+        let signing_key = test_signing_key();
+        let (methods, params) = node_bind_fixture(&signing_key, vec![vec![42]], true).await;
+
+        let result: Result<serde_json::Value, _> = methods
+            .call("browser_bind_webauthn_identity", (params,))
+            .await;
+        let error = format!(
+            "{:?}",
+            result.expect_err("off-roster identity must be rejected")
+        );
+        assert!(error.contains("not admitted"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn node_bind_reports_an_unregistered_execution_so_the_client_can_retry() {
+        let signing_key = test_signing_key();
+        let identity = VerifyingKey::from(&signing_key).to_sec1_bytes().to_vec();
+        let (methods, params) = node_bind_fixture(&signing_key, vec![identity], false).await;
+
+        let result: Result<serde_json::Value, _> = methods
+            .call("browser_bind_webauthn_identity", (params,))
+            .await;
+        let error = format!(
+            "{:?}",
+            result.expect_err("unknown execution must be rejected")
+        );
+        // stoffel-browser-client.js retries on exactly this text.
+        assert!(error.contains("execution is not registered"), "{error}");
     }
 
     #[tokio::test]
@@ -2146,22 +2462,18 @@ mod tests {
         // executions - this is exactly the "several elections at once" scenario that used
         // to silently let the second bind steal the first execution's output-encryption
         // target, since the old by_client_identity map was keyed by identity alone.
-        bindings.insert(
-            Some(exec_a),
-            WebauthnBinding {
-                client_identity: identity.clone(),
-                ecdsa_public_key: vec![0xA1],
-                ecdh_public_key: vec![0xA; 65],
-            },
-        );
-        bindings.insert(
-            Some(exec_b),
-            WebauthnBinding {
-                client_identity: identity.clone(),
-                ecdsa_public_key: vec![0xB1],
-                ecdh_public_key: vec![0xB; 65],
-            },
-        );
+        bindings.insert(WebauthnBinding {
+            execution_id: exec_a,
+            client_identity: identity.clone(),
+            ecdsa_public_key: vec![0xA1],
+            ecdh_public_key: vec![0xA; 65],
+        });
+        bindings.insert(WebauthnBinding {
+            execution_id: exec_b,
+            client_identity: identity.clone(),
+            ecdsa_public_key: vec![0xB1],
+            ecdh_public_key: vec![0xB; 65],
+        });
 
         assert_eq!(
             bindings.resolve_ecdh_public_key(exec_a, &identity),
@@ -2176,49 +2488,26 @@ mod tests {
     }
 
     #[test]
-    fn insert_without_an_execution_id_does_not_populate_the_secondary_index() {
-        let mut bindings = WebauthnBindings::default();
-        let identity: ClientIdentity = vec![42];
-        let exec_a = ExecutionId::from_bytes([1; 32]);
-
-        // The party-side call site - see insert()'s own doc for why None is correct there.
-        bindings.insert(
-            None,
-            WebauthnBinding {
-                client_identity: identity.clone(),
-                ecdsa_public_key: vec![0xA1],
-                ecdh_public_key: vec![0xA; 65],
-            },
-        );
-
-        assert_eq!(bindings.resolve_ecdh_public_key(exec_a, &identity), None);
-    }
-
-    #[test]
     fn pin_binding_from_token_re_affirms_the_execution_scoped_entry() {
         let mut bindings = WebauthnBindings::default();
         let identity: ClientIdentity = vec![42];
         let exec = execution_id();
 
         // Tab 1 binds - key A, token A.
-        let token_a = bindings.insert(
-            Some(exec),
-            WebauthnBinding {
-                client_identity: identity.clone(),
-                ecdsa_public_key: vec![0xA1],
-                ecdh_public_key: vec![0xA; 65],
-            },
-        );
+        let token_a = bindings.insert(WebauthnBinding {
+            execution_id: exec,
+            client_identity: identity.clone(),
+            ecdsa_public_key: vec![0xA1],
+            ecdh_public_key: vec![0xA; 65],
+        });
         // A second, still-legitimate bind for the same identity (e.g. a different tab,
         // before either has submitted) - overwrites the live entry to key B.
-        bindings.insert(
-            Some(exec),
-            WebauthnBinding {
-                client_identity: identity.clone(),
-                ecdsa_public_key: vec![0xB1],
-                ecdh_public_key: vec![0xB; 65],
-            },
-        );
+        bindings.insert(WebauthnBinding {
+            execution_id: exec,
+            client_identity: identity.clone(),
+            ecdsa_public_key: vec![0xB1],
+            ecdh_public_key: vec![0xB; 65],
+        });
         assert_eq!(
             bindings.resolve_ecdh_public_key(exec, &identity),
             Some(vec![0xB; 65]),

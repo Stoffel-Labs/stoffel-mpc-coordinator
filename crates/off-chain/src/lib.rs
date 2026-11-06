@@ -155,7 +155,7 @@ pub mod node_rpc {
         PendingSubscriptionSink, SubscriptionSink,
     };
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::marker::PhantomData;
     use std::sync::Arc;
     use stoffel_mpc_coordinator_shared::{
@@ -419,15 +419,28 @@ pub mod node_rpc {
             self.server_handle.shutdown().await;
         }
 
-        /// Registers a program invocation on this long-running listener.
+        /// Registers a program invocation on this long-running listener. Its browser roster is
+        /// empty, so no browser client can bind to it; see
+        /// `register_execution_with_browser_clients`.
         pub async fn register_execution(
             &self,
             execution_id: ExecutionId,
         ) -> Result<(), CoordinatorError> {
+            self.register_execution_with_browser_clients(execution_id, Vec::new())
+                .await
+        }
+
+        /// Registers a program invocation whose `browser_clients` may bind over this node's
+        /// browser listener. The native mTLS transport does not consult this roster.
+        pub async fn register_execution_with_browser_clients(
+            &self,
+            execution_id: ExecutionId,
+            browser_clients: Vec<ClientIdentity>,
+        ) -> Result<(), CoordinatorError> {
             self.rpc_server
                 .lock()
                 .await
-                .register_execution(execution_id)
+                .register_execution(execution_id, browser_clients)
         }
 
         /// Stops admitting new RPCs for an invocation and drops all of its node-side state.
@@ -683,6 +696,8 @@ pub mod node_rpc {
         assigned_sinks: HashMap<ClientIdentity, AssignedMaskRequest>,
         /// Preprocessed mask shares, indexed only within this execution.
         mask_shares: HashMap<u64, Vec<u8>>,
+        /// The identities allowed to bind over this node's browser listener.
+        browser_clients: HashSet<ClientIdentity>,
     }
 
     struct AssignedMaskRequest {
@@ -692,15 +707,16 @@ pub mod node_rpc {
     }
 
     impl NodeRPCServerInternal {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 executions: HashMap::new(),
             }
         }
 
-        fn register_execution(
+        pub(crate) fn register_execution(
             &mut self,
             execution_id: ExecutionId,
+            browser_clients: Vec<ClientIdentity>,
         ) -> Result<(), CoordinatorError> {
             if execution_id.is_zero() {
                 return Err(CoordinatorError::JSONError(
@@ -720,13 +736,18 @@ pub mod node_rpc {
             }
             self.executions.insert(
                 execution_id,
-                Arc::new(Mutex::new(NodeRPCExecutionState::new())),
+                Arc::new(Mutex::new(NodeRPCExecutionState::new(browser_clients))),
             );
             Ok(())
         }
 
         fn retire_execution(&mut self, execution_id: ExecutionId) -> bool {
             self.executions.remove(&execution_id).is_some()
+        }
+
+        /// The executions currently registered; `browser_rpc` drops sessions for all others.
+        pub(crate) fn execution_ids(&self) -> HashSet<ExecutionId> {
+            self.executions.keys().copied().collect()
         }
 
         /// `pub(crate)`, not private: `browser_rpc` (a sibling module, not a descendant of
@@ -742,13 +763,19 @@ pub mod node_rpc {
     }
 
     impl NodeRPCExecutionState {
-        fn new() -> Self {
+        fn new(browser_clients: Vec<ClientIdentity>) -> Self {
             Self {
                 index_to_client: HashMap::new(),
                 assigned_reservations: HashMap::new(),
                 assigned_sinks: HashMap::new(),
                 mask_shares: HashMap::new(),
+                browser_clients: browser_clients.into_iter().collect(),
             }
+        }
+
+        /// `pub(crate)`, not private -- see `execution_state`'s doc above.
+        pub(crate) fn admits_browser_client(&self, client: &ClientIdentity) -> bool {
+            self.browser_clients.contains(client)
         }
     }
 
