@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fixed batched mask reservation and masked-input submission accepting a repeated index. Such a batch is now rejected with the new `DuplicateIndex` RPC error without changing any state, and `wait_for_inputs` counts distinct indices and fails with `CoordinatorError::DuplicateIndex` on a repeat.
+
 ## 0.2.1 - 2026-11-02
 
 ### Added
