@@ -847,6 +847,124 @@ async fn client_may_only_call_reserve_mask_indices_once() {
     );
 }
 
+#[tokio::test]
+async fn reserve_mask_indices_rejects_repeated_indices_without_reserving_any() {
+    stoffel_mpc_coordinator_shared::setup_test();
+    let cert = client_cert();
+    let execution_id = execution(0x4e);
+    let state = coordinator_state(
+        execution_id,
+        1,
+        0,
+        vec![cert.signing_key.public_key_raw().to_vec()],
+        2,
+        vec![],
+    );
+    let port = free_port();
+    let _server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        state,
+        "127.0.0.1",
+        port,
+        0,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+    let mut node = start_coord_client(execution_id, "127.0.0.1", port, 0, 1, 0, cert).await;
+
+    node.start_preprocessing().await.unwrap();
+    node.wait_for_round(Round::Preprocessing).await.unwrap();
+    node.reserve_input_masks().await.unwrap();
+    node.wait_for_round(Round::InputMaskReservation)
+        .await
+        .unwrap();
+
+    let error = node
+        .reserve_mask_indices(&[0, 0])
+        .await
+        .expect_err("a batch that repeats an index must be rejected");
+    assert!(
+        error.to_string().contains("occurs more than once"),
+        "{error}"
+    );
+
+    // This client may only reserve once, so this succeeds only if the rejected batch left no
+    // reservation behind.
+    node.reserve_mask_indices(&[0, 1])
+        .await
+        .expect("the rejected batch must not have reserved anything");
+}
+
+#[tokio::test]
+async fn submit_masked_inputs_rejects_repeated_indices_without_recording_any() {
+    stoffel_mpc_coordinator_shared::setup_test();
+
+    let node_certs = (0..3).map(|_| server_cert()).collect::<Vec<_>>();
+    let client = client_cert();
+    let public_keys = node_certs
+        .iter()
+        .map(|c| c.signing_key.public_key_raw().to_vec())
+        .collect::<Vec<_>>();
+
+    let addr = "127.0.0.1";
+    let port = free_port();
+    let execution_id = execution(0x54);
+    let server_state = coordinator_state(execution_id, 3, 1, public_keys, 2, vec![]);
+    let _coord = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+        server_state,
+        addr,
+        port,
+        1,
+        server_cert(),
+    )
+    .await
+    .unwrap();
+
+    let mut nodes = Vec::new();
+    for cert in node_certs {
+        nodes.push(start_coord_client(execution_id, addr, port, 1, 3, 0, cert).await);
+    }
+    let mut client = start_coord_client(execution_id, addr, port, 1, 3, 0, client).await;
+
+    propose_round(&nodes, Round::Preprocessing).await;
+    propose_round(&nodes, Round::InputMaskReservation).await;
+    client
+        .wait_for_round(Round::InputMaskReservation)
+        .await
+        .unwrap();
+    client.reserve_mask_indices(&[0, 1]).await.unwrap();
+
+    propose_round(&nodes, Round::InputCollection).await;
+    client.wait_for_round(Round::InputCollection).await.unwrap();
+
+    let error = client
+        .send_masked_inputs(&[(0, Fr::from(7)), (0, Fr::from(8))])
+        .await
+        .expect_err("a batch that repeats an index must be rejected");
+    assert!(
+        error.to_string().contains("occurs more than once"),
+        "{error}"
+    );
+
+    // Slot 0 was not filled: resubmitting it would otherwise fail as already submitted.
+    client
+        .send_masked_inputs(&[(0, Fr::from(7)), (1, Fr::from(9))])
+        .await
+        .expect("the rejected batch must not have recorded anything");
+
+    // Parties replay the event history, so a stored duplicate event would fail this wait.
+    let ids = sample_ids(3);
+    let mut rng = test_rng();
+    let mask_shares = [Fr::from(2), Fr::from(3)].map(|mask| {
+        HoneyBadgerShareType::compute_shares(mask, 3, 1, Some(&ids), &mut rng).unwrap()[0].clone()
+    });
+    let inputs = nodes[0]
+        .wait_for_inputs(2, mask_shares.to_vec())
+        .await
+        .expect("no duplicate event may have been stored");
+    assert_eq!(inputs.values().map(Vec::len).sum::<usize>(), 2);
+}
+
 // Goes through one entire program execution, calling all needed coordinator methods.
 #[tokio::test]
 async fn end_to_end() {

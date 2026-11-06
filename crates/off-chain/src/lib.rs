@@ -1077,6 +1077,7 @@ pub enum CoordinatorRPCBaseError {
     ExecutionAlreadyRegistered = 17,
     ShutdownNotAccepted = 18,
     EmptyBatch = 19,
+    DuplicateIndex = 20,
 }
 
 /// Every round except `Idle`, in protocol order.
@@ -1088,6 +1089,25 @@ const ORDERED_ROUNDS: [Round; 6] = [
     Round::OutputDistribution,
     Round::ProgramFinished,
 ];
+
+/// Rejects a batch that names the same index twice.
+///
+/// Batch validation checks each index against the state from before the batch, so without this
+/// guard every occurrence of an index would pass, and the event would hold more entries than the
+/// batch fills slots. Parties count those entries, so it has to run before any state changes.
+fn reject_duplicate_indices(indices: &[u64]) -> RpcResult<()> {
+    let mut seen = HashSet::with_capacity(indices.len());
+    for &index in indices {
+        if !seen.insert(index) {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(DuplicateIndex as i32).code(),
+                format!("The index {index} occurs more than once in this batch."),
+                None::<()>,
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn execution_not_found(execution_id: ExecutionId) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(
@@ -2107,6 +2127,8 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
+        reject_duplicate_indices(&reserved_indices)?;
+
         // Validate every index before applying any of them, so the batch is atomic: either all
         // of `reserved_indices` end up with a masked input recorded, or (on error) none do.
         for &raw_reserved_index in &reserved_indices {
@@ -2312,6 +2334,8 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
                 None::<()>,
             ));
         }
+
+        reject_duplicate_indices(&indices)?;
 
         // Clients must reserve all of their indices in a single (batched) call: once a client
         // owns any entry in `reserved_indices`, it gets no second call to add more piecemeal.
@@ -2999,16 +3023,20 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         // Each event now carries every (index, masked input) pair submitted by one
         // `submit_masked_input`/`submit_masked_inputs` call, so a single event can satisfy
         // several of the `n_inputs` we're waiting for -- keep receiving events (not just
-        // `n_inputs` of them) until enough inputs have actually been seen.
-        let mut received = 0u64;
-        while received < n_inputs {
+        // `n_inputs` of them) until enough inputs have actually been seen. Only distinct indices
+        // count: a repeated one fills no new slot, so this fails instead of returning a set of
+        // inputs that does not match the reservations.
+        let mut seen = HashSet::new();
+        while (seen.len() as u64) < n_inputs {
             if let Some(Ok(Event::MaskedInputEvent {
                 client,
                 masked_inputs,
             })) = sub.next().await
             {
-                received += masked_inputs.len() as u64;
                 for (reserved_index, masked_input) in masked_inputs {
+                    if !seen.insert(reserved_index) {
+                        return Err(CoordinatorError::DuplicateIndex(reserved_index));
+                    }
                     let i = reserved_index as usize;
                     let mask_share = &mask_shares[i];
                     let masked_input =
@@ -3259,5 +3287,99 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod duplicate_index_tests {
+    use super::*;
+    use crate::tests::fake_coord::{
+        HoneyBadgerOffChainCoordinatorClient, HoneyBadgerOffChainCoordinatorServer,
+    };
+    use ark_bls12_381::Fr;
+    use stoffel_mpc_coordinator_shared::self_signed_certs::{client_cert, server_cert};
+    use stoffel_mpc_coordinator_shared::tests::fake_coord::HoneyBadgerShareType;
+    use stoffel_mpc_coordinator_shared::Coordinator;
+    use stoffelmpc_mpc::common::SecretSharingScheme;
+
+    // A coordinator that predates the duplicate check can still hold such an event, and the
+    // current one refuses to create it, so this test seeds the event history directly.
+    #[tokio::test]
+    async fn wait_for_inputs_rejects_a_repeated_index() {
+        stoffel_mpc_coordinator_shared::setup_test();
+
+        let execution_id = ExecutionId::from_bytes([0x61; 32]);
+        let node = server_cert();
+        let (cert_der, key_der) = (node.cert.der().to_vec(), node.signing_key.serialize_der());
+        let mut masked_input = Vec::new();
+        Fr::from(5u64)
+            .serialize_compressed(&mut masked_input)
+            .unwrap();
+
+        let mut state = CoordinatorRPCServerSharedBase::new_for_execution(
+            execution_id,
+            [1; 32],
+            1,
+            0,
+            vec![node.signing_key.public_key_raw().to_vec()],
+            1,
+            vec![],
+            InputAssignment::default(),
+        )
+        .unwrap();
+        state
+            .executions
+            .get_mut(&execution_id)
+            .unwrap()
+            .masked_input_events
+            .push(Event::MaskedInputEvent {
+                client: client_cert().signing_key.public_key_raw().to_vec(),
+                masked_inputs: vec![(0, masked_input.clone()), (0, masked_input)],
+            });
+
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let _server = HoneyBadgerOffChainCoordinatorServer::start_coord_from_cert(
+            state,
+            "127.0.0.1",
+            port,
+            0,
+            server_cert(),
+        )
+        .await
+        .unwrap();
+        let client = HoneyBadgerOffChainCoordinatorClient::start_rpc_client_for_execution(
+            "127.0.0.1",
+            port,
+            0,
+            1,
+            0,
+            execution_id,
+            cert_der,
+            key_der,
+        )
+        .await
+        .unwrap();
+
+        let mask_shares = HoneyBadgerShareType::compute_shares(
+            Fr::from(2u64),
+            1,
+            0,
+            Some(&[1]),
+            &mut ark_std::test_rng(),
+        )
+        .unwrap();
+
+        // One input is expected, so counting entries instead of distinct indices would stop
+        // here and hand back two shares for it.
+        let result = client.wait_for_inputs(1, mask_shares).await;
+        assert!(
+            matches!(result, Err(CoordinatorError::DuplicateIndex(0))),
+            "a repeated index must fail the wait, got {:?}",
+            result.map(|inputs| inputs.len()),
+        );
     }
 }
