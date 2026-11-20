@@ -5469,7 +5469,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stoffel-mpc-coordinator-bins"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "alloy",
  "alloy-primitives",
@@ -5492,7 +5492,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -5518,7 +5518,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-mpc-coordinator-on-chain"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "alloy",
  "alloy-primitives",
@@ -5546,7 +5546,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",

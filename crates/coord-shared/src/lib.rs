@@ -111,6 +111,13 @@ pub trait ShareBound<F: FftField>:
     fn compute_masked_input(input: Self::ValueType, mask_share: &Self) -> Result<Self, ShareError>;
 
     fn min_shares(t: usize) -> usize;
+
+    /// Validate share metadata against the authenticated sender's roster position.
+    fn valid_output_sender(&self, party_index: usize, n: usize, t: usize) -> bool;
+
+    fn recover_output(shares: &[Self], n: usize, t: usize) -> Result<Self::ValueType, Self::Error> {
+        Self::recover_secret(shares, n, t).map(|(_, value)| value)
+    }
 }
 
 impl<F: FftField> ShareBound<F> for RobustShare<F> {
@@ -127,6 +134,9 @@ impl<F: FftField> ShareBound<F> for RobustShare<F> {
     fn min_shares(t: usize) -> usize {
         2 * t + 1
     }
+    fn valid_output_sender(&self, party_index: usize, n: usize, t: usize) -> bool {
+        party_index < n && self.id == party_index && self.degree == t
+    }
 }
 
 impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShamirShare<F, G> {
@@ -139,6 +149,42 @@ impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShami
 
     fn min_shares(t: usize) -> usize {
         t + 1
+    }
+    fn valid_output_sender(&self, party_index: usize, n: usize, t: usize) -> bool {
+        if party_index >= n
+            || self.feldmanshare.id != party_index + 1
+            || self.feldmanshare.degree != t
+            || self.commitments.len() != t + 1
+        {
+            return false;
+        }
+        let x = F::from(self.feldmanshare.id as u64);
+        let expected = self
+            .commitments
+            .iter()
+            .rev()
+            .fold(G::zero(), |acc, c| acc * x + c);
+        G::generator() * self.feldmanshare.share[0] == expected
+    }
+
+    fn recover_output(shares: &[Self], n: usize, t: usize) -> Result<Self::ValueType, Self::Error> {
+        // At most t senders are faulty. A group of t+1 identical polynomial
+        // commitments therefore contains an honest sender and binds the output.
+        for candidate in shares {
+            let matching: Vec<_> = shares
+                .iter()
+                .filter(|share| {
+                    share.commitments == candidate.commitments
+                        && share.feldmanshare.id > 0
+                        && share.valid_output_sender(share.feldmanshare.id - 1, n, t)
+                })
+                .cloned()
+                .collect();
+            if matching.len() >= t + 1 {
+                return Self::recover_secret(&matching, n, t).map(|(_, value)| value);
+            }
+        }
+        Err(ShareError::InsufficientShares)
     }
 }
 
@@ -328,4 +374,32 @@ pub fn setup_test() {
         // test setup and must not poison the initializer.
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+#[cfg(test)]
+mod output_validation_tests {
+    use super::*;
+    use ark_bls12_381::{Fr, G1Projective};
+
+    #[test]
+    fn feldman_output_ignores_invalid_values_and_minority_polynomials() {
+        type Share = FeldmanShamirShare<Fr, G1Projective>;
+        let ids = [1, 2, 3, 4, 5];
+        let mut rng = ark_std::test_rng();
+        let mut shares = Share::compute_shares(Fr::from(7u64), 5, 1, Some(&ids), &mut rng).unwrap();
+        shares[0].feldmanshare.share[0] += Fr::from(1u64);
+        assert!(!shares[0].valid_output_sender(0, 5, 1));
+        assert_eq!(
+            Share::recover_output(&shares, 5, 1).unwrap(),
+            Fr::from(7u64)
+        );
+        shares[0] = Share::compute_shares(Fr::from(99u64), 5, 1, Some(&ids), &mut rng)
+            .unwrap()
+            .remove(0);
+        assert!(shares[0].valid_output_sender(0, 5, 1));
+        assert_eq!(
+            Share::recover_output(&shares, 5, 1).unwrap(),
+            Fr::from(7u64)
+        );
+    }
 }

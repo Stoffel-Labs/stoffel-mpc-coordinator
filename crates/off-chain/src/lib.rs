@@ -54,6 +54,10 @@ pub type ClientIdentity = Vec<u8>;
 /// A deliberately small, explicit bound for the number of live executions owned by one RPC
 /// listener. Finished executions must be retired before this many more are registered.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 1024;
+/// Bound slot-vector allocation to roughly 64 MiB per execution and 256 MiB
+/// across the listener (before input payloads). These checks precede expansion.
+pub const MAX_INPUTS_PER_EXECUTION: u64 = 1_000_000;
+pub const MAX_LIVE_INPUT_SLOTS: u64 = 4_000_000;
 const SUBSCRIPTION_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a one-off coordinator waits for parties to acknowledge the terminal round after the
 /// designated party requests shutdown. Unanimous acknowledgement closes immediately; the bound
@@ -1097,6 +1101,18 @@ fn execution_not_found(execution_id: ExecutionId) -> ErrorObjectOwned {
     )
 }
 
+fn validate_distinct_input_indices(indices: &[u64]) -> RpcResult<()> {
+    let mut seen = HashSet::with_capacity(indices.len());
+    if indices.iter().any(|index| !seen.insert(*index)) {
+        return Err(ErrorObjectOwned::owned(
+            ErrorCode::InvalidParams.code(),
+            "input indices must be distinct",
+            None::<()>,
+        ));
+    }
+    Ok(())
+}
+
 /// The basic server-side information for one client connection to the coordinator RPC interface.
 /// Can be extended by the developer.
 #[derive(Clone)]
@@ -1174,6 +1190,7 @@ impl RetiredExecutions {
 
 /// All mutable protocol state for one program invocation.
 struct CoordinatorExecutionState {
+    output_party_order: Vec<ClientIdentity>,
     registration: ExecutionRegistration,
     retirement_acks: HashSet<ClientIdentity>,
     /// Parties that have proposed each round transition. A round is applied once its proposer
@@ -1337,35 +1354,44 @@ impl CoordinatorRPCServerSharedBase {
                 registration.execution_id
             )));
         }
-        if self.executions.len() >= DEFAULT_MAX_CONCURRENT_EXECUTIONS {
-            // Healthy stragglers need the completed round history until they have also reached
-            // ProgramFinished. Keep that history during normal operation, and only compact a
-            // quorum-retired execution when its slot is actually needed. This preserves bounded
-            // memory without racing a live fifth party merely because the first `n - t` parties
-            // finished slightly earlier.
-            let retirement_quorum = self.retirement_quorum();
-            let evictable = self
-                .executions
-                .iter()
-                .find_map(|(execution_id, execution)| {
-                    (self.one_off_execution != Some(*execution_id)
-                        && execution.retirement_acks.len() >= retirement_quorum)
-                        .then_some(*execution_id)
-                });
-            if let Some(execution_id) = evictable {
-                let execution = self
-                    .executions
-                    .remove(&execution_id)
-                    .expect("eviction candidate came from the execution map");
-                self.retired.seal(execution_id, execution.retirement_acks);
-            } else {
-                return Err(CoordinatorError::JSONError(format!(
-                    "Execution capacity {} reached",
-                    DEFAULT_MAX_CONCURRENT_EXECUTIONS
-                )));
-            }
+        // Reject intrinsically oversized requests before reclaiming completed work.
+        if registration.n_inputs > MAX_INPUTS_PER_EXECUTION {
+            return Err(CoordinatorError::JSONError(
+                "too many input slots".to_owned(),
+            ));
         }
-        let execution = CoordinatorExecutionState::new(registration.clone(), self.n)?;
+        loop {
+            let live_slots = self
+                .executions
+                .values()
+                .try_fold(registration.n_inputs, |total, state| {
+                    total.checked_add(state.registration.n_inputs)
+                });
+            if self.executions.len() < DEFAULT_MAX_CONCURRENT_EXECUTIONS
+                && live_slots.is_some_and(|total| total <= MAX_LIVE_INPUT_SLOTS)
+            {
+                break;
+            }
+            // Retain output/history for stragglers until either capacity bound needs it.
+            let retirement_quorum = self.retirement_quorum();
+            let evictable = self.executions.iter().find_map(|(id, execution)| {
+                (self.one_off_execution != Some(*id)
+                    && execution.retirement_acks.len() >= retirement_quorum)
+                    .then_some(*id)
+            });
+            let Some(id) = evictable else {
+                return Err(CoordinatorError::JSONError(
+                    "coordinator execution or input-slot capacity exceeded".to_owned(),
+                ));
+            };
+            let execution = self
+                .executions
+                .remove(&id)
+                .expect("existing eviction candidate");
+            self.retired.seal(id, execution.retirement_acks);
+        }
+        let execution =
+            CoordinatorExecutionState::new(registration.clone(), self.n, self.mpc_nodes.clone())?;
         self.executions.insert(registration.execution_id, execution);
         Ok(())
     }
@@ -1517,7 +1543,13 @@ fn expand_input_ranges(ranges: &[InputClientRange]) -> Vec<InputSlotAssignment> 
 }
 
 impl CoordinatorExecutionState {
-    fn new(registration: ExecutionRegistration, n: u64) -> Result<Self, CoordinatorError> {
+    fn new(
+        registration: ExecutionRegistration,
+        n: u64,
+        mut output_party_order: Vec<ClientIdentity>,
+    ) -> Result<Self, CoordinatorError> {
+        // stoffelnet assigns protocol IDs by lexicographically sorted SPKI bytes.
+        output_party_order.sort();
         if registration.execution_id.is_zero() {
             return Err(CoordinatorError::JSONError(
                 "execution ID must be nonzero".to_string(),
@@ -1528,12 +1560,17 @@ impl CoordinatorExecutionState {
                 "program hash must be nonzero".to_string(),
             ));
         }
+        if registration.n_inputs > MAX_INPUTS_PER_EXECUTION {
+            return Err(CoordinatorError::JSONError(
+                "execution input count exceeds the allocation limit".to_owned(),
+            ));
+        }
         let ranges_total: u64 = registration
             .input_assignment
             .ranges
             .iter()
-            .map(|range| range.count)
-            .sum();
+            .try_fold(0_u64, |total, range| total.checked_add(range.count))
+            .ok_or_else(|| CoordinatorError::JSONError("input range count overflow".to_owned()))?;
         if !registration.input_assignment.ranges.is_empty() && registration.n_inputs != ranges_total
         {
             return Err(CoordinatorError::JSONError(format!(
@@ -1562,6 +1599,7 @@ impl CoordinatorExecutionState {
         let n_inputs = usize::try_from(registration.n_inputs)
             .map_err(|_| CoordinatorError::U64ToUsizeError)?;
         Ok(Self {
+            output_party_order,
             registration: registration.clone(),
             retirement_acks: HashSet::new(),
             transition_votes: HashMap::new(),
@@ -1819,15 +1857,25 @@ impl CoordinatorExecutionState {
             return None;
         }
 
-        let output_shares = self
+        let received = self
             .output_shares
-            .iter()
-            .filter(|((candidate, _), _)| candidate == client_id)
-            .map(|(_, shares)| shares.clone())
-            .collect::<Vec<_>>();
-        if output_shares.len() < min_shares {
+            .keys()
+            .filter(|(candidate, _)| candidate == client_id)
+            .count();
+        if received < min_shares {
             return None;
         }
+        // Positional slots bind decrypted metadata to the authenticated sending party.
+        let output_shares = self
+            .output_party_order
+            .iter()
+            .map(|party| {
+                self.output_shares
+                    .get(&(client_id.clone(), party.clone()))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
 
         Some((waiter, output_shares))
     }
@@ -2062,6 +2110,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         masked_inputs: Vec<Vec<u8>>,
         reserved_indices: Vec<u64>,
     ) -> RpcResult<()> {
+        validate_distinct_input_indices(&reserved_indices)?;
         let (quorum, roster_head) = {
             let shared = self.d.lock().await;
             (shared.transition_quorum(), shared.mpc_nodes[0].clone())
@@ -2291,6 +2340,7 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         execution_id: ExecutionId,
         indices: Vec<u64>,
     ) -> RpcResult<()> {
+        validate_distinct_input_indices(&indices)?;
         let mut d = self.execution_state(execution_id).await?;
 
         if d.round != Round::InputMaskReservation {
@@ -2520,6 +2570,24 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
             ));
         }
 
+        if d.round != Round::OutputDistribution && d.round != Round::ProgramFinished {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::ServerError(WrongRound as i32).code(),
+                "output shares require the output-distribution round",
+                None::<()>,
+            ));
+        }
+        if <KemImpl as Kem>::EncappedKey::from_bytes(&enc_shares.0).is_err()
+            || enc_shares.1.len() < 16
+            || enc_shares.1.len() > 16 * 1024 * 1024
+        {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::InvalidParams.code(),
+                "invalid encrypted output framing",
+                None::<()>,
+            ));
+        }
+
         // a node cannot send output shares for a client twice
         if d.output_shares
             .contains_key(&(client_id.clone(), self.id.clone()))
@@ -2616,6 +2684,101 @@ impl CoordinatorRPCBaseServer for CoordinatorRPCServerConnectionBase {
         deliver_ready_output_waiters(&self.d, execution_id, &self.id, min_shares).await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod veria_regressions {
+    use super::*;
+
+    fn state(inputs: u64) -> CoordinatorRPCServerSharedBase {
+        CoordinatorRPCServerSharedBase::new_for_execution(
+            ExecutionId::from_bytes([1; 32]),
+            [2; 32],
+            5,
+            1,
+            (0..5).map(|id| vec![id]).collect(),
+            inputs,
+            vec![vec![9]],
+            InputAssignment::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn oversized_registration_is_rejected_before_allocating_slots() {
+        let mut state = state(1);
+        let mut registration = state
+            .executions
+            .values()
+            .next()
+            .unwrap()
+            .registration
+            .clone();
+        registration.execution_id = ExecutionId::from_bytes([3; 32]);
+        registration.n_inputs = MAX_INPUTS_PER_EXECUTION + 1;
+        assert!(state.register_execution(registration).is_err());
+        assert_eq!(state.executions.len(), 1);
+    }
+
+    #[test]
+    fn retired_executions_release_aggregate_input_capacity() {
+        let mut state = state(1);
+        let id = ExecutionId::from_bytes([1; 32]);
+        // Account for an exhausted slot budget without allocating four million slots.
+        state.executions.get_mut(&id).unwrap().registration.n_inputs = MAX_LIVE_INPUT_SLOTS;
+        state.executions.get_mut(&id).unwrap().round = Round::ProgramFinished;
+        for party in 0..4 {
+            state.retire_execution(id, &vec![party]).unwrap();
+        }
+        let mut registration = state.executions[&id].registration.clone();
+        registration.execution_id = ExecutionId::from_bytes([3; 32]);
+        registration.n_inputs = 1;
+        state.register_execution(registration).unwrap();
+        assert!(!state.executions.contains_key(&id));
+        assert_eq!(state.executions.len(), 1);
+    }
+
+    #[test]
+    fn output_snapshot_preserves_authenticated_party_positions() {
+        let mut state = state(1);
+        let execution = state.executions.values_mut().next().unwrap();
+        execution
+            .output_shares
+            .insert((vec![9], vec![3]), (vec![33], vec![44]));
+        let snapshot: Vec<_> = execution
+            .output_party_order
+            .iter()
+            .map(|party| {
+                execution
+                    .output_shares
+                    .get(&(vec![9], party.clone()))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(snapshot.len(), 5);
+        assert!(snapshot[0].0.is_empty());
+        assert_eq!(snapshot[3], (vec![33], vec![44]));
+    }
+
+    #[tokio::test]
+    async fn duplicate_masked_inputs_do_not_mutate_state_or_event_history() {
+        let id = ExecutionId::from_bytes([1; 32]);
+        let mut state = state(1);
+        let execution = state.executions.get_mut(&id).unwrap();
+        execution.round = Round::InputCollection;
+        execution.reserved_indices[0] = Some(vec![9]);
+        let shared = Arc::new(Mutex::new(state));
+        let client = CoordinatorRPCServerConnectionBase::new(shared.clone(), vec![9]);
+        assert!(client
+            .submit_masked_inputs(id, vec![vec![0], vec![0]], vec![0, 0])
+            .await
+            .is_err());
+        let state = shared.lock().await;
+        let execution = &state.executions[&id];
+        assert!(execution.masked_inputs[0].is_none());
+        assert!(execution.masked_input_events.is_empty());
     }
 }
 
@@ -3001,16 +3164,26 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
         // several of the `n_inputs` we're waiting for -- keep receiving events (not just
         // `n_inputs` of them) until enough inputs have actually been seen.
         let mut received = 0u64;
+        let mut seen_indices = HashSet::new();
         while received < n_inputs {
             if let Some(Ok(Event::MaskedInputEvent {
                 client,
                 masked_inputs,
             })) = sub.next().await
             {
-                received += masked_inputs.len() as u64;
                 for (reserved_index, masked_input) in masked_inputs {
-                    let i = reserved_index as usize;
-                    let mask_share = &mask_shares[i];
+                    if !seen_indices.insert(reserved_index) {
+                        return Err(CoordinatorError::JSONError(
+                            "duplicate masked-input event index".to_owned(),
+                        ));
+                    }
+                    let i = usize::try_from(reserved_index)
+                        .map_err(|_| CoordinatorError::U64ToUsizeError)?;
+                    let mask_share = mask_shares.get(i).ok_or_else(|| {
+                        CoordinatorError::JSONError(
+                            "masked-input event index is out of bounds".to_owned(),
+                        )
+                    })?;
                     let masked_input =
                         S::ValueType::deserialize_compressed(masked_input.as_slice())
                             .map_err(|_| CoordinatorError::DeserializationError)?;
@@ -3020,6 +3193,7 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                     map.entry(client.clone())
                         .or_default()
                         .push((reserved_index, input));
+                    received += 1;
                 }
             } else {
                 return Err(CoordinatorError::JSONError(
@@ -3139,28 +3313,46 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
             }
 
             let mut output_shares = Vec::new();
-            for (encapped_key_bytes, c) in enc_output_shares.iter() {
-                let encapped_key = <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes)
-                    .map_err(|_| CoordinatorError::ParsingEncapsulatedKeyFailed)?;
-                let output_shares_bytes = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
+            for (party_index, (encapped_key_bytes, c)) in enc_output_shares.iter().enumerate() {
+                let Ok(encapped_key) =
+                    <KemImpl as Kem>::EncappedKey::from_bytes(encapped_key_bytes)
+                else {
+                    continue;
+                };
+                let Ok(output_shares_bytes) = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
                     &OpModeR::Base,
                     &client_sk,
                     &encapped_key,
                     &enc_info,
                     c,
                     b"",
-                )
-                .map_err(|_| CoordinatorError::DecryptionError)?;
-                let shares: Vec<S> =
+                ) else {
+                    continue;
+                };
+                let Ok(shares): Result<Vec<S>, _> =
                     CanonicalDeserialize::deserialize_compressed(output_shares_bytes.as_slice())
-                        .map_err(|_| CoordinatorError::DeserializationError)?;
+                else {
+                    continue;
+                };
 
-                if shares.len() as u64 != self.n_outputs {
+                if shares.len() as u64 != self.n_outputs
+                    || !shares.iter().all(|share| {
+                        share.valid_output_sender(
+                            party_index,
+                            self.n_parties as usize,
+                            self.t as usize,
+                        )
+                    })
+                {
                     println!("Some node sent an invalid number of output shares, ignoring.");
                     continue;
                 }
 
                 output_shares.push(shares);
+            }
+
+            if output_shares.len() < min_shares {
+                continue;
             }
 
             let outputs: Vec<_> = (0..self.n_outputs as usize)
@@ -3172,8 +3364,8 @@ impl<F: FftField, S: ShareBound<F>> Coordinator<F, S> for OffChainCoordinatorCli
                         .collect();
 
                     // At least S::min_shares(t) shares are available as checked above.
-                    match S::recover_secret(&shares_i, self.n_parties as usize, self.t as usize) {
-                        Ok((_, output_i)) => Some(output_i),
+                    match S::recover_output(&shares_i, self.n_parties as usize, self.t as usize) {
+                        Ok(output_i) => Some(output_i),
                         Err(_) => {
                             println!(
                                 "Reconstruction failed for output {}, waiting for more shares.",

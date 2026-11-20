@@ -286,6 +286,8 @@ struct BrowserExecutionStatus {
 
 /// `(created, nonce)` pairs seen recently for one `(execution_id, identity)`.
 type SeenNonces = VecDeque<(u64, [u8; 16])>;
+const MAX_TRACKED_NONCES: usize = 65_536;
+const MAX_NONCES_PER_IDENTITY: usize = 4_096;
 
 /// Tracks recently-seen `(created, nonce)` pairs per `(execution_id,
 /// identity)`, within a sliding `NONCE_WINDOW_SECONDS` window - see the
@@ -314,14 +316,48 @@ impl NonceBook {
                 "request timestamp is outside the accepted window",
             ));
         }
+        // Sweep all keys, including executions that will never be requested
+        // again. Never evict a still-valid nonce to make room for a new one.
+        self.seen.retain(|_, entries| {
+            entries.retain(|(created, _)| now.saturating_sub(*created) <= NONCE_WINDOW_SECONDS);
+            !entries.is_empty()
+        });
+        if self.seen.values().map(VecDeque::len).sum::<usize>() >= MAX_TRACKED_NONCES {
+            return Err(auth_error("request nonce capacity exceeded"));
+        }
         let key = (execution_id, identity.clone());
         let entries = self.seen.entry(key).or_default();
         entries.retain(|(created, _)| now.saturating_sub(*created) <= NONCE_WINDOW_SECONDS);
         if entries.iter().any(|(_, seen_nonce)| *seen_nonce == nonce) {
             return Err(auth_error("request nonce was already used"));
         }
+        if entries.len() >= MAX_NONCES_PER_IDENTITY {
+            return Err(auth_error("identity request nonce capacity exceeded"));
+        }
         entries.push_back((created, nonce));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod nonce_budget_tests {
+    use super::*;
+
+    #[test]
+    fn nonce_budget_rejects_growth_without_evicting_replay_protection() {
+        let mut book = NonceBook::default();
+        let id = ExecutionId::from_bytes([1; 32]);
+        for value in 0..MAX_NONCES_PER_IDENTITY {
+            let mut nonce = [0; 16];
+            nonce[..8].copy_from_slice(&(value as u64).to_le_bytes());
+            book.accept(id, &vec![1], 1000, nonce, 1000).unwrap();
+        }
+        assert!(book.accept(id, &vec![1], 1000, [255; 16], 1000).is_err());
+        assert!(book.accept(id, &vec![1], 1000, [0; 16], 1000).is_err());
+        assert_eq!(book.seen[&(id, vec![1])].len(), MAX_NONCES_PER_IDENTITY);
+        let later = 1000 + NONCE_WINDOW_SECONDS + 1;
+        book.accept(id, &vec![2], later, [1; 16], later).unwrap();
+        assert!(!book.seen.contains_key(&(id, vec![1])));
     }
 }
 
@@ -929,15 +965,25 @@ impl CoordinatorRPCServerSharedBase {
         if !execution.output_clients.contains(client) {
             return Err(rpc_error(-32012, "client is not authorized for output"));
         }
-        let shares = execution
+        let received = execution
             .output_shares
-            .iter()
-            .filter(|((candidate, _), _)| candidate == client)
-            .map(|(_, shares)| shares.clone())
-            .collect::<Vec<_>>();
-        if shares.len() < execution.registration.min_output_shares as usize {
+            .keys()
+            .filter(|(candidate, _)| candidate == client)
+            .count();
+        if received < execution.registration.min_output_shares as usize {
             return Ok(None);
         }
+        let shares = execution
+            .output_party_order
+            .iter()
+            .map(|party| {
+                execution
+                    .output_shares
+                    .get(&(client.clone(), party.clone()))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
         Ok(Some(shares))
     }
 }
