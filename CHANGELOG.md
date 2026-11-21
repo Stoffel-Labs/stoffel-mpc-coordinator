@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Enforce off-chain execution phases and output frame validation, and bound the
+  coordinator's execution state and browser authentication state.
+
 ## 0.2.1 - 2026-11-02
 
 ### Added
