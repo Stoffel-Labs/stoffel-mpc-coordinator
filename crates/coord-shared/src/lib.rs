@@ -180,7 +180,7 @@ impl<F: FftField, G: CurveGroup<ScalarField = F>> ShareBound<F> for FeldmanShami
                 })
                 .cloned()
                 .collect();
-            if matching.len() >= t + 1 {
+            if matching.len() > t {
                 return Self::recover_secret(&matching, n, t).map(|(_, value)| value);
             }
         }
